@@ -86,6 +86,7 @@ arguments=(
     '--prefer-text[Inject alpha characters and space as text events instead of key events]'
     '--print-fps[Start FPS counter, to print frame logs to the console]'
     '--push-target=[Set the target directory for pushing files to the device by drag and drop]'
+    '--reconnect[Keep the window open and mirror again when the device reconnects]'
     {-r,--record=}'[Record screen to file]:record file:_files'
     '--raw-key-events[Inject key events for all input keys, and ignore text events]'
     '--record-format=[Force recording format]:format:(mp4 mkv m4a mka opus aac flac wav)'

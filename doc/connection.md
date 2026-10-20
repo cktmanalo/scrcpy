@@ -119,6 +119,25 @@ bypass having to physically connect your device to your computer.
 [adb-wireless]: https://developer.android.com/studio/command-line/adb#wireless-android11-command-line
 
 
+## Reconnection
+
+By default, _scrcpy_ exits when the device is disconnected (for example when it
+reboots).
+
+To keep the window open and mirror the same device again in the same window as
+soon as it is available:
+
+```bash
+scrcpy --reconnect
+```
+
+Closing the window while waiting stops _scrcpy_. A TCP/IP device is connected
+again automatically.
+
+This option is incompatible with `--record`, `--kill-adb-on-close` and
+`--tcpip` without address.
+
+
 ## Autostart
 
 A small tool (by the scrcpy author) allows you to run arbitrary commands

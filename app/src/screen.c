@@ -365,6 +365,14 @@ sc_screen_on_resize(struct sc_screen *screen, const SDL_WindowEvent *event) {
         return;
     }
 
+    if (screen->awaiting_first_frame) {
+        // A reused window may be resized before the first frame
+        if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+            sc_screen_render(screen, true);
+        }
+        return;
+    }
+
     if (event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
         sc_screen_render(screen, true);
     } else {
@@ -532,6 +540,9 @@ sc_screen_init(struct sc_screen *screen,
     screen->window_aspect_ratio_lock = params->window_aspect_ratio_lock;
     screen->render_fit = params->render_fit;
     screen->flex_display = params->flex_display;
+    screen->reconnect = params->reconnect;
+    screen->owns_window = true;
+    screen->awaiting_first_frame = false;
 
     screen->bg.r = (params->background_color >> 16) & 0xFF;
     screen->bg.g = (params->background_color >> 8) & 0xFF;
@@ -606,11 +617,15 @@ sc_screen_init(struct sc_screen *screen,
     }
 
     // The window will be positioned and sized on first video frame
-    screen->window =
-        sc_sdl_create_window(title, x, y, width, height, window_flags);
-    if (!screen->window) {
-        LOGE("Could not create window: %s", SDL_GetError());
-        goto error_destroy_fps_counter;
+    if (params->window) {
+        screen->window = params->window;
+    } else {
+        screen->window =
+            sc_sdl_create_window(title, x, y, width, height, window_flags);
+        if (!screen->window) {
+            LOGE("Could not create window: %s", SDL_GetError());
+            goto error_destroy_fps_counter;
+        }
     }
 
     screen->renderer = SDL_CreateRenderer(screen->window, NULL);
@@ -744,6 +759,15 @@ sc_screen_init(struct sc_screen *screen,
             // Capture mouse immediately if video mirroring is disabled
             sc_mouse_capture_set_active(&screen->mc, true);
         }
+    } else if (params->window) {
+        // The reused window is already shown, keep it until the first frame
+        struct sc_size window_size = sc_sdl_get_window_size(screen->window);
+        screen->content_size.width = MAX(1, window_size.width);
+        screen->content_size.height = MAX(1, window_size.height);
+        screen->frame_size = screen->content_size;
+        screen->awaiting_first_frame = true;
+        screen->window_shown = true;
+        sc_screen_render(screen, true);
     }
 
     return true;
@@ -758,7 +782,9 @@ error_destroy_renderer:
 #endif
     SDL_DestroyRenderer(screen->renderer);
 error_destroy_window:
-    SDL_DestroyWindow(screen->window);
+    if (!params->window) {
+        SDL_DestroyWindow(screen->window);
+    }
 error_destroy_fps_counter:
     sc_fps_counter_destroy(&screen->fps_counter);
 error_destroy_frame_buffer:
@@ -810,10 +836,45 @@ sc_screen_show_initial_window(struct sc_screen *screen) {
     sc_screen_update_content_rect(screen);
 }
 
+static void
+sc_screen_show_reused_window(struct sc_screen *screen) {
+    screen->awaiting_first_frame = false;
+
+    if (is_windowed(screen)) {
+        struct sc_size window_size = sc_sdl_get_window_size(screen->window);
+        struct sc_size size =
+            get_optimal_size(window_size, screen->content_size, true);
+
+        if (screen->flex_display
+                && size.width == screen->content_size.width
+                && size.height == screen->content_size.height) {
+            sc_screen_track_resize(screen, size);
+        }
+
+        set_aspect_ratio(screen, screen->content_size);
+        sc_sdl_set_window_size(screen->window, size);
+    } else {
+        screen->windowed_content_size = screen->content_size;
+        screen->resize_pending = true;
+    }
+
+    if (screen->req.start_fps_counter) {
+        sc_fps_counter_start(&screen->fps_counter);
+    }
+
+    sc_screen_update_content_rect(screen);
+}
+
 void
 sc_screen_hide_window(struct sc_screen *screen) {
     sc_sdl_hide_window(screen->window);
     screen->window_shown = false;
+}
+
+SDL_Window *
+sc_screen_release_window(struct sc_screen *screen) {
+    screen->owns_window = false;
+    return screen->window;
 }
 
 void
@@ -844,13 +905,20 @@ sc_screen_destroy(struct sc_screen *screen) {
     if (screen->disconnect_started) {
         sc_disconnect_destroy(&screen->disconnect);
     }
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+    if (screen->video) {
+        SDL_RemoveEventWatch(event_watcher, screen);
+    }
+#endif
     sc_texture_destroy(&screen->tex);
     av_frame_free(&screen->frame);
 #ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
     SDL_GL_DestroyContext(screen->gl_context);
 #endif
     SDL_DestroyRenderer(screen->renderer);
-    SDL_DestroyWindow(screen->window);
+    if (screen->owns_window) {
+        SDL_DestroyWindow(screen->window);
+    }
     sc_fps_counter_destroy(&screen->fps_counter);
     sc_frame_buffer_destroy(&screen->fb);
     sc_mutex_destroy(&screen->mutex);
@@ -1179,7 +1247,11 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             free(size);
             screen->content_size = get_oriented_size(screen->frame_size,
                                                      screen->orientation);
-            sc_screen_show_initial_window(screen);
+            if (screen->awaiting_first_frame) {
+                sc_screen_show_reused_window(screen);
+            } else {
+                sc_screen_show_initial_window(screen);
+            }
 
             if (sc_screen_is_relative_mode(screen)) {
                 // Capture mouse on start
@@ -1237,6 +1309,14 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             sc_texture_reset(&screen->tex);
             sc_screen_render(screen, true);
 
+            if (screen->reconnect) {
+                // The caller keeps the window open and waits for the device
+                if (sc_screen_is_relative_mode(screen)) {
+                    sc_mouse_capture_set_active(&screen->mc, false);
+                }
+                return;
+            }
+
             sc_tick deadline = sc_tick_now() + SC_TICK_FROM_SEC(2);
             static const struct sc_disconnect_callbacks cbs = {
                 .on_icon_loaded = sc_disconnect_on_icon_loaded,
@@ -1249,6 +1329,11 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             }
 
             return;
+    }
+
+    if (screen->awaiting_first_frame) {
+        // The device content is not known yet, ignore input
+        return;
     }
 
     if (sc_screen_is_relative_mode(screen)

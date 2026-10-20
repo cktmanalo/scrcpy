@@ -69,3 +69,10 @@ sc_main_thread_stop(void) {
     // Run all remaining runnables on the main thread
     SDL_PumpEvents();
 }
+
+void
+sc_main_thread_restart(void) {
+    sc_mutex_lock(&mutex);
+    stopped = false;
+    sc_mutex_unlock(&mutex);
+}

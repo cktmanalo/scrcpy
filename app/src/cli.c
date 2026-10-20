@@ -112,6 +112,7 @@ enum {
     OPT_IGNORE_VIDEO_ENCODER_CONSTRAINTS,
     OPT_NO_TERMINAL_TITLE,
     OPT_HWDEC,
+    OPT_RECONNECT,
 };
 
 struct sc_option {
@@ -791,6 +792,14 @@ static const struct sc_option options[] = {
         .text = "Set the target directory for pushing files to the device by "
                 "drag & drop. It is passed as is to \"adb push\".\n"
                 "Default is \"/sdcard/Download/\".",
+    },
+    {
+        .longopt_id = OPT_RECONNECT,
+        .longopt = "reconnect",
+        .text = "Keep the window open when the device is disconnected (for "
+                "example when it reboots), and mirror it again in the same "
+                "window as soon as it is available.\n"
+                "Closing the window stops waiting.",
     },
     {
         .shortopt = 'r',
@@ -2895,6 +2904,9 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
             case OPT_KILL_ADB_ON_CLOSE:
                 opts->kill_adb_on_close = true;
                 break;
+            case OPT_RECONNECT:
+                opts->reconnect = true;
+                break;
             case OPT_TIME_LIMIT:
                 if (!parse_time_limit(optarg, &opts->time_limit)) {
                     return false;
@@ -3411,6 +3423,21 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         return false;
     }
 
+    if (opts->reconnect) {
+        if (opts->record_filename) {
+            LOGE("--reconnect is incompatible with --record");
+            return false;
+        }
+        if (opts->kill_adb_on_close) {
+            LOGE("--reconnect is incompatible with --kill-adb-on-close");
+            return false;
+        }
+        if (opts->tcpip && !opts->tcpip_dst) {
+            LOGE("--reconnect is incompatible with --tcpip without address");
+            return false;
+        }
+    }
+
     if (opts->record_filename) {
         if (!opts->video && !opts->audio) {
             LOGE("Video and audio disabled, nothing to record");
@@ -3571,6 +3598,10 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         }
         if (v4l2) {
             LOGE("OTG mode: could not sink to V4L2 device");
+            return false;
+        }
+        if (opts->reconnect) {
+            LOGE("OTG mode: could not reconnect");
             return false;
         }
     }

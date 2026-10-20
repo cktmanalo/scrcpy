@@ -354,6 +354,7 @@ struct scrcpy_options {
     bool audio;
     bool require_audio;
     bool kill_adb_on_close;
+    bool reconnect;
     bool camera_high_speed;
 #define SC_OPTION_LIST_ENCODERS 0x1
 #define SC_OPTION_LIST_DISPLAYS 0x2

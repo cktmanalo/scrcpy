@@ -81,6 +81,7 @@ _scrcpy() {
         --prefer-text
         --print-fps
         --push-target=
+        --reconnect
         -r --record=
         --raw-key-events
         --record-format=

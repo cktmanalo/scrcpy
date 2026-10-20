@@ -15,12 +15,14 @@
 #endif
 
 #include "audio_player.h"
+#include "adb/adb.h"
 #include "controller.h"
 #include "decoder.h"
 #include "demuxer.h"
 #include "events.h"
 #include "file_pusher.h"
 #include "hwdec.h"
+#include "icon.h"
 #include "keyboard_sdk.h"
 #include "mouse_sdk.h"
 #include "recorder.h"
@@ -38,10 +40,13 @@
 # include "usb/usb.h"
 #endif
 #include "util/acksync.h"
+#include "util/intr.h"
 #include "util/log.h"
 #include "util/rand.h"
+#include "util/sdl.h"
 #include "util/str.h"
 #include "util/term.h"
+#include "util/thread.h"
 #include "util/timeout.h"
 #include "util/tick.h"
 #ifdef HAVE_V4L2
@@ -50,6 +55,26 @@
 #include "video_regulator.h"
 
 #define SC_BACKPRESSURE_THRESHOLD 8 // in-flight frames in video regulator
+
+struct sc_reconnect {
+    // window kept open between sessions, or NULL
+    SDL_Window *window;
+    // serial of the device to reconnect to, NULL until the first connection
+    char *serial;
+};
+
+struct sc_reconnect_probe {
+    struct sc_intr intr;
+    const char *serial;
+    bool ready;
+};
+
+struct sc_reconnect_view {
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *icon;
+    uint32_t background_color;
+};
 
 struct scrcpy {
     struct sc_server server;
@@ -373,22 +398,20 @@ sc_init_video_hwdec(struct sc_hwdec *hwdec, enum sc_hwdec_mode mode,
     return sc_hwdec_init(hwdec, AV_HWDEVICE_TYPE_NONE, NULL, false, NULL);
 }
 
-enum scrcpy_exit_code
-scrcpy(struct scrcpy_options *options) {
+static bool
+should_reconnect(const struct scrcpy_options *options,
+                 const struct sc_reconnect *rc, enum scrcpy_exit_code ret) {
+    return options->reconnect && rc->serial && ret != SCRCPY_EXIT_SUCCESS;
+}
+
+static enum scrcpy_exit_code
+run_session(struct scrcpy_options *options, struct sc_reconnect *rc) {
     static struct scrcpy scrcpy;
 #ifndef NDEBUG
     // Detect missing initializations
     memset(&scrcpy, 42, sizeof(scrcpy));
 #endif
     struct scrcpy *s = &scrcpy;
-
-    // Minimal SDL initialization
-    if (!SDL_Init(SDL_INIT_EVENTS)) {
-        LOGE("Could not initialize SDL: %s", SDL_GetError());
-        return SCRCPY_EXIT_FAILURE;
-    }
-
-    atexit(SDL_Quit);
 
     enum scrcpy_exit_code ret = SCRCPY_EXIT_FAILURE;
 
@@ -425,11 +448,25 @@ scrcpy(struct scrcpy_options *options) {
 
     uint32_t scid = scrcpy_generate_scid();
 
+    const char *req_serial = options->serial;
+    bool select_usb = options->select_usb;
+    bool select_tcpip = options->select_tcpip;
+    bool tcpip = options->tcpip;
+    const char *tcpip_dst = options->tcpip_dst;
+    if (rc->serial) {
+        // Reconnect to the same device
+        req_serial = rc->serial;
+        select_usb = false;
+        select_tcpip = false;
+        tcpip = false;
+        tcpip_dst = NULL;
+    }
+
     struct sc_server_params params = {
         .scid = scid,
-        .req_serial = options->serial,
-        .select_usb = options->select_usb,
-        .select_tcpip = options->select_tcpip,
+        .req_serial = req_serial,
+        .select_usb = select_usb,
+        .select_tcpip = select_tcpip,
         .log_level = options->log_level,
         .video_codec = options->video_codec,
         .audio_codec = options->audio_codec,
@@ -470,8 +507,8 @@ scrcpy(struct scrcpy_options *options) {
         .power_off_on_close = options->power_off_on_close,
         .clipboard_autosync = options->clipboard_autosync,
         .downsize_on_error = options->downsize_on_error,
-        .tcpip = options->tcpip,
-        .tcpip_dst = options->tcpip_dst,
+        .tcpip = tcpip,
+        .tcpip_dst = tcpip_dst,
         .cleanup = options->cleanup,
         .power_on = options->power_on,
         .kill_adb_on_close = options->kill_adb_on_close,
@@ -495,10 +532,6 @@ scrcpy(struct scrcpy_options *options) {
     if (!sc_server_init(&s->server, &params, &cbs, NULL)) {
         return SCRCPY_EXIT_FAILURE;
     }
-
-#ifdef _WIN32
-    sdl_configure_ctrl_c_windows();
-#endif
 
     // Set hints before starting the server thread to avoid race conditions in
     // SDL
@@ -817,6 +850,8 @@ aoa_complete:
             .video = options->video_playback,
             .camera = options->video_source == SC_VIDEO_SOURCE_CAMERA,
             .flex_display = options->flex_display,
+            .reconnect = options->reconnect,
+            .window = rc->window,
             .controller = controller,
             .fp = fp,
             .kp = kp,
@@ -847,6 +882,7 @@ aoa_complete:
             goto end;
         }
         screen_initialized = true;
+        rc->window = NULL;
     }
 
     bool needs_video_decoder = options->video_playback;
@@ -1038,6 +1074,16 @@ aoa_complete:
 
     ret = event_loop(s, options->window);
 
+    // Reconnect only to a device which has actually been mirrored, so that
+    // a persistent error does not retry forever
+    if (options->reconnect && !rc->serial
+            && (!options->video_playback || s->screen.window_shown)) {
+        rc->serial = strdup(serial);
+        if (!rc->serial) {
+            LOG_OOM();
+        }
+    }
+
     // Reject all new runnables, and execute the pending ones now
     // (they could access memory that will be cleaned up below)
     sc_main_thread_stop();
@@ -1090,14 +1136,20 @@ end:
     }
 
     if (screen_initialized) {
-        if (disconnected) {
-            sc_screen_handle_disconnection(&s->screen);
-        }
-        LOGD("Quit...");
+        if (should_reconnect(options, rc, ret) && s->screen.window_shown) {
+            // Keep the window open while waiting for the device
+            rc->window = sc_screen_release_window(&s->screen);
+        } else {
+            if (disconnected) {
+                sc_screen_handle_disconnection(&s->screen);
+            }
+            LOGD("Quit...");
 
-        // Close the window immediately, because sc_screen_destroy() may only be
-        // called once the video decoder thread is joined (it may take time)
-        sc_screen_hide_window(&s->screen);
+            // Close the window immediately, because sc_screen_destroy() may
+            // only be called once the video decoder thread is joined (it may
+            // take time)
+            sc_screen_hide_window(&s->screen);
+        }
     }
 
     if (video_decoder_started) {
@@ -1206,6 +1258,238 @@ end:
     }
 
     sc_server_destroy(&s->server);
+
+    return ret;
+}
+
+static void
+sc_reconnect_view_render(struct sc_reconnect_view *view) {
+    SDL_Renderer *renderer = view->renderer;
+    if (!renderer) {
+        return;
+    }
+
+    uint32_t bg = view->background_color;
+    SDL_SetRenderDrawColor(renderer, (bg >> 16) & 0xFF, (bg >> 8) & 0xFF,
+                           bg & 0xFF, 0xFF);
+    sc_sdl_render_clear(renderer);
+
+    int out_w;
+    int out_h;
+    float icon_w;
+    float icon_h;
+    if (view->icon && SDL_GetRenderOutputSize(renderer, &out_w, &out_h)
+            && SDL_GetTextureSize(view->icon, &icon_w, &icon_h)) {
+        float density = SDL_GetWindowPixelDensity(view->window);
+        if (density <= 0) {
+            density = 1;
+        }
+        icon_w *= density;
+        icon_h *= density;
+        float scale = MIN(1.f, MIN(out_w / icon_w, out_h / icon_h));
+        SDL_FRect rect = {
+            .w = icon_w * scale,
+            .h = icon_h * scale,
+        };
+        rect.x = (int) ((out_w - rect.w) / 2);
+        rect.y = (int) ((out_h - rect.h) / 2);
+        SDL_RenderTexture(renderer, view->icon, NULL, &rect);
+    }
+
+    sc_sdl_render_present(renderer);
+}
+
+static void
+sc_reconnect_view_init(struct sc_reconnect_view *view, SDL_Window *window,
+                       uint32_t background_color) {
+    view->window = window;
+    view->renderer = NULL;
+    view->icon = NULL;
+    view->background_color = background_color;
+
+    if (!window) {
+        return;
+    }
+
+    view->renderer = SDL_CreateRenderer(window, NULL);
+    if (!view->renderer) {
+        LOGW("Could not create renderer: %s", SDL_GetError());
+        return;
+    }
+
+    SDL_Surface *icon = sc_icon_load(SC_ICON_FILENAME_DISCONNECTED);
+    if (icon) {
+        view->icon = SDL_CreateTextureFromSurface(view->renderer, icon);
+        if (!view->icon) {
+            LOGW("Could not create texture: %s", SDL_GetError());
+        }
+        sc_icon_destroy(icon);
+    }
+
+    sc_reconnect_view_render(view);
+}
+
+static void
+sc_reconnect_view_destroy(struct sc_reconnect_view *view) {
+    if (view->icon) {
+        SDL_DestroyTexture(view->icon);
+    }
+    if (view->renderer) {
+        SDL_DestroyRenderer(view->renderer);
+    }
+}
+
+static char *
+probe_boot_completed(struct sc_intr *intr, const char *serial) {
+    return sc_adb_getprop(intr, serial, "sys.boot_completed",
+                          SC_ADB_NO_STDERR | SC_ADB_NO_LOGERR);
+}
+
+static int
+run_reconnect_probe(void *data) {
+    struct sc_reconnect_probe *probe = data;
+
+    char *value = probe_boot_completed(&probe->intr, probe->serial);
+    if (!value && strchr(probe->serial, ':')
+            && !sc_intr_is_interrupted(&probe->intr)) {
+        // A TCP/IP device must be connected again after a reboot
+        sc_adb_disconnect(&probe->intr, probe->serial, SC_ADB_SILENT);
+        if (sc_adb_connect(&probe->intr, probe->serial,
+                           SC_ADB_NO_STDERR | SC_ADB_NO_LOGERR)) {
+            value = probe_boot_completed(&probe->intr, probe->serial);
+        }
+    }
+
+    probe->ready = value && !strcmp(value, "1");
+    free(value);
+
+    sc_push_event(SC_EVENT_RECONNECT_PROBE_DONE);
+    return 0;
+}
+
+// Return true once the device is ready, false on error or if the user quits
+static bool
+wait_for_device(const struct scrcpy_options *options, struct sc_reconnect *rc,
+                bool *quit) {
+    *quit = false;
+
+    if (!sc_adb_init()) {
+        return false;
+    }
+
+    struct sc_reconnect_probe probe = {
+        .serial = rc->serial,
+        .ready = false,
+    };
+    if (!sc_intr_init(&probe.intr)) {
+        sc_adb_destroy();
+        return false;
+    }
+
+    LOGI("Waiting for device %s to reconnect...", rc->serial);
+
+    struct sc_reconnect_view view;
+    sc_reconnect_view_init(&view, rc->window, options->background_color);
+
+    sc_thread thread;
+    bool probing = false;
+    bool ready = false;
+    bool error = false;
+    // Give the device time to actually go away before the first probe
+    sc_tick next_probe = sc_tick_now() + SC_TICK_FROM_SEC(2);
+
+    while (!ready && !*quit && !error) {
+        if (!probing && sc_tick_now() >= next_probe) {
+            if (!sc_thread_create(&thread, run_reconnect_probe,
+                                  "scrcpy-probe", &probe)) {
+                LOGE("Could not start reconnection probe");
+                error = true;
+                break;
+            }
+            probing = true;
+        }
+
+        SDL_Event event;
+        if (!SDL_WaitEventTimeout(&event, 100)) {
+            continue;
+        }
+
+        switch (event.type) {
+            case SDL_EVENT_QUIT:
+                LOGD("User requested to quit");
+                *quit = true;
+                break;
+            case SC_EVENT_RECONNECT_PROBE_DONE:
+                sc_thread_join(&thread, NULL);
+                probing = false;
+                ready = probe.ready;
+                next_probe = sc_tick_now() + SC_TICK_FROM_SEC(1);
+                break;
+            case SDL_EVENT_WINDOW_EXPOSED:
+            case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                sc_reconnect_view_render(&view);
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (probing) {
+        sc_intr_interrupt(&probe.intr);
+        sc_thread_join(&thread, NULL);
+    }
+
+    sc_reconnect_view_destroy(&view);
+    sc_intr_destroy(&probe.intr);
+    sc_adb_destroy();
+
+    return ready;
+}
+
+enum scrcpy_exit_code
+scrcpy(struct scrcpy_options *options) {
+    // Minimal SDL initialization
+    if (!SDL_Init(SDL_INIT_EVENTS)) {
+        LOGE("Could not initialize SDL: %s", SDL_GetError());
+        return SCRCPY_EXIT_FAILURE;
+    }
+
+    atexit(SDL_Quit);
+
+#ifdef _WIN32
+    sdl_configure_ctrl_c_windows();
+#endif
+
+    struct sc_reconnect rc = {
+        .window = NULL,
+        .serial = NULL,
+    };
+
+    enum scrcpy_exit_code ret = run_session(options, &rc);
+
+    while (should_reconnect(options, &rc, ret)) {
+        bool quit;
+        if (!wait_for_device(options, &rc, &quit)) {
+            if (quit) {
+                ret = SCRCPY_EXIT_SUCCESS;
+            }
+            break;
+        }
+
+        LOGI("Reconnecting to %s...", rc.serial);
+
+        // Discard the events of the previous session
+        SDL_FlushEvents(SC_EVENT_NEW_FRAME, SC_EVENT_RECONNECT_PROBE_DONE);
+        sc_main_thread_restart();
+
+        ret = run_session(options, &rc);
+    }
+
+    if (rc.window) {
+        SDL_DestroyWindow(rc.window);
+    }
+    free(rc.serial);
 
     return ret;
 }
