@@ -6,13 +6,23 @@
 .DESCRIPTION
     One scrcpy window is opened per device with --reconnect, so the window stays open while the device
     restarts and mirroring resumes in the same window. Every scrcpy process runs without a console window.
-    Closing a scrcpy window stops monitoring that device; the monitor exits once every window is closed.
+    Closing a scrcpy window stops monitoring that device; it can be reopened from the control panel. Without
+    the control panel (-NoPanel), the monitor exits once every window is closed.
 
-    Recording runs in a separate hidden scrcpy process that can be started and stopped at any time from the
-    tray icon or with -Command. A device restart while recording continues the recording in a new part, and
-    the parts are joined into one MP4 with ffmpeg when the recording stops:
+    Recording runs in a separate hidden scrcpy process that can be started and stopped at any time with the
+    record button in the top-right corner of each scrcpy window (or Alt+E), the control panel, the tray icon
+    or -Command. A device restart while recording continues the recording in a new part, and the parts are
+    joined into one MP4 with ffmpeg when the recording stops:
         <RecordDir>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
     If the device cannot run a second hardware video encoder, the recorder switches to a software encoder.
+
+    The recordings folder is -RecordDir if given, else the folder chosen in the control panel, else the
+    default. When scrcpy.exe is next to this script (portable package), scrcpy, adb and ffmpeg are used from
+    this folder.
+
+    A portable package built with package-portable.ps1 checks its GitHub repository for a newer release at
+    startup (unless -NoUpdateCheck) and from "Check for updates" in the control panel, then updates itself
+    and restarts.
 
     Run scrcpy-monitor.vbs to start the monitor without any visible console window.
 
@@ -34,18 +44,24 @@ param(
     [string]$AdbPath,
     [string]$MsysBin,
     [switch]$Record,
-    [string]$RecordDir = 'D:\Charles Manalo\Recordings',
+    [string]$RecordDir,
     [string]$RecordEncoder = 'auto',
     [string[]]$RecordArgs,
     [switch]$KeepParts,
-    [ValidateSet('StartRecording', 'StopRecording', 'Exit')]
+    [ValidateSet('StartRecording', 'StopRecording', 'ShowPanel', 'Exit')]
     [string]$Command,
     [switch]$List,
     [switch]$NoTray,
+    [switch]$NoPanel,
+    [switch]$NoUpdateCheck,
     [ValidateRange(1, 60)]
     [int]$PollSeconds = 2,
     [Parameter(DontShow)]
     [int]$SendCtrlC,
+    [Parameter(DontShow)]
+    [string]$ApplyUpdate,
+    [Parameter(DontShow)]
+    [string]$UpdateTarget,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ScrcpyArgs
 )
@@ -71,7 +87,9 @@ if ($SendCtrlC) {
 
 $script:StateDir = Join-Path $env:TEMP 'scrcpy-monitor'
 $script:RequestDir = Join-Path $script:StateDir 'requests'
+$script:ControlDir = Join-Path $script:StateDir 'control'
 $script:LogDir = Join-Path $script:StateDir 'logs'
+$script:SettingsPath = Join-Path $env:LOCALAPPDATA 'scrcpy-monitor\settings.json'
 $script:LogPath = Join-Path $script:StateDir 'scrcpy-monitor.log'
 $script:EncoderCachePath = Join-Path $script:StateDir 'encoders.json'
 $mutexName = 'Local\scrcpy-monitor'
@@ -90,11 +108,87 @@ function Show-Error([string]$Message) {
     } catch { }
 }
 
-[void](New-Item -ItemType Directory -Force -Path $script:RequestDir, $script:LogDir)
+[void](New-Item -ItemType Directory -Force -Path $script:RequestDir, $script:ControlDir, $script:LogDir)
 
 $Serial = @($Serial | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $ScrcpyArgs = @($ScrcpyArgs | Where-Object { $_ -and $_ -ne '--' })
 $RecordArgs = @($RecordArgs | Where-Object { $_ })
+
+function Send-MonitorRequest([string]$RequestCommand, [string[]]$Serials) {
+    $name = '{0:yyyyMMddHHmmssfff}-{1}' -f (Get-Date), [guid]::NewGuid().ToString('N')
+    $temp = Join-Path $script:RequestDir "$name.tmp"
+    @{ Command = $RequestCommand; Serial = $Serials } | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination (Join-Path $script:RequestDir "$name.json")
+}
+
+function Test-MonitorRunning {
+    $existing = $null
+    if (-not [System.Threading.Mutex]::TryOpenExisting($mutexName, [ref]$existing)) { return $false }
+    $existing.Dispose()
+    $true
+}
+
+function Get-ProcessesIn([string]$Name, [string]$Folder) {
+    $prefix = $Folder.TrimEnd('\') + '\'
+    @(Get-CimInstance Win32_Process -Filter "Name='$Name'" | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+}
+
+function Wait-ProcessesExit([string]$Name, [string]$Folder, [int]$Seconds) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while (@(Get-ProcessesIn $Name $Folder).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+    foreach ($process in (Get-ProcessesIn $Name $Folder)) {
+        try { Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop } catch { }
+    }
+}
+
+if ($ApplyUpdate) {
+    $updateDir = Join-Path $script:StateDir 'update'
+    $monitorStopped = $false
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        if (Test-Path -LiteralPath $updateDir) { Remove-Item -LiteralPath $updateDir -Recurse -Force }
+        [void](New-Item -ItemType Directory -Force -Path $updateDir)
+        $zip = Join-Path $updateDir 'update.zip'
+        $extractDir = Join-Path $updateDir 'files'
+        Write-Log "Update: downloading $ApplyUpdate"
+        Invoke-WebRequest -Uri $ApplyUpdate -OutFile $zip -UseBasicParsing -Headers @{ 'User-Agent' = 'scrcpy-monitor' }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $extractDir)
+        $source = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter 'scrcpy-monitor.ps1' | Select-Object -First 1
+        if (-not $source -or -not (Test-Path -LiteralPath (Join-Path $source.DirectoryName 'scrcpy.exe'))) { throw 'The downloaded update is not a scrcpy monitor package.' }
+
+        Write-Log 'Update: stopping the monitor.'
+        if (Test-MonitorRunning) { Send-MonitorRequest 'Exit' @() }
+        $monitorStopped = $true
+        $deadline = (Get-Date).AddMinutes(15)
+        while ((Test-MonitorRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+        if (Test-MonitorRunning) { throw 'The monitor did not stop.' }
+
+        Wait-ProcessesExit 'scrcpy.exe' $UpdateTarget 20
+        $adb = Join-Path $UpdateTarget 'adb.exe'
+        if (@(Get-ProcessesIn 'adb.exe' $UpdateTarget).Count -gt 0) {
+            try { & $adb kill-server 2>&1 | Out-Null } catch { }
+            Wait-ProcessesExit 'adb.exe' $UpdateTarget 10
+        }
+
+        Write-Log "Update: copying files to $UpdateTarget"
+        $robocopy = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+        & $robocopy $source.DirectoryName $UpdateTarget /E /R:10 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "Copying the update failed (robocopy exit code $LASTEXITCODE)." }
+        Write-Log 'Update: installed.'
+    } catch {
+        Show-Error "Update failed: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $updateDir -Recurse -Force -ErrorAction SilentlyContinue
+        if ($monitorStopped) {
+            Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') -ArgumentList "`"$(Join-Path $UpdateTarget 'scrcpy-monitor.vbs')`""
+        }
+    }
+    exit 0
+}
 
 if ($Command) {
     $existing = $null
@@ -103,10 +197,7 @@ if ($Command) {
         exit 1
     }
     $existing.Dispose()
-    $name = '{0:yyyyMMddHHmmssfff}-{1}' -f (Get-Date), [guid]::NewGuid().ToString('N')
-    $temp = Join-Path $script:RequestDir "$name.tmp"
-    @{ Command = $Command; Serial = $Serial } | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding UTF8
-    Move-Item -LiteralPath $temp -Destination (Join-Path $script:RequestDir "$name.json")
+    Send-MonitorRequest $Command $Serial
     Write-Host "Sent $Command to the running scrcpy monitor."
     exit 0
 }
@@ -205,7 +296,6 @@ function Start-ScrcpyProcess([string[]]$Arguments, [string]$LogFile) {
 }
 
 function Stop-OrphanServers([string]$DeviceSerial) {
-    # A crashed scrcpy leaves its "adb shell app_process" running, which keeps the log file locked
     $pattern = '"-s" "' + [regex]::Escape($DeviceSerial) + '" "shell" .*app_process.*scid=([0-9a-f]+)'
     foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='adb.exe'" -ErrorAction SilentlyContinue)) {
         if ($process.CommandLine -notmatch $pattern) { continue }
@@ -225,17 +315,22 @@ function Stop-ProcessTree([int]$ProcessId) {
     [void](Invoke-Hidden (Join-Path $env:SystemRoot 'System32\taskkill.exe') @('/PID', "$ProcessId", '/T', '/F') 10000)
 }
 
-function Stop-ScrcpyProcess([System.Diagnostics.Process]$Process, [int]$TimeoutMs = 15000) {
-    if ($Process.HasExited) { return $true }
-    $helper = $null
+function Send-CtrlC([System.Diagnostics.Process]$Process) {
     try {
         $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -SendCtrlC {1}' -f $PSCommandPath, $Process.Id
-        $helper = [System.Diagnostics.Process]::Start((New-HiddenStartInfo $script:PowerShellExe $arguments))
-        [void]$helper.WaitForExit(15000)
+        return [System.Diagnostics.Process]::Start((New-HiddenStartInfo $script:PowerShellExe $arguments))
     } catch {
         Write-Log "Could not send Ctrl+C to process $($Process.Id): $($_.Exception.Message)"
-    } finally {
-        if ($helper) { $helper.Dispose() }
+        return $null
+    }
+}
+
+function Stop-ScrcpyProcess([System.Diagnostics.Process]$Process, [int]$TimeoutMs = 15000) {
+    if ($Process.HasExited) { return $true }
+    $helper = Send-CtrlC $Process
+    if ($helper) {
+        [void]$helper.WaitForExit(15000)
+        $helper.Dispose()
     }
     if ($Process.WaitForExit($TimeoutMs)) { return $true }
     Write-Log "Process $($Process.Id) did not stop gracefully; killing it."
@@ -256,7 +351,6 @@ function Test-VideoFile([string]$Path) {
 function Get-SoftwareEncoder([string]$DeviceSerial) {
     $codec = Get-RecordCodec
     $output = Invoke-Hidden $script:Scrcpy @('-s', $DeviceSerial, '--list-encoders') 30000 -ScrcpyEnvironment -IncludeStdErr
-    # Before Android 10 the encoder type is unknown, so also recognize the AOSP software encoders by name
     $fallback = $null
     foreach ($line in ($output -split "`r?`n")) {
         if ($line -notmatch "--video-codec=$([regex]::Escape($codec))\s+--video-encoder=(\S+)" -or $line -match '\(alias') { continue }
@@ -336,10 +430,39 @@ function New-Session([string]$DeviceSerial) {
         RecorderFailures   = 0
         NextRecordAttempt  = Get-Date
         SoftwareEncoder    = $(if ($RecordEncoder -eq 'auto') { Get-CachedEncoder $DeviceSerial } else { $null })
+        ControlPath        = Join-Path $script:ControlDir "$(ConvertTo-SafeName $DeviceSerial).state"
+        Stopping           = $false
     }
     $script:Sessions[$DeviceSerial] = $session
+    Set-RecordState $session
     if ($script:RecordOnStart) { Start-Recording $session }
     $session
+}
+
+function Set-RecordState($Session) {
+    $state = if ($Session.Recording) { '1' } else { '0' }
+    try { [System.IO.File]::WriteAllText($Session.ControlPath, $state) } catch { Write-Log "[$($Session.Serial)] Could not write $($Session.ControlPath): $($_.Exception.Message)" }
+}
+
+function Invoke-ControlRequests {
+    foreach ($session in @($script:Sessions.Values)) {
+        $requestPath = "$($session.ControlPath).request"
+        if (-not [System.IO.File]::Exists($requestPath)) { continue }
+        $request = ''
+        try {
+            $request = [System.IO.File]::ReadAllText($requestPath).Trim()
+            [System.IO.File]::Delete($requestPath)
+        } catch {
+            continue
+        }
+        Write-Log "[$($session.Serial)] Record button: $request"
+        switch ($request) {
+            'start' { Start-Recording $session }
+            'stop' { Stop-Recording $session }
+        }
+        Set-RecordState $session
+        Update-TrayText
+    }
 }
 
 function Test-DeviceReady($Session, $Devices) {
@@ -355,7 +478,7 @@ function Test-DeviceReady($Session, $Devices) {
 }
 
 function Start-Display($Session) {
-    $arguments = @('-s', $Session.Serial, '--reconnect')
+    $arguments = @('-s', $Session.Serial, '--reconnect', "--record-control=$($Session.ControlPath)")
     if (-not ($ScrcpyArgs | Where-Object { $_ -like '--window-title*' })) { $arguments += "--window-title=$($Session.Title)" }
     $arguments += $ScrcpyArgs
     $log = Join-Path $script:LogDir "$($Session.SafeSerial)-display.log"
@@ -410,6 +533,7 @@ function Start-Recording($Session) {
     $Session.Parts.Clear()
     $Session.RecorderFailures = 0
     $Session.NextRecordAttempt = Get-Date
+    Set-RecordState $Session
     Get-ChildItem -LiteralPath $script:LogDir -Filter "$($Session.SafeSerial)-record*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Show-Notification "Recording requested for $($Session.Title)."
 }
@@ -466,7 +590,6 @@ function Update-Recorder($Session, $Devices, [ref]$Ready) {
     $now = Get-Date
     if ($Session.Recorder) {
         $encoderFailed = Test-EncoderFailure $Session
-        # Right after a boot the server may never come up, leaving the client waiting forever
         $stalled = -not $encoderFailed -and -not $Session.Recorder.HasExited -and
                    ($now - $Session.RecorderStartedAt).TotalSeconds -gt 20 -and -not (Test-Path -LiteralPath $Session.RecorderPart)
         if (-not $Session.Recorder.HasExited -and -not $encoderFailed -and -not $stalled) { return }
@@ -514,11 +637,10 @@ function Update-Recorder($Session, $Devices, [ref]$Ready) {
         }
     }
 
-    if (-not $Session.Recording -or $now -lt $Session.NextRecordAttempt) { return }
+    if (-not $Session.Recording -or $Session.Stopping -or $now -lt $Session.NextRecordAttempt) { return }
     if (-not $Session.Display -or ($now - $Session.DisplayStartedAt).TotalSeconds -lt 5) { return }
     if ($null -eq $Ready.Value) { $Ready.Value = Test-DeviceReady $Session $Devices }
     if (-not $Ready.Value) { return }
-    # Let the window reconnect first, so that both do not push the server at the same time
     if (($now - $Session.BootedAt).TotalSeconds -lt 4) { return }
 
     try {
@@ -533,26 +655,63 @@ function Update-Recorder($Session, $Devices, [ref]$Ready) {
 function Stop-Recording($Session) {
     if (-not $Session.Recording) { return }
     $Session.Recording = $false
-    if ($Session.Recorder) {
-        [void](Stop-ScrcpyProcess $Session.Recorder)
-        $Session.Recorder.Dispose()
-        $Session.Recorder = $null
+    Set-RecordState $Session
+    $stop = [pscustomobject]@{
+        Session  = $Session
+        Recorder = $Session.Recorder
+        Helper   = $null
+        Deadline = (Get-Date).AddSeconds(30)
+        Killed   = $false
+        Title    = $Session.Title
+        Base     = $Session.RecordingBase
+        Parts    = @($Session.Parts)
     }
-    Complete-Recording $Session
+    $Session.Recorder = $null
+    $Session.Parts.Clear()
+    $Session.Stopping = $true
+    if ($stop.Recorder -and -not $stop.Recorder.HasExited) { $stop.Helper = Send-CtrlC $stop.Recorder }
+    [void]$script:Stops.Add($stop)
+    Update-Stops
 }
 
-function Complete-Recording($Session) {
-    $parts = @($Session.Parts | Where-Object { Test-VideoFile $_ })
-    foreach ($part in @($Session.Parts | Where-Object { $parts -notcontains $_ })) {
+function Update-Stops([int]$TimeoutMs = 0) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    do {
+        foreach ($stop in @($script:Stops)) {
+            $now = Get-Date
+            if ($stop.Helper -and $stop.Helper.HasExited) { $stop.Helper.Dispose(); $stop.Helper = $null }
+            if ($stop.Recorder -and -not $stop.Recorder.HasExited) {
+                if ($now -lt $stop.Deadline) { continue }
+                if (-not $stop.Killed) {
+                    Write-Log "Process $($stop.Recorder.Id) did not stop gracefully; killing it."
+                    Stop-ProcessTree $stop.Recorder.Id
+                    $stop.Killed = $true
+                    $stop.Deadline = $now.AddSeconds(5)
+                    continue
+                }
+            }
+            if ($stop.Recorder) { $stop.Recorder.Dispose(); $stop.Recorder = $null }
+            if ($stop.Helper) { $stop.Helper.Dispose(); $stop.Helper = $null }
+            $script:Stops.Remove($stop)
+            if (-not @($script:Stops | Where-Object { $_.Session -eq $stop.Session }).Count) { $stop.Session.Stopping = $false }
+            Complete-Recording $stop.Title $stop.Base $stop.Parts
+        }
+        if ($script:Stops.Count -eq 0 -or (Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds 200
+    } while ($true)
+}
+
+function Complete-Recording([string]$Title, [string]$Base, [string[]]$AllParts) {
+    $parts = @($AllParts | Where-Object { $_ -and (Test-VideoFile $_) })
+    foreach ($part in @($AllParts | Where-Object { $_ -and $parts -notcontains $_ })) {
         Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
     }
-    $Session.Parts.Clear()
-    if (-not $Session.RecordingBase -or $parts.Count -eq 0) {
-        Show-Notification "Recording stopped for $($Session.Title); nothing was recorded."
+    if (-not $Base -or $parts.Count -eq 0) {
+        Show-Notification "Recording stopped for $Title; nothing was recorded."
         return
     }
 
-    $output = "$($Session.RecordingBase).mp4"
+    $output = "$Base.mp4"
     if ($parts.Count -eq 1) {
         Move-Item -LiteralPath $parts[0] -Destination $output
         Show-Notification "Recording saved: $output"
@@ -563,7 +722,6 @@ function Complete-Recording($Session) {
         return
     }
 
-    # scrcpy adds the video and audio streams in arrival order, so normalize each part before concatenation
     $steps = New-Object System.Collections.ArrayList
     $temps = foreach ($part in $parts) {
         $temp = $part -replace '\.mp4$', '_fixed.mp4'
@@ -641,6 +799,10 @@ function Invoke-Requests {
         switch ($request.Command) {
             'StartRecording' { foreach ($session in (Get-TargetSessions $serials)) { Start-Recording $session } }
             'StopRecording' { foreach ($session in (Get-TargetSessions $serials)) { Stop-Recording $session } }
+            'ShowPanel' {
+                if ($script:Panel) { Show-Panel }
+                else { Show-Notification 'scrcpy monitor is already running (see the tray icon).' }
+            }
             'Exit' { Stop-Monitor; return }
         }
     }
@@ -681,7 +843,7 @@ function Invoke-Tick {
     }
 
     $tracked = @($script:Sessions.Values)
-    if ($tracked.Count -gt 0 -and -not ($tracked | Where-Object { -not $_.UserClosed })) {
+    if (-not $script:Panel -and $tracked.Count -gt 0 -and -not ($tracked | Where-Object { -not $_.UserClosed })) {
         Write-Log 'All scrcpy windows were closed.'
         Stop-Monitor
         return
@@ -699,6 +861,13 @@ function Update-TrayText {
 function Update-TrayMenu {
     $menu = $script:Tray.ContextMenuStrip
     $menu.Items.Clear()
+
+    if ($script:Panel) {
+        $showPanel = $menu.Items.Add('Show control panel')
+        $showPanel.Font = New-Object System.Drawing.Font($showPanel.Font, [System.Drawing.FontStyle]::Bold)
+        $showPanel.add_Click({ Invoke-Safely { Show-Panel } })
+        [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    }
 
     $sessions = @($script:Sessions.Values | Where-Object { -not $_.UserClosed } | Sort-Object Title)
     if ($sessions.Count -eq 0) {
@@ -733,6 +902,10 @@ function Update-TrayMenu {
     $openFolder.add_Click({ Invoke-Safely { Open-RecordFolder } })
     $openLog = $menu.Items.Add('Open log')
     $openLog.add_Click({ Invoke-Safely { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" } })
+    if ($script:UpdateConfig) {
+        $checkUpdate = $menu.Items.Add('Check for updates')
+        $checkUpdate.add_Click({ Invoke-Safely { Start-UpdateCheck $true } })
+    }
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $exit = $menu.Items.Add('Exit')
     $exit.add_Click({ Invoke-Safely { Stop-Monitor } })
@@ -752,8 +925,16 @@ function Stop-Monitor {
     $script:Exiting = $true
     $script:Timer.Stop()
     Write-Log 'Stopping monitor.'
+    if ($script:Panel -and $script:Panel.Visible) {
+        Invoke-Safely {
+            $script:PanelStatus.Text = 'Stopping: finishing recordings and closing windows...'
+            $script:Panel.UseWaitCursor = $true
+            $script:Panel.Refresh()
+        }
+    }
     try {
         foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-Recording $session } }
+        Invoke-Safely { Update-Stops 45000 }
         foreach ($session in @($script:Sessions.Values)) {
             Invoke-Safely {
                 if ($session.Connector) {
@@ -774,27 +955,353 @@ function Stop-Monitor {
             $script:Tray.Visible = $false
             $script:Tray.Dispose()
         }
+        if ($script:Panel) { $script:Panel.Dispose() }
         $script:AppContext.ExitThread()
     }
 }
 
+function Open-Window([string[]]$Serials) {
+    foreach ($serial in $Serials) {
+        $session = $script:Sessions[$serial]
+        if (-not $session -or -not $session.UserClosed) { continue }
+        $session.UserClosed = $false
+        $session.DisplayFailures = 0
+        $session.NextDisplayAttempt = Get-Date
+        Write-Log "[$serial] Reopening scrcpy window."
+    }
+    $script:Timer.Stop()
+    $script:Timer.Interval = 100
+    $script:Timer.Start()
+}
+
+function Get-SettingsRecordDir {
+    try {
+        $settings = Get-Content -LiteralPath $script:SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($settings.RecordDir) { return [string]$settings.RecordDir }
+    } catch { }
+    return $null
+}
+
+function Select-RecordFolder {
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    try {
+        $dialog.Description = 'Choose the folder where recordings are saved'
+        if (Test-Path -LiteralPath $RecordDir) { $dialog.SelectedPath = $RecordDir }
+        if ($dialog.ShowDialog($script:Panel) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $script:RecordDir = $dialog.SelectedPath
+    } finally {
+        $dialog.Dispose()
+    }
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:SettingsPath))
+    @{ RecordDir = $RecordDir } | ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+    Write-Log "Recordings folder changed to $RecordDir"
+    Update-Panel
+}
+
+function Get-UpdateConfig {
+    if (-not $portable) { return $null }
+    try {
+        $config = Get-Content -LiteralPath (Join-Path $RepoRoot 'update.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($config.Repo -and $config.Version) {
+            $built = $null
+            if ($config.PSObject.Properties['Built']) {
+                $parsed = [DateTimeOffset]::MinValue
+                if ([DateTimeOffset]::TryParse([string]$config.Built, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { $built = $parsed }
+            }
+            return @{ Repo = [string]$config.Repo; Version = [string]$config.Version; Built = $built }
+        }
+    } catch { }
+    $null
+}
+
+function Show-Message([string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'Information') {
+    $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
+    if ($owner) { return [System.Windows.Forms.MessageBox]::Show($owner, $Text, 'scrcpy monitor', $Buttons, $Icon) }
+    [System.Windows.Forms.MessageBox]::Show($Text, 'scrcpy monitor', $Buttons, $Icon)
+}
+
+function Start-UpdateCheck([bool]$Manual) {
+    if (-not $script:UpdateConfig -or $script:UpdateCheck -or $script:Updating) { return }
+    $shell = [PowerShell]::Create()
+    [void]$shell.AddScript({
+        param($Repo)
+        $ErrorActionPreference = 'Stop'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try {
+            Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 20 -Headers @{ 'User-Agent' = 'scrcpy-monitor'; Accept = 'application/vnd.github+json' }
+        } catch {
+            if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return }
+            throw
+        }
+    }).AddArgument($script:UpdateConfig.Repo)
+    $script:UpdateCheck = @{ Shell = $shell; Handle = $shell.BeginInvoke(); Manual = $Manual }
+    if ($Manual) { $script:UpdateStatus = 'Checking for updates...' }
+}
+
+function Complete-UpdateCheck {
+    $check = $script:UpdateCheck
+    if (-not $check -or -not $check.Handle.IsCompleted) { return }
+    $script:UpdateCheck = $null
+    $script:UpdateStatus = ''
+    try {
+        $release = @($check.Shell.EndInvoke($check.Handle)) | Select-Object -First 1
+    } catch {
+        $message = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        Write-Log "Update check failed: $message"
+        if ($check.Manual) { [void](Show-Message "Could not check for updates:`n$message" 'OK' 'Warning') }
+        return
+    } finally {
+        $check.Shell.Dispose()
+    }
+
+    $current = $script:UpdateConfig.Version
+    $asset = $null
+    if ($release -and $release.PSObject.Properties['assets']) {
+        $asset = @($release.assets | Where-Object { $_.name -like 'scrcpy-monitor-portable-*.zip' }) | Select-Object -First 1
+    }
+    $newer = $true
+    if ($asset -and $script:UpdateConfig.Built -and $release.PSObject.Properties['published_at']) {
+        $published = [DateTimeOffset]::MinValue
+        $publishedText = if ($release.published_at -is [DateTime]) { $release.published_at.ToUniversalTime().ToString('o') } else { [string]$release.published_at }
+        if ([DateTimeOffset]::TryParse($publishedText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$published)) {
+            $newer = $published -gt $script:UpdateConfig.Built
+        }
+    }
+    if (-not $asset -or $release.tag_name -eq $current -or -not $newer) {
+        Write-Log "Update check: $current is up to date."
+        if ($check.Manual) { [void](Show-Message "You have the latest version ($current).") }
+        return
+    }
+
+    $tag = [string]$release.tag_name
+    $script:AvailableUpdate = @{ Tag = $tag; Url = [string]$asset.browser_download_url }
+    Write-Log "Update available: $tag (current: $current)"
+    $notes = if ($release.body) { [string]$release.body } else { '' }
+    if ($notes.Length -gt 600) { $notes = $notes.Substring(0, 600) + '...' }
+    $recording = @($script:Sessions.Values | Where-Object { $_.Recording }).Count
+    $text = "scrcpy monitor $tag is available (you have $current)."
+    if ($notes) { $text += "`n`n$notes" }
+    $text += "`n`nUpdate now? The monitor restarts"
+    $text += if ($recording) { " and the $recording recording(s) in progress are stopped and saved." } else { '.' }
+    if ((Show-Message $text 'YesNo' 'Question') -eq [System.Windows.Forms.DialogResult]::Yes) {
+        Start-Update
+    } else {
+        $script:UpdateStatus = "Update $tag available"
+    }
+}
+
+function Start-Update {
+    $update = $script:AvailableUpdate
+    if ($script:Updating -or -not $update) { return }
+    $updater = Join-Path $script:StateDir 'scrcpy-monitor-updater.ps1'
+    Copy-Item -LiteralPath $script:ScriptPath -Destination $updater -Force
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $updater, '-ApplyUpdate', $update.Url, '-UpdateTarget', $RepoRoot)
+    $script:Updater = Start-Process -FilePath $script:PowerShellExe -ArgumentList (ConvertTo-ArgumentString $arguments) -WindowStyle Hidden -PassThru
+    $script:Updating = $true
+    $script:UpdateStatus = "Downloading update $($update.Tag)... the monitor restarts when it is ready."
+    Write-Log "Updating to $($update.Tag)"
+}
+
+function Update-UpdaterState {
+    if (-not $script:Updater -or -not $script:Updater.HasExited) { return }
+    $script:Updater.Dispose()
+    $script:Updater = $null
+    $script:Updating = $false
+    $script:UpdateStatus = ''
+    Write-Log 'Update was not installed.'
+}
+
+function Get-SessionStatus($Session) {
+    if ($Session.UserClosed) { return 'Window closed' }
+    if ($Session.LastState -ne 'device') {
+        $state = if ($Session.LastState) { $Session.LastState } else { 'missing' }
+        return "Waiting for device ($state)"
+    }
+    if ($Session.Display) { return 'Mirroring' }
+    'Opening window'
+}
+
+function Get-SessionRecordingText($Session) {
+    if (-not $Session.Recording) { return $(if ($Session.Stopping) { 'Saving...' } else { '' }) }
+    $text = 'REC {0:hh\:mm\:ss}' -f ((Get-Date) - $Session.RecordingStartedAt)
+    if ($Session.Stopping) { $text += ' (saving previous)' }
+    elseif (-not $Session.Recorder) { $text += ' (waiting for device)' }
+    elseif ($Session.Parts.Count -gt 1) { $text += " (part $($Session.Parts.Count))" }
+    $text
+}
+
+function Get-SelectedSessions {
+    @($script:PanelList.SelectedItems | ForEach-Object { $script:Sessions[$_.Name] } | Where-Object { $_ })
+}
+
+function Update-PanelButtons {
+    $selected = Get-SelectedSessions
+    $open = @($selected | Where-Object { -not $_.UserClosed })
+    $toStart = @($open | Where-Object { -not $_.Recording })
+    $script:PanelToggle.Text = if ($toStart.Count -gt 0 -or $open.Count -eq 0) { 'Start recording' } else { 'Stop recording' }
+    $script:PanelToggle.Enabled = $open.Count -gt 0
+    $script:PanelOpen.Enabled = @($selected | Where-Object { $_.UserClosed }).Count -gt 0
+}
+
+function Update-Panel {
+    if (-not $script:Panel -or $script:Panel.IsDisposed -or -not $script:Panel.Visible) { return }
+    $list = $script:PanelList
+    $list.BeginUpdate()
+    try {
+        foreach ($session in @($script:Sessions.Values)) {
+            $index = $list.Items.IndexOfKey($session.Serial)
+            if ($index -lt 0) {
+                $item = $list.Items.Add($session.Serial, $session.Title, -1)
+                [void]$item.SubItems.Add('')
+                [void]$item.SubItems.Add('')
+            } else {
+                $item = $list.Items[$index]
+            }
+            $texts = @($session.Title, (Get-SessionStatus $session), (Get-SessionRecordingText $session))
+            for ($i = 0; $i -lt $texts.Count; $i++) {
+                if ($item.SubItems[$i].Text -ne $texts[$i]) { $item.SubItems[$i].Text = $texts[$i] }
+            }
+            $color = if ($session.Recording) { [System.Drawing.Color]::Firebrick } elseif ($session.UserClosed) { [System.Drawing.SystemColors]::GrayText } else { [System.Drawing.SystemColors]::WindowText }
+            if ($item.ForeColor -ne $color) { $item.ForeColor = $color }
+        }
+    } finally {
+        $list.EndUpdate()
+    }
+    $status = "Recordings: $RecordDir"
+    if ($script:Merges.Count -gt 0) { $status = "Joining $($script:Merges.Count) recording(s)...  $status" }
+    if ($script:UpdateStatus) { $status = "$($script:UpdateStatus)  |  $status" }
+    if ($script:PanelStatus.Text -ne $status) { $script:PanelStatus.Text = $status }
+    Update-PanelButtons
+}
+
+function Show-Panel {
+    if (-not $script:Panel -or $script:Panel.IsDisposed) { return }
+    $script:Panel.Show()
+    [void][ScrcpyMonitor.Window]::ShowWindow($script:Panel.Handle, 5)
+    if ($script:Panel.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        $script:Panel.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+    }
+    $script:Panel.Activate()
+    Update-Panel
+}
+
+function New-PanelButton([System.Windows.Forms.Control]$Parent, [string]$Text, [scriptblock]$OnClick) {
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.AutoSize = $true
+    $button.Tag = $OnClick
+    $button.add_Click({
+        param($sender, $e)
+        Invoke-Safely { & $sender.Tag; Update-TrayText; Update-Panel }
+    })
+    $Parent.Controls.Add($button)
+    $button
+}
+
+function New-Panel {
+    Add-Type -Namespace ScrcpyMonitor -Name Window -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = if ($script:UpdateConfig) { "scrcpy monitor $($script:UpdateConfig.Version)" } else { 'scrcpy monitor' }
+    $form.Size = New-Object System.Drawing.Size(720, 380)
+    $form.MinimumSize = New-Object System.Drawing.Size(560, 260)
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    if ($script:Icon) { $form.Icon = $script:Icon }
+
+    $list = New-Object System.Windows.Forms.ListView
+    $list.View = [System.Windows.Forms.View]::Details
+    $list.FullRowSelect = $true
+    $list.HideSelection = $false
+    $list.Sorting = [System.Windows.Forms.SortOrder]::Ascending
+    $list.Dock = [System.Windows.Forms.DockStyle]::Fill
+    [void]$list.Columns.Add('Device', 270)
+    [void]$list.Columns.Add('Status', 190)
+    [void]$list.Columns.Add('Recording', 190)
+    $list.add_SelectedIndexChanged({ Invoke-Safely { Update-PanelButtons } })
+    $form.Controls.Add($list)
+
+    $deviceButtons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $deviceButtons.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $deviceButtons.AutoSize = $true
+    $deviceButtons.Padding = New-Object System.Windows.Forms.Padding(4)
+    $form.Controls.Add($deviceButtons)
+
+    $globalButtons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $globalButtons.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $globalButtons.AutoSize = $true
+    $globalButtons.Padding = New-Object System.Windows.Forms.Padding(4)
+    $form.Controls.Add($globalButtons)
+
+    $statusStrip = New-Object System.Windows.Forms.StatusStrip
+    $statusStrip.SizingGrip = $false
+    $status = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $status.Spring = $true
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    [void]$statusStrip.Items.Add($status)
+    $form.Controls.Add($statusStrip)
+
+    $script:PanelList = $list
+    $script:PanelStatus = $status
+    $script:PanelToggle = New-PanelButton $deviceButtons 'Start recording' {
+        $selected = Get-SelectedSessions | Where-Object { -not $_.UserClosed }
+        $toStart = @($selected | Where-Object { -not $_.Recording })
+        if ($toStart.Count -gt 0) { foreach ($s in $toStart) { Start-Recording $s } }
+        else { foreach ($s in $selected) { Stop-Recording $s } }
+    }
+    $script:PanelOpen = New-PanelButton $deviceButtons 'Open window' { Open-Window @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
+    $list.add_DoubleClick({ Invoke-Safely { $script:PanelToggle.PerformClick() } })
+
+    [void](New-PanelButton $globalButtons 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } })
+    [void](New-PanelButton $globalButtons 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } })
+    [void](New-PanelButton $globalButtons 'Open recordings folder' { Open-RecordFolder })
+    [void](New-PanelButton $globalButtons 'Change folder...' { Select-RecordFolder })
+    [void](New-PanelButton $globalButtons 'Open log' { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" })
+    if ($script:UpdateConfig) { [void](New-PanelButton $globalButtons 'Check for updates' { Start-UpdateCheck $true }) }
+    [void](New-PanelButton $globalButtons 'Exit' { $script:ExitRequested = $true })
+
+    $form.add_FormClosing({
+        param($sender, $e)
+        if ($script:Exiting) { return }
+        $e.Cancel = $true
+        if ($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -and $script:Tray) {
+            $sender.Hide()
+            if (-not $script:PanelHiddenOnce) {
+                $script:PanelHiddenOnce = $true
+                Show-Notification 'scrcpy monitor keeps running in the tray. Double-click the tray icon to show the control panel.'
+            }
+        } else {
+            $script:ExitRequested = $true
+        }
+    })
+    $form.add_Shown({ Invoke-Safely { Update-Panel } })
+    $form
+}
+
 $RepoRoot = $PSScriptRoot
-$buildPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $RepoRoot $BuildDir }
-$script:Scrcpy = Join-Path $buildPath 'app\scrcpy.exe'
-$script:Server = Join-Path $buildPath 'server\scrcpy-server'
-$script:IconDir = Join-Path $RepoRoot 'app\data'
+$script:ScriptPath = $PSCommandPath
+$portable = -not $PSBoundParameters.ContainsKey('BuildDir') -and (Test-Path -LiteralPath (Join-Path $RepoRoot 'scrcpy.exe') -PathType Leaf)
+if ($portable) {
+    $script:Scrcpy = Join-Path $RepoRoot 'scrcpy.exe'
+    $script:Server = Join-Path $RepoRoot 'scrcpy-server'
+    $script:IconDir = $RepoRoot
+} else {
+    $buildPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $RepoRoot $BuildDir }
+    $script:Scrcpy = Join-Path $buildPath 'app\scrcpy.exe'
+    $script:Server = Join-Path $buildPath 'server\scrcpy-server'
+    $script:IconDir = Join-Path $RepoRoot 'app\data'
+}
 $script:PowerShellExe = (Get-Process -Id $PID).Path
 
 if (-not (Test-Path -LiteralPath $script:Scrcpy -PathType Leaf) -or -not (Test-Path -LiteralPath $script:Server -PathType Leaf)) {
-    Show-Error "scrcpy is not built in '$buildPath'. Build it first (meson setup $BuildDir ... then ninja -C $BuildDir) or pass -BuildDir."
+    if ($portable) { Show-Error "scrcpy-server is missing from '$RepoRoot'. Extract the whole package again." }
+    else { Show-Error "scrcpy is not built in '$buildPath'. Build it first (meson setup $BuildDir ... then ninja -C $BuildDir) or pass -BuildDir." }
     exit 1
 }
 
-$msysCandidates = if ($MsysBin) { @($MsysBin) } else { @('D:\msys64\mingw64\bin', 'C:\msys64\mingw64\bin') }
+$msysCandidates = if ($MsysBin) { @($MsysBin) } elseif ($portable) { @($RepoRoot) } else { @('D:\msys64\mingw64\bin', 'C:\msys64\mingw64\bin') }
 $script:MsysBinPath = $msysCandidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'SDL3.dll') } | Select-Object -First 1
 if (-not $script:MsysBinPath) { Write-Log 'WARNING: MSYS2 mingw64\bin with SDL3.dll not found; scrcpy needs its DLLs in PATH.' }
 
-$adbCandidates = @($env:ADB, (Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'))
+$adbCandidates = @($(if ($portable) { Join-Path $RepoRoot 'adb.exe' }), $env:ADB, (Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'))
 $script:Adb = Resolve-Tool $AdbPath $adbCandidates 'adb.exe'
 if (-not $script:Adb) {
     Show-Error 'adb.exe not found. Add platform-tools to PATH or pass -AdbPath.'
@@ -806,8 +1313,15 @@ $script:Ffmpeg = Resolve-Tool $null @($(if ($toolDir) { Join-Path $toolDir 'ffmp
 $script:Ffprobe = Resolve-Tool $null @($(if ($toolDir) { Join-Path $toolDir 'ffprobe.exe' })) 'ffprobe.exe'
 
 if ($ScrcpyArgs | Where-Object { $_ -match '^(--record(=|$)|-r)' }) {
-    Show-Error 'Use -Record (or the tray menu) to record instead of passing --record to scrcpy.'
+    Show-Error 'Use -Record (or the record button) to record instead of passing --record to scrcpy.'
     exit 1
+}
+
+if (-not $RecordDir) {
+    $RecordDir = Get-SettingsRecordDir
+    if (-not $RecordDir) {
+        $RecordDir = if ($portable) { Join-Path ([Environment]::GetFolderPath('MyVideos')) 'scrcpy Recordings' } else { 'D:\Charles Manalo\Recordings' }
+    }
 }
 
 [void](Invoke-Hidden $script:Adb @('start-server') 15000)
@@ -825,29 +1339,48 @@ if ($List) {
 $createdMutex = $false
 $script:Mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdMutex)
 if (-not $createdMutex) {
-    Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording or Exit to control it.'
-    exit 1
+    if ($NoPanel) {
+        Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording, ShowPanel or Exit to control it.'
+        exit 1
+    }
+    Send-MonitorRequest 'ShowPanel' @()
+    exit 0
 }
 
 Get-ChildItem -LiteralPath $script:RequestDir -File | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath $script:ControlDir -File | Remove-Item -Force -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:Sessions = @{}
 $script:Merges = New-Object System.Collections.ArrayList
+$script:Stops = New-Object System.Collections.ArrayList
 $script:Exiting = $false
+$script:ExitRequested = $false
 $script:RecordOnStart = [bool]$Record
 $script:Tray = $null
+$script:Panel = $null
+$script:PanelHiddenOnce = $false
+$script:UpdateConfig = Get-UpdateConfig
+$script:UpdateCheck = $null
+$script:UpdateStatus = ''
+$script:AvailableUpdate = $null
+$script:Updating = $false
+$script:Updater = $null
+$iconPath = Join-Path $script:IconDir 'icon.ico'
+$script:Icon = if (Test-Path -LiteralPath $iconPath) { New-Object System.Drawing.Icon $iconPath } else { $null }
 
 Write-Log "Monitor started (scrcpy: $script:Scrcpy, adb: $script:Adb, devices: $(if ($Serial.Count) { $Serial -join ', ' } else { 'all connected' }), recordings: $RecordDir)"
 
+if (-not $NoPanel) { $script:Panel = New-Panel }
+
 if (-not $NoTray) {
     $script:Tray = New-Object System.Windows.Forms.NotifyIcon
-    $iconPath = Join-Path $script:IconDir 'icon.ico'
-    $script:Tray.Icon = if (Test-Path -LiteralPath $iconPath) { New-Object System.Drawing.Icon $iconPath } else { [System.Drawing.SystemIcons]::Application }
+    $script:Tray.Icon = if ($script:Icon) { $script:Icon } else { [System.Drawing.SystemIcons]::Application }
     $script:Tray.ContextMenuStrip = New-Object System.Windows.Forms.ContextMenuStrip
     $script:Tray.ContextMenuStrip.add_Opening({ Invoke-Safely { Update-TrayMenu } })
-    $script:Tray.add_DoubleClick({ Invoke-Safely { Open-RecordFolder } })
+    $script:Tray.add_DoubleClick({ Invoke-Safely { if ($script:Panel) { Show-Panel } else { Open-RecordFolder } } })
     $script:Tray.Text = 'scrcpy monitor'
     $script:Tray.Visible = $true
 }
@@ -865,10 +1398,29 @@ $script:Timer.add_Tick({
 })
 $script:Timer.Start()
 
+$script:FastTimer = New-Object System.Windows.Forms.Timer
+$script:FastTimer.Interval = 300
+$script:FastTimerTicks = 0
+$script:FastTimer.add_Tick({
+    if ($script:Exiting) { $script:FastTimer.Stop(); return }
+    if ($script:ExitRequested) { Invoke-Safely { Stop-Monitor }; return }
+    Invoke-Safely { Invoke-ControlRequests }
+    Invoke-Safely { Update-Stops }
+    Invoke-Safely { Complete-UpdateCheck }
+    Invoke-Safely { Update-UpdaterState }
+    $script:FastTimerTicks++
+    if ($script:FastTimerTicks % 3 -eq 0) { Invoke-Safely { Update-Panel } }
+})
+$script:FastTimer.Start()
+
+if ($script:Panel) { Show-Panel }
+if (-not $NoUpdateCheck) { Invoke-Safely { Start-UpdateCheck $false } }
+
 try {
     [System.Windows.Forms.Application]::Run($script:AppContext)
 } finally {
     $script:Timer.Dispose()
+    $script:FastTimer.Dispose()
     $script:Mutex.ReleaseMutex()
     $script:Mutex.Dispose()
     Write-Log 'Monitor stopped.'
