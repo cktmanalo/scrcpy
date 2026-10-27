@@ -84,6 +84,7 @@ _scrcpy() {
         --reconnect
         -r --record=
         --raw-key-events
+        --record-control=
         --record-format=
         --record-orientation=
         --render-driver=
@@ -173,7 +174,7 @@ _scrcpy() {
             COMPREPLY=($(compgen -W 'true false if-error' -- "$cur"))
             return
             ;;
-        -r|--record)
+        -r|--record|--record-control)
             COMPREPLY=($(compgen -f -- "$cur"))
             return
             ;;

@@ -340,6 +340,10 @@ sc_screen_render(struct sc_screen *screen, bool update_content_rect) {
     }
 
 end:
+    if (screen->record_control) {
+        sc_record_control_render(screen->record_control, screen->window,
+                                 renderer);
+    }
     sc_sdl_render_present(renderer);
 }
 
@@ -526,6 +530,7 @@ bool
 sc_screen_init(struct sc_screen *screen,
                const struct sc_screen_params *params) {
     screen->controller = params->controller;
+    screen->record_control = params->record_control;
 
     screen->resize_pending = false;
     screen->window_shown = false;
@@ -1238,6 +1243,20 @@ sc_disconnect_on_timeout(struct sc_disconnect *d, void *userdata) {
 
 void
 sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
+    if (screen->record_control) {
+        bool render;
+        bool handle_mouse = screen->window_shown
+                         && !sc_screen_is_relative_mode(screen);
+        if (sc_record_control_handle_event(screen->record_control,
+                                           screen->window, event,
+                                           handle_mouse, &render)) {
+            if (render && screen->window_shown) {
+                sc_screen_render(screen, false);
+            }
+            return;
+        }
+    }
+
     switch (event->type) {
         case SC_EVENT_OPEN_WINDOW: {
             struct sc_size *size = event->user.data1;

@@ -25,6 +25,7 @@
 #include "icon.h"
 #include "keyboard_sdk.h"
 #include "mouse_sdk.h"
+#include "record_control.h"
 #include "recorder.h"
 #include "screen.h"
 #include "sdl_hints.h"
@@ -61,6 +62,7 @@ struct sc_reconnect {
     SDL_Window *window;
     // serial of the device to reconnect to, NULL until the first connection
     char *serial;
+    struct sc_record_control *record_control;
 };
 
 struct sc_reconnect_probe {
@@ -74,6 +76,7 @@ struct sc_reconnect_view {
     SDL_Renderer *renderer;
     SDL_Texture *icon;
     uint32_t background_color;
+    struct sc_record_control *record_control;
 };
 
 struct scrcpy {
@@ -853,6 +856,7 @@ aoa_complete:
             .reconnect = options->reconnect,
             .window = rc->window,
             .controller = controller,
+            .record_control = rc->record_control,
             .fp = fp,
             .kp = kp,
             .mp = mp,
@@ -1296,16 +1300,22 @@ sc_reconnect_view_render(struct sc_reconnect_view *view) {
         SDL_RenderTexture(renderer, view->icon, NULL, &rect);
     }
 
+    if (view->record_control) {
+        sc_record_control_render(view->record_control, view->window, renderer);
+    }
+
     sc_sdl_render_present(renderer);
 }
 
 static void
 sc_reconnect_view_init(struct sc_reconnect_view *view, SDL_Window *window,
-                       uint32_t background_color) {
+                       uint32_t background_color,
+                       struct sc_record_control *record_control) {
     view->window = window;
     view->renderer = NULL;
     view->icon = NULL;
     view->background_color = background_color;
+    view->record_control = record_control;
 
     if (!window) {
         return;
@@ -1389,7 +1399,8 @@ wait_for_device(const struct scrcpy_options *options, struct sc_reconnect *rc,
     LOGI("Waiting for device %s to reconnect...", rc->serial);
 
     struct sc_reconnect_view view;
-    sc_reconnect_view_init(&view, rc->window, options->background_color);
+    sc_reconnect_view_init(&view, rc->window, options->background_color,
+                           rc->record_control);
 
     sc_thread thread;
     bool probing = false;
@@ -1412,6 +1423,17 @@ wait_for_device(const struct scrcpy_options *options, struct sc_reconnect *rc,
         SDL_Event event;
         if (!SDL_WaitEventTimeout(&event, 100)) {
             continue;
+        }
+
+        if (rc->record_control) {
+            bool render;
+            if (sc_record_control_handle_event(rc->record_control, rc->window,
+                                               &event, true, &render)) {
+                if (render) {
+                    sc_reconnect_view_render(&view);
+                }
+                continue;
+            }
         }
 
         switch (event.type) {
@@ -1464,7 +1486,17 @@ scrcpy(struct scrcpy_options *options) {
     struct sc_reconnect rc = {
         .window = NULL,
         .serial = NULL,
+        .record_control = NULL,
     };
+
+    struct sc_record_control record_control;
+    if (options->record_control) {
+        if (!sc_record_control_init(&record_control, options->record_control,
+                                    options->shortcut_mods)) {
+            return SCRCPY_EXIT_FAILURE;
+        }
+        rc.record_control = &record_control;
+    }
 
     enum scrcpy_exit_code ret = run_session(options, &rc);
 
@@ -1490,6 +1522,9 @@ scrcpy(struct scrcpy_options *options) {
         SDL_DestroyWindow(rc.window);
     }
     free(rc.serial);
+    if (rc.record_control) {
+        sc_record_control_destroy(rc.record_control);
+    }
 
     return ret;
 }

@@ -32,6 +32,7 @@ _<kbd>[Super]</kbd> is typically the <kbd>Windows</kbd> or <kbd>Cmd</kbd> key._
  | Pause or re-pause display                   | <kbd>MOD</kbd>+<kbd>z</kbd>
  | Unpause display                             | <kbd>MOD</kbd>+<kbd>Shift</kbd>+<kbd>z</kbd>
  | Reset video capture/encoding                | <kbd>MOD</kbd>+<kbd>Shift</kbd>+<kbd>r</kbd>
+ | Start/stop external recording⁶              | <kbd>MOD</kbd>+<kbd>e</kbd>
  | Resize window to 1:1 (pixel-perfect)        | <kbd>MOD</kbd>+<kbd>g</kbd>
  | Resize window to remove black borders       | <kbd>MOD</kbd>+<kbd>w</kbd> \| _Double-left-click¹_
  | Click on `HOME`                             | <kbd>MOD</kbd>+<kbd>h</kbd> \| _Middle-click_
@@ -68,7 +69,8 @@ _¹Double-click on black borders to remove them._
 _²Right-click turns the screen on if it was off, presses BACK otherwise._  
 _³4th and 5th mouse buttons, if your mouse has them._  
 _⁴For react-native apps in development, `MENU` triggers development menu._  
-_⁵Only on Android >= 7._
+_⁵Only on Android >= 7._  
+_⁶Only with [`--record-control`](recording.md#external-recording-control)._
 
 Shortcuts with repeated keys are executed by releasing and pressing the key a
 second time. For example, to execute "Expand settings panel":

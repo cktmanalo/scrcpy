@@ -110,6 +110,7 @@ const struct scrcpy_options scrcpy_options_default = {
     .require_audio = false,
     .kill_adb_on_close = false,
     .reconnect = false,
+    .record_control = NULL,
     .camera_high_speed = false,
     .list = 0,
     .window = true,

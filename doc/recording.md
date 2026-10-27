@@ -92,3 +92,19 @@ mirroring:
 ```bash
 scrcpy --time-limit=20
 ```
+
+
+## External recording control
+
+To show a start/stop recording button in the top-right corner of the window,
+for a recorder running outside this scrcpy instance (for example a separate
+`scrcpy --no-window --record=...` process managed by a script):
+
+```bash
+scrcpy --record-control=/tmp/rec
+```
+
+The recording state is read from the file (`1` when recording, `0` otherwise).
+A click on the button (or <kbd>MOD</kbd>+<kbd>e</kbd>) writes `start` or `stop`
+to `/tmp/rec.request`; the external recorder is responsible for handling the
+request and updating the state file.

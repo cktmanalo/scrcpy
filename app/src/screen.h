@@ -18,6 +18,7 @@
 #include "input_manager.h"
 #include "mouse_capture.h"
 #include "options.h"
+#include "record_control.h"
 #include "texture.h"
 #include "trait/key_processor.h"
 #include "trait/frame_sink.h"
@@ -47,6 +48,7 @@ struct sc_screen {
     bool awaiting_first_frame;
 
     struct sc_controller *controller;
+    struct sc_record_control *record_control;
 
     struct sc_screen_bg_color {
         uint8_t r;
@@ -130,6 +132,7 @@ struct sc_screen_params {
     SDL_Window *window;
 
     struct sc_controller *controller;
+    struct sc_record_control *record_control;
     struct sc_file_pusher *fp;
     struct sc_key_processor *kp;
     struct sc_mouse_processor *mp;

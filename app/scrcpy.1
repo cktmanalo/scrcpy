@@ -541,6 +541,13 @@ option if set, or by the file extension.
 Inject key events for all input keys, and ignore text events.
 
 .TP
+.BI "\-\-record\-control " file
+Show a start/stop recording button in the window, for an external recorder.
+
+The recording state is read from the file ("1" when recording, "0" otherwise), and a click on the button (or MOD+e) writes "start" or "stop" to
+.IR file .request.
+
+.TP
 .BI "\-\-record\-format " format
 Force recording format (mp4, mkv, m4a, mka, opus, aac, flac or wav).
 
@@ -792,6 +799,10 @@ Unpause display
 .TP
 .B MOD+Shift+r
 Reset video capture/encoding
+
+.TP
+.B MOD+e
+Request to start/stop the external recording (with \-\-record\-control)
 
 .TP
 .B MOD+g

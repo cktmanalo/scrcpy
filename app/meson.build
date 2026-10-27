@@ -30,6 +30,7 @@ src = [
     'src/options.c',
     'src/packet_merger.c',
     'src/receiver.c',
+    'src/record_control.c',
     'src/recorder.c',
     'src/scrcpy.c',
     'src/screen.c',

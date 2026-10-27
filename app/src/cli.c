@@ -113,6 +113,7 @@ enum {
     OPT_NO_TERMINAL_TITLE,
     OPT_HWDEC,
     OPT_RECONNECT,
+    OPT_RECORD_CONTROL,
 };
 
 struct sc_option {
@@ -815,6 +816,16 @@ static const struct sc_option options[] = {
         .text = "Inject key events for all input keys, and ignore text events."
     },
     {
+        .longopt_id = OPT_RECORD_CONTROL,
+        .longopt = "record-control",
+        .argdesc = "file",
+        .text = "Show a start/stop recording button in the window, for an "
+                "external recorder.\n"
+                "The recording state is read from the file (\"1\" when "
+                "recording, \"0\" otherwise), and a click on the button (or "
+                "MOD+e) writes \"start\" or \"stop\" to <file>.request.",
+    },
+    {
         .longopt_id = OPT_RECORD_FORMAT,
         .longopt = "record-format",
         .argdesc = "format",
@@ -1123,6 +1134,11 @@ static const struct sc_shortcut shortcuts[] = {
     {
         .shortcuts = { "MOD+Shift+r" },
         .text = "Reset video capture/encoding",
+    },
+    {
+        .shortcuts = { "MOD+e" },
+        .text = "Request to start/stop the external recording (with "
+                "--record-control)",
     },
     {
         .shortcuts = { "MOD+g" },
@@ -2907,6 +2923,9 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
             case OPT_RECONNECT:
                 opts->reconnect = true;
                 break;
+            case OPT_RECORD_CONTROL:
+                opts->record_control = optarg;
+                break;
             case OPT_TIME_LIMIT:
                 if (!parse_time_limit(optarg, &opts->time_limit)) {
                     return false;
@@ -3438,6 +3457,11 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         }
     }
 
+    if (opts->record_control && !opts->video_playback) {
+        LOGW("--record-control ignored without video playback");
+        opts->record_control = NULL;
+    }
+
     if (opts->record_filename) {
         if (!opts->video && !opts->audio) {
             LOGE("Video and audio disabled, nothing to record");
@@ -3602,6 +3626,10 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         }
         if (opts->reconnect) {
             LOGE("OTG mode: could not reconnect");
+            return false;
+        }
+        if (opts->record_control) {
+            LOGE("OTG mode: could not control recording");
             return false;
         }
     }

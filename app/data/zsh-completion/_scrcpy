@@ -89,6 +89,7 @@ arguments=(
     '--reconnect[Keep the window open and mirror again when the device reconnects]'
     {-r,--record=}'[Record screen to file]:record file:_files'
     '--raw-key-events[Inject key events for all input keys, and ignore text events]'
+    '--record-control=[Show a start/stop recording button for an external recorder]:control file:_files'
     '--record-format=[Force recording format]:format:(mp4 mkv m4a mka opus aac flac wav)'
     '--record-orientation=[Set the record orientation]:orientation values:(0 90 180 270)'
     '--render-driver=[Request SDL to use the given render driver]:driver name:(direct3d opengl opengles2 opengles metal software)'
