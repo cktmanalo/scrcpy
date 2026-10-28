@@ -151,30 +151,31 @@ SETUP (once)
 
 START
   Double-click "scrcpy-monitor.vbs" (or the desktop shortcut).
-  A window opens for every connected device, plus the "scrcpy monitor" control panel.
-  Running it again while it is already running just shows the control panel.
+  A window opens for every connected device. The monitor runs in the background with a tray icon
+  (notification area); no other window is shown.
+  Running it again while it is already running reopens any device window you closed.
 
 RECORD
   - Click the round button in the top-right corner of a device window (red dot = start, white square =
     stop), or press Alt+E in that window.
-  - Or use the control panel: select devices, then "Start recording"/"Stop recording", or "Start all"
-    and "Stop all".
-  - Or right-click the tray icon.
+  - Or right-click the tray icon: pick a device > Start/Stop recording, or "Start/Stop recording on all
+    devices".
   If the device restarts while recording, the recording continues automatically; the parts are
   joined into a single MP4 when the recording stops.
 
   Recordings are saved as:
     <Recordings folder>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
-  The default folder is "Videos\scrcpy Recordings". Use "Change folder..." in the control panel to
-  change it, and "Open recordings folder" to open it.
+  The default folder is "Videos\scrcpy Recordings". Right-click the tray icon > "Change recordings
+  folder..." to change it, and "Open recordings folder" (or double-click the tray icon) to open it.
 
 CLOSE
-  Closing a device window stops mirroring that device (use "Open window" in the control panel to
-  reopen it). Closing the control panel keeps the monitor running in the tray; use "Exit" to quit.
-  Exiting stops and saves any recording in progress.
+  Closing a device window stops mirroring that device (right-click the tray icon > the device >
+  "Open window" to reopen it). When every device window is closed, the monitor exits.
+  Right-click the tray icon > "Exit" also quits. Exiting stops and saves any recording in progress.
+  An optional "Control panel" with the same actions is in the tray icon menu.
 
 UPDATES
-  At startup, and when you click "Check for updates" in the control panel (or the tray menu), the
+  At startup, and when you click "Check for updates" in the tray icon menu, the
   monitor checks https://github.com/$UpdateRepo/releases for a newer version. Accept the prompt to
   download it; the monitor stops (saving any recording), updates this folder and restarts.
   Your recordings folder setting is kept.
@@ -182,7 +183,7 @@ UPDATES
 TROUBLESHOOTING
   - No device listed: check the USB cable and USB debugging authorization ("adb.exe devices" in this
     folder lists the devices).
-  - "Open log" in the control panel shows what happened; per-device logs are in
+  - Right-click the tray icon > "Open log" shows what happened; per-device logs are in
     %TEMP%\scrcpy-monitor\logs.
   - If Windows blocks the files after downloading the ZIP: right-click the ZIP > Properties >
     Unblock, then extract it again.

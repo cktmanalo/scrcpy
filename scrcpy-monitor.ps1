@@ -6,22 +6,23 @@
 .DESCRIPTION
     One scrcpy window is opened per device with --reconnect, so the window stays open while the device
     restarts and mirroring resumes in the same window. Every scrcpy process runs without a console window.
-    Closing a scrcpy window stops monitoring that device; it can be reopened from the control panel. Without
-    the control panel (-NoPanel), the monitor exits once every window is closed.
+    Closing a scrcpy window stops monitoring that device; it can be reopened from the tray icon or by
+    running the monitor again. The monitor exits once every window is closed, unless the control panel is
+    open. The control panel is hidden by default and is opened from the tray icon menu.
 
     Recording runs in a separate hidden scrcpy process that can be started and stopped at any time with the
-    record button in the top-right corner of each scrcpy window (or Alt+E), the control panel, the tray icon
+    record button in the top-right corner of each scrcpy window (or Alt+E), the tray icon, the control panel
     or -Command. A device restart while recording continues the recording in a new part, and the parts are
     joined into one MP4 with ffmpeg when the recording stops:
         <RecordDir>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
     If the device cannot run a second hardware video encoder, the recorder switches to a software encoder.
 
-    The recordings folder is -RecordDir if given, else the folder chosen in the control panel, else the
+    The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
     default. When scrcpy.exe is next to this script (portable package), scrcpy, adb and ffmpeg are used from
     this folder.
 
     A portable package built with package-portable.ps1 checks its GitHub repository for a newer release at
-    startup (unless -NoUpdateCheck) and from "Check for updates" in the control panel, then updates itself
+    startup (unless -NoUpdateCheck) and from "Check for updates" in the tray icon menu, then updates itself
     and restarts.
 
     Run scrcpy-monitor.vbs to start the monitor without any visible console window.
@@ -118,7 +119,9 @@ function Send-MonitorRequest([string]$RequestCommand, [string[]]$Serials) {
     $name = '{0:yyyyMMddHHmmssfff}-{1}' -f (Get-Date), [guid]::NewGuid().ToString('N')
     $temp = Join-Path $script:RequestDir "$name.tmp"
     @{ Command = $RequestCommand; Serial = $Serials } | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding UTF8
-    Move-Item -LiteralPath $temp -Destination (Join-Path $script:RequestDir "$name.json")
+    $request = Join-Path $script:RequestDir "$name.json"
+    Move-Item -LiteralPath $temp -Destination $request
+    $request
 }
 
 function Test-MonitorRunning {
@@ -161,7 +164,7 @@ if ($ApplyUpdate) {
         if (-not $source -or -not (Test-Path -LiteralPath (Join-Path $source.DirectoryName 'scrcpy.exe'))) { throw 'The downloaded update is not a scrcpy monitor package.' }
 
         Write-Log 'Update: stopping the monitor.'
-        if (Test-MonitorRunning) { Send-MonitorRequest 'Exit' @() }
+        if (Test-MonitorRunning) { [void](Send-MonitorRequest 'Exit' @()) }
         $monitorStopped = $true
         $deadline = (Get-Date).AddMinutes(15)
         while ((Test-MonitorRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
@@ -197,7 +200,7 @@ if ($Command) {
         exit 1
     }
     $existing.Dispose()
-    Send-MonitorRequest $Command $Serial
+    [void](Send-MonitorRequest $Command $Serial)
     Write-Host "Sent $Command to the running scrcpy monitor."
     exit 0
 }
@@ -556,7 +559,7 @@ function Start-RecorderPart($Session) {
     }
 
     $part = '{0}_part{1:D2}.mp4' -f $Session.RecordingBase, ($Session.Parts.Count + 1)
-    $arguments = @('-s', $Session.Serial, '--no-playback', '--no-control', "--record=$part", '--record-format=mp4')
+    $arguments = @('-s', $Session.Serial, '--no-window', '--no-playback', '--no-control', "--record=$part", '--record-format=mp4')
     if ($RecordEncoder -ne 'auto') { $arguments += "--video-encoder=$RecordEncoder" }
     elseif ($Session.SoftwareEncoder) { $arguments += "--video-encoder=$($Session.SoftwareEncoder)" }
     $arguments += $RecordArgs
@@ -803,6 +806,7 @@ function Invoke-Requests {
                 if ($script:Panel) { Show-Panel }
                 else { Show-Notification 'scrcpy monitor is already running (see the tray icon).' }
             }
+            'OpenWindows' { $script:OpenWindowsRequested = $true }
             'Exit' { Stop-Monitor; return }
         }
     }
@@ -843,7 +847,13 @@ function Invoke-Tick {
     }
 
     $tracked = @($script:Sessions.Values)
-    if (-not $script:Panel -and $tracked.Count -gt 0 -and -not ($tracked | Where-Object { -not $_.UserClosed })) {
+    if ($script:OpenWindowsRequested) {
+        $script:OpenWindowsRequested = $false
+        $closed = @($tracked | Where-Object { $_.UserClosed } | ForEach-Object { $_.Serial })
+        if ($closed.Count) { Open-Window $closed }
+        else { Show-Notification 'scrcpy monitor is already running. Right-click the tray icon for recording and settings.' }
+    }
+    if (-not ($script:Panel -and $script:Panel.Visible) -and $tracked.Count -gt 0 -and -not ($tracked | Where-Object { -not $_.UserClosed })) {
         Write-Log 'All scrcpy windows were closed.'
         Stop-Monitor
         return
@@ -862,15 +872,9 @@ function Update-TrayMenu {
     $menu = $script:Tray.ContextMenuStrip
     $menu.Items.Clear()
 
-    if ($script:Panel) {
-        $showPanel = $menu.Items.Add('Show control panel')
-        $showPanel.Font = New-Object System.Drawing.Font($showPanel.Font, [System.Drawing.FontStyle]::Bold)
-        $showPanel.add_Click({ Invoke-Safely { Show-Panel } })
-        [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-    }
-
     $sessions = @($script:Sessions.Values | Where-Object { -not $_.UserClosed } | Sort-Object Title)
-    if ($sessions.Count -eq 0) {
+    $closed = @($script:Sessions.Values | Where-Object { $_.UserClosed } | Sort-Object Title)
+    if ($sessions.Count -eq 0 -and $closed.Count -eq 0) {
         $empty = New-Object System.Windows.Forms.ToolStripMenuItem 'No device'
         $empty.Enabled = $false
         [void]$menu.Items.Add($empty)
@@ -891,6 +895,14 @@ function Update-TrayMenu {
         [void]$item.DropDownItems.Add($toggle)
         [void]$menu.Items.Add($item)
     }
+    foreach ($session in $closed) {
+        $item = New-Object System.Windows.Forms.ToolStripMenuItem "$($session.Title)  [closed]"
+        $open = New-Object System.Windows.Forms.ToolStripMenuItem 'Open window'
+        $open.Tag = $session.Serial
+        $open.add_Click({ param($sender, $e) Invoke-Safely { Open-Window @($sender.Tag) } })
+        [void]$item.DropDownItems.Add($open)
+        [void]$menu.Items.Add($item)
+    }
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $startAll = $menu.Items.Add('Start recording on all devices')
@@ -900,11 +912,17 @@ function Update-TrayMenu {
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $openFolder = $menu.Items.Add('Open recordings folder')
     $openFolder.add_Click({ Invoke-Safely { Open-RecordFolder } })
+    $changeFolder = $menu.Items.Add('Change recordings folder...')
+    $changeFolder.add_Click({ Invoke-Safely { Select-RecordFolder } })
     $openLog = $menu.Items.Add('Open log')
     $openLog.add_Click({ Invoke-Safely { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" } })
     if ($script:UpdateConfig) {
         $checkUpdate = $menu.Items.Add('Check for updates')
         $checkUpdate.add_Click({ Invoke-Safely { Start-UpdateCheck $true } })
+    }
+    if ($script:Panel) {
+        $showPanel = $menu.Items.Add('Control panel')
+        $showPanel.add_Click({ Invoke-Safely { Show-Panel } })
     }
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $exit = $menu.Items.Add('Exit')
@@ -987,7 +1005,8 @@ function Select-RecordFolder {
     try {
         $dialog.Description = 'Choose the folder where recordings are saved'
         if (Test-Path -LiteralPath $RecordDir) { $dialog.SelectedPath = $RecordDir }
-        if ($dialog.ShowDialog($script:Panel) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
+        if ($dialog.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return }
         $script:RecordDir = $dialog.SelectedPath
     } finally {
         $dialog.Dispose()
@@ -1262,12 +1281,8 @@ function New-Panel {
         param($sender, $e)
         if ($script:Exiting) { return }
         $e.Cancel = $true
-        if ($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -and $script:Tray) {
+        if ($e.CloseReason -ne [System.Windows.Forms.CloseReason]::WindowsShutDown -and $script:Tray) {
             $sender.Hide()
-            if (-not $script:PanelHiddenOnce) {
-                $script:PanelHiddenOnce = $true
-                Show-Notification 'scrcpy monitor keeps running in the tray. Double-click the tray icon to show the control panel.'
-            }
         } else {
             $script:ExitRequested = $true
         }
@@ -1343,8 +1358,13 @@ if (-not $createdMutex) {
         Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording, ShowPanel or Exit to control it.'
         exit 1
     }
-    Send-MonitorRequest 'ShowPanel' @()
-    exit 0
+    $request = Send-MonitorRequest 'OpenWindows' @()
+    $deadline = (Get-Date).AddMinutes(15)
+    $acquired = $false
+    while (-not $acquired -and (Test-Path -LiteralPath $request) -and (Get-Date) -lt $deadline) {
+        try { $acquired = $script:Mutex.WaitOne(1000) } catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+    }
+    if (-not $acquired) { exit 0 }
 }
 
 Get-ChildItem -LiteralPath $script:RequestDir -File | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -1358,10 +1378,10 @@ $script:Merges = New-Object System.Collections.ArrayList
 $script:Stops = New-Object System.Collections.ArrayList
 $script:Exiting = $false
 $script:ExitRequested = $false
+$script:OpenWindowsRequested = $false
 $script:RecordOnStart = [bool]$Record
 $script:Tray = $null
 $script:Panel = $null
-$script:PanelHiddenOnce = $false
 $script:UpdateConfig = Get-UpdateConfig
 $script:UpdateCheck = $null
 $script:UpdateStatus = ''
@@ -1380,7 +1400,7 @@ if (-not $NoTray) {
     $script:Tray.Icon = if ($script:Icon) { $script:Icon } else { [System.Drawing.SystemIcons]::Application }
     $script:Tray.ContextMenuStrip = New-Object System.Windows.Forms.ContextMenuStrip
     $script:Tray.ContextMenuStrip.add_Opening({ Invoke-Safely { Update-TrayMenu } })
-    $script:Tray.add_DoubleClick({ Invoke-Safely { if ($script:Panel) { Show-Panel } else { Open-RecordFolder } } })
+    $script:Tray.add_DoubleClick({ Invoke-Safely { Open-RecordFolder } })
     $script:Tray.Text = 'scrcpy monitor'
     $script:Tray.Visible = $true
 }
@@ -1413,7 +1433,6 @@ $script:FastTimer.add_Tick({
 })
 $script:FastTimer.Start()
 
-if ($script:Panel) { Show-Panel }
 if (-not $NoUpdateCheck) { Invoke-Safely { Start-UpdateCheck $false } }
 
 try {
