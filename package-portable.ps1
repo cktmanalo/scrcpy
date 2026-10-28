@@ -66,9 +66,10 @@ function Copy-Required([string]$Source, [string]$Destination) {
 if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) { throw "MSYS2 not found in '$MsysRoot' (use -MsysRoot)." }
 if (-not (Test-Path -LiteralPath (Join-Path $AdbDir 'adb.exe') -PathType Leaf)) { throw "adb.exe not found in '$AdbDir' (use -AdbDir)." }
 
-$version = (& git -C $root describe --tags --always --dirty 2>$null)
+$version = (& git -C $root describe --tags --match 'v[0-9]*' --always --dirty 2>$null)
 if (-not $version) { $version = Get-Date -Format 'yyyyMMdd' }
 $tag = "qa-$version"
+$displayVersion = if ($version -match '^v?(\d+(?:\.\d+)+)(?:-(\d+)-g[0-9a-f]+)?(?:-dirty)?$') { '{0}.{1}' -f $Matches[1], $(if ($Matches[2]) { $Matches[2] } else { '0' }) } else { $version }
 
 if ($Publish) {
     if ($NoZip) { throw '-Publish needs the ZIP; remove -NoZip.' }
@@ -151,31 +152,32 @@ SETUP (once)
 
 START
   Double-click "scrcpy-monitor.vbs" (or the desktop shortcut).
-  A window opens for every connected device. The monitor runs in the background with a tray icon
-  (notification area); no other window is shown.
-  Running it again while it is already running reopens any device window you closed.
+  A window opens for every connected device (USB or Wi-Fi/TCP), and the "scrcpy monitor" control
+  panel appears as soon as the first device screen starts sharing. Running it again while it is
+  already running shows the control panel and reopens any device window you closed.
 
 RECORD
   - Click the round button in the top-right corner of a device window (red dot = start, white square =
     stop), or press Alt+E in that window.
-  - Or right-click the tray icon: pick a device > Start/Stop recording, or "Start/Stop recording on all
-    devices".
+  - Or use the control panel: select devices, then "Start recording"/"Stop recording", or "Start all"
+    and "Stop all".
+  - Or right-click the tray icon.
   If the device restarts while recording, the recording continues automatically; the parts are
   joined into a single MP4 when the recording stops.
 
   Recordings are saved as:
     <Recordings folder>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
-  The default folder is "Videos\scrcpy Recordings". Right-click the tray icon > "Change recordings
-  folder..." to change it, and "Open recordings folder" (or double-click the tray icon) to open it.
+  The default folder is "Videos\scrcpy Recordings". Use "Change folder..." in the control panel to
+  change it, and "Open recordings folder" to open it.
 
 CLOSE
-  Closing a device window stops mirroring that device (right-click the tray icon > the device >
-  "Open window" to reopen it). When every device window is closed, the monitor exits.
-  Right-click the tray icon > "Exit" also quits. Exiting stops and saves any recording in progress.
-  An optional "Control panel" with the same actions is in the tray icon menu.
+  Closing a device window stops mirroring that device (use "Open window" in the control panel or the
+  tray icon menu to reopen it). Closing the control panel keeps the monitor running in the tray
+  (double-click the tray icon to show it again); the monitor exits once every device window is closed.
+  Use "Exit" to quit. Exiting stops and saves any recording in progress.
 
 UPDATES
-  At startup, and when you click "Check for updates" in the tray icon menu, the
+  At startup, and when you click "Check for updates" in the control panel (or the tray menu), the
   monitor checks https://github.com/$UpdateRepo/releases for a newer version. Accept the prompt to
   download it; the monitor stops (saving any recording), updates this folder and restarts.
   Your recordings folder setting is kept.
@@ -183,8 +185,8 @@ UPDATES
 TROUBLESHOOTING
   - No device listed: check the USB cable and USB debugging authorization ("adb.exe devices" in this
     folder lists the devices).
-  - Right-click the tray icon > "Open log" shows what happened; per-device logs are in
-    %TEMP%\scrcpy-monitor\logs.
+  - "Open log" in the control panel shows what happened; per-device logs are in
+    %TEMP%\scrcpy-monitor\logs. "About" shows the version to include when reporting a problem.
   - If Windows blocks the files after downloading the ZIP: right-click the ZIP > Properties >
     Unblock, then extract it again.
 
@@ -209,7 +211,7 @@ if ($Publish) {
     Set-Content -LiteralPath $notesFile -Value $text -Encoding UTF8
     try {
         Write-Host "Publishing $tag to $UpdateRepo..."
-        & gh release create $tag $zip --repo $UpdateRepo --target $head --title "scrcpy monitor $tag" --notes-file $notesFile --latest
+        & gh release create $tag $zip --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
         if ($LASTEXITCODE) { throw "gh release create failed ($LASTEXITCODE)." }
     } finally {
         Remove-Item -LiteralPath $notesFile -Force -ErrorAction SilentlyContinue

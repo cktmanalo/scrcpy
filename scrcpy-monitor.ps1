@@ -6,12 +6,13 @@
 .DESCRIPTION
     One scrcpy window is opened per device with --reconnect, so the window stays open while the device
     restarts and mirroring resumes in the same window. Every scrcpy process runs without a console window.
-    Closing a scrcpy window stops monitoring that device; it can be reopened from the tray icon or by
-    running the monitor again. The monitor exits once every window is closed, unless the control panel is
-    open. The control panel is hidden by default and is opened from the tray icon menu.
+    Closing a scrcpy window stops monitoring that device; it can be reopened from the control panel, the
+    tray icon or by running the monitor again. Once every window is closed, the monitor exits unless the
+    control panel is open. The control panel opens when the first device window starts; closing it keeps
+    the monitor in the tray.
 
     Recording runs in a separate hidden scrcpy process that can be started and stopped at any time with the
-    record button in the top-right corner of each scrcpy window (or Alt+E), the tray icon, the control panel
+    record button in the top-right corner of each scrcpy window (or Alt+E), the control panel, the tray icon
     or -Command. A device restart while recording continues the recording in a new part, and the parts are
     joined into one MP4 with ffmpeg when the recording stops:
         <RecordDir>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
@@ -21,9 +22,10 @@
     default. When scrcpy.exe is next to this script (portable package), scrcpy, adb and ffmpeg are used from
     this folder.
 
-    A portable package built with package-portable.ps1 checks its GitHub repository for a newer release at
-    startup (unless -NoUpdateCheck) and from "Check for updates" in the tray icon menu, then updates itself
-    and restarts.
+    At startup (unless -NoUpdateCheck) and from "Check for updates" in the control panel or tray icon, the
+    monitor checks its GitHub repository for a newer release. A portable package built with
+    package-portable.ps1 then updates itself and restarts; a git checkout (repository of the origin remote)
+    only offers to open the release page.
 
     Run scrcpy-monitor.vbs to start the monitor without any visible console window.
 
@@ -489,6 +491,7 @@ function Start-Display($Session) {
     Write-Log "[$($Session.Serial)] Starting scrcpy window: $(ConvertTo-ArgumentString $arguments)"
     $Session.Display = Start-ScrcpyProcess $arguments $log
     $Session.DisplayStartedAt = Get-Date
+    if ($script:PanelPending) { Show-Panel }
 }
 
 function Update-Display($Session, $Devices, [ref]$Ready) {
@@ -851,7 +854,8 @@ function Invoke-Tick {
         $script:OpenWindowsRequested = $false
         $closed = @($tracked | Where-Object { $_.UserClosed } | ForEach-Object { $_.Serial })
         if ($closed.Count) { Open-Window $closed }
-        else { Show-Notification 'scrcpy monitor is already running. Right-click the tray icon for recording and settings.' }
+        if ($script:Panel) { Show-Panel }
+        elseif (-not $closed.Count) { Show-Notification 'scrcpy monitor is already running. Right-click the tray icon for recording and settings.' }
     }
     if (-not ($script:Panel -and $script:Panel.Visible) -and $tracked.Count -gt 0 -and -not ($tracked | Where-Object { -not $_.UserClosed })) {
         Write-Log 'All scrcpy windows were closed.'
@@ -871,6 +875,13 @@ function Update-TrayText {
 function Update-TrayMenu {
     $menu = $script:Tray.ContextMenuStrip
     $menu.Items.Clear()
+
+    if ($script:Panel) {
+        $showPanel = $menu.Items.Add('Show control panel')
+        $showPanel.Font = New-Object System.Drawing.Font($showPanel.Font, [System.Drawing.FontStyle]::Bold)
+        $showPanel.add_Click({ Invoke-Safely { Show-Panel } })
+        [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    }
 
     $sessions = @($script:Sessions.Values | Where-Object { -not $_.UserClosed } | Sort-Object Title)
     $closed = @($script:Sessions.Values | Where-Object { $_.UserClosed } | Sort-Object Title)
@@ -906,8 +917,10 @@ function Update-TrayMenu {
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $startAll = $menu.Items.Add('Start recording on all devices')
+    $startAll.Enabled = @($sessions | Where-Object { -not $_.Recording }).Count -gt 0
     $startAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s }; Update-TrayText } })
     $stopAll = $menu.Items.Add('Stop recording on all devices')
+    $stopAll.Enabled = @($sessions | Where-Object { $_.Recording }).Count -gt 0
     $stopAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s }; Update-TrayText } })
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $openFolder = $menu.Items.Add('Open recordings folder')
@@ -920,13 +933,85 @@ function Update-TrayMenu {
         $checkUpdate = $menu.Items.Add('Check for updates')
         $checkUpdate.add_Click({ Invoke-Safely { Start-UpdateCheck $true } })
     }
-    if ($script:Panel) {
-        $showPanel = $menu.Items.Add('Control panel')
-        $showPanel.add_Click({ Invoke-Safely { Show-Panel } })
-    }
+    $about = $menu.Items.Add('About')
+    $about.add_Click({ Invoke-Safely { Show-About } })
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $exit = $menu.Items.Add('Exit')
     $exit.add_Click({ Invoke-Safely { Stop-Monitor } })
+}
+
+function Get-ScrcpyVersion {
+    if ($null -eq $script:ScrcpyVersion) {
+        $first = @((Invoke-Hidden $script:Scrcpy @('--version') 5000 -ScrcpyEnvironment) -split "`r?`n" | Where-Object { $_ -match '^scrcpy\s' }) | Select-Object -First 1
+        $script:ScrcpyVersion = if ($first -match '^scrcpy\s+(\S+)') { $Matches[1] } else { '' }
+    }
+    $script:ScrcpyVersion
+}
+
+function Show-About {
+    if ($script:About -and -not $script:About.IsDisposed) {
+        $script:About.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        $script:About.Activate()
+        return
+    }
+    $version = if ($script:UpdateConfig) { $script:UpdateConfig.Display } else { 'development build' }
+    $repo = if ($script:UpdateConfig) { $script:UpdateConfig.Repo } else { $script:DefaultRepo }
+    $scrcpyVersion = Get-ScrcpyVersion
+    $engine = if ($scrcpyVersion) { "scrcpy $scrcpyVersion" } else { 'scrcpy' }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'About scrcpy monitor'
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = -not ($script:Panel -and $script:Panel.Visible)
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.AutoSize = $true
+    $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $form.Padding = New-Object System.Windows.Forms.Padding(16)
+    if ($script:Icon) { $form.Icon = $script:Icon }
+
+    $layout = New-Object System.Windows.Forms.FlowLayoutPanel
+    $layout.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+    $layout.AutoSize = $true
+    $layout.WrapContents = $false
+    $form.Controls.Add($layout)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = 'scrcpy monitor'
+    $title.AutoSize = $true
+    $title.Font = New-Object System.Drawing.Font($form.Font.FontFamily, 14, [System.Drawing.FontStyle]::Bold)
+    $layout.Controls.Add($title)
+
+    $details = New-Object System.Windows.Forms.Label
+    $details.AutoSize = $true
+    $details.MaximumSize = New-Object System.Drawing.Size(440, 0)
+    $details.Margin = New-Object System.Windows.Forms.Padding(3, 6, 3, 6)
+    $details.Text = "Version: $version`nMirroring engine: $engine`nAuthor: $script:Author`n`n" +
+        'Mirrors one or more Android devices over USB or Wi-Fi/TCP, each in its own window. A window stays open while its device restarts and mirroring resumes automatically. ' +
+        'Screen recording can be started and stopped per device or for all devices from the window button (Alt+E), this control panel or the tray icon; recordings continue across device restarts and are saved as a single MP4 per device.' +
+        "`n`nBuilt on scrcpy by Genymobile (Apache License 2.0)."
+    $layout.Controls.Add($details)
+
+    $link = New-Object System.Windows.Forms.LinkLabel
+    $link.Text = "https://github.com/$repo"
+    $link.AutoSize = $true
+    $link.add_LinkClicked({ param($sender, $e) Invoke-Safely { Start-Process $sender.Text } })
+    $layout.Controls.Add($link)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+    $ok.Margin = New-Object System.Windows.Forms.Padding(3, 12, 3, 3)
+    $ok.add_Click({ param($sender, $e) $sender.FindForm().Close() })
+    $layout.Controls.Add($ok)
+    $form.AcceptButton = $ok
+    $form.CancelButton = $ok
+
+    $form.add_FormClosed({ param($sender, $e) $sender.Dispose(); $script:About = $null })
+    $script:About = $form
+    $form.Show()
+    $form.Activate()
 }
 
 function Open-RecordFolder {
@@ -1017,8 +1102,59 @@ function Select-RecordFolder {
     Update-Panel
 }
 
+function Get-RepoUpdateConfig {
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $git) { return $null }
+    $git = $git.Source
+    $url = (Invoke-Hidden $git @('-C', $RepoRoot, 'remote', 'get-url', 'origin') 5000).Trim()
+    if ($url -notmatch '[:/]([^/:\s]+)/([^/\s]+?)(\.git)?/?$') { return $null }
+    $repo = "$($Matches[1])/$($Matches[2])"
+    $version = (Invoke-Hidden $git @('-C', $RepoRoot, 'describe', '--tags', '--match', 'v[0-9]*', '--always', '--dirty') 5000).Trim()
+    if (-not $version) { return $null }
+    @{ Repo = $repo; Version = $version; Display = $version; Built = $null; Portable = $false; Git = $git }
+}
+
+function Test-ReleaseInRepo($Release) {
+    $git = $script:UpdateConfig.Git
+    foreach ($ref in @("refs/tags/$($Release.tag_name)", [string]$Release.target_commitish)) {
+        if (-not $ref -or $ref -eq 'refs/tags/') { continue }
+        $sha = (Invoke-Hidden $git @('-C', $RepoRoot, 'rev-parse', '-q', '--verify', "$ref^{commit}") 5000).Trim()
+        if (-not $sha) { continue }
+        $base = (Invoke-Hidden $git @('-C', $RepoRoot, 'merge-base', $sha, 'HEAD') 5000).Trim()
+        return $base -eq $sha
+    }
+    $false
+}
+
+function Get-DisplayVersion([string]$Tag) {
+    if ($Tag -match '^(?:qa-)?v?(\d+(?:\.\d+)+)(?:-(\d+)-g[0-9a-f]+)?(?:-dirty)?$') {
+        $build = if ($Matches[2]) { $Matches[2] } else { '0' }
+        return "$($Matches[1]).$build"
+    }
+    $Tag -replace '^qa-', ''
+}
+
+function Complete-RepoUpdateCheck($Release, [bool]$Manual) {
+    $current = $script:UpdateConfig.Display
+    if (-not $Release -or -not $Release.PSObject.Properties['tag_name'] -or (Test-ReleaseInRepo $Release)) {
+        Write-Log "Update check: $current is up to date."
+        if ($Manual) { [void](Show-Message "You have the latest version ($current).") }
+        return
+    }
+    $tag = [string]$Release.tag_name
+    Write-Log "Update available: $tag (current: $current)"
+    $display = Get-DisplayVersion $tag
+    $script:UpdateStatus = "Update $display available"
+    $text = "scrcpy monitor $display is available (you have $current).`n`nThis copy runs from a git checkout, so it is not updated automatically. Pull the latest changes and rebuild, or use the portable ZIP from the release page.`n`nOpen the release page?"
+    if ((Show-Message $text 'YesNo' 'Question') -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $page = [string]$Release.html_url
+        if ($page -notlike 'https://github.com/*') { $page = "https://github.com/$($script:UpdateConfig.Repo)/releases/latest" }
+        Start-Process $page
+    }
+}
+
 function Get-UpdateConfig {
-    if (-not $portable) { return $null }
+    if (-not $portable) { return Get-RepoUpdateConfig }
     try {
         $config = Get-Content -LiteralPath (Join-Path $RepoRoot 'update.json') -Raw -ErrorAction Stop | ConvertFrom-Json
         if ($config.Repo -and $config.Version) {
@@ -1027,7 +1163,7 @@ function Get-UpdateConfig {
                 $parsed = [DateTimeOffset]::MinValue
                 if ([DateTimeOffset]::TryParse([string]$config.Built, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { $built = $parsed }
             }
-            return @{ Repo = [string]$config.Repo; Version = [string]$config.Version; Built = $built }
+            return @{ Repo = [string]$config.Repo; Version = [string]$config.Version; Display = (Get-DisplayVersion ([string]$config.Version)); Built = $built; Portable = $true; Git = $null }
         }
     } catch { }
     $null
@@ -1073,7 +1209,8 @@ function Complete-UpdateCheck {
         $check.Shell.Dispose()
     }
 
-    $current = $script:UpdateConfig.Version
+    if (-not $script:UpdateConfig.Portable) { Complete-RepoUpdateCheck $release $check.Manual; return }
+    $current = $script:UpdateConfig.Display
     $asset = $null
     if ($release -and $release.PSObject.Properties['assets']) {
         $asset = @($release.assets | Where-Object { $_.name -like 'scrcpy-monitor-portable-*.zip' }) | Select-Object -First 1
@@ -1086,26 +1223,27 @@ function Complete-UpdateCheck {
             $newer = $published -gt $script:UpdateConfig.Built
         }
     }
-    if (-not $asset -or $release.tag_name -eq $current -or -not $newer) {
-        Write-Log "Update check: $current is up to date."
+    if (-not $asset -or $release.tag_name -eq $script:UpdateConfig.Version -or -not $newer) {
+        Write-Log "Update check: $($script:UpdateConfig.Version) is up to date."
         if ($check.Manual) { [void](Show-Message "You have the latest version ($current).") }
         return
     }
 
     $tag = [string]$release.tag_name
     $script:AvailableUpdate = @{ Tag = $tag; Url = [string]$asset.browser_download_url }
-    Write-Log "Update available: $tag (current: $current)"
+    Write-Log "Update available: $tag (current: $($script:UpdateConfig.Version))"
+    $display = Get-DisplayVersion $tag
     $notes = if ($release.body) { [string]$release.body } else { '' }
     if ($notes.Length -gt 600) { $notes = $notes.Substring(0, 600) + '...' }
     $recording = @($script:Sessions.Values | Where-Object { $_.Recording }).Count
-    $text = "scrcpy monitor $tag is available (you have $current)."
+    $text = "scrcpy monitor $display is available (you have $current)."
     if ($notes) { $text += "`n`n$notes" }
     $text += "`n`nUpdate now? The monitor restarts"
     $text += if ($recording) { " and the $recording recording(s) in progress are stopped and saved." } else { '.' }
     if ((Show-Message $text 'YesNo' 'Question') -eq [System.Windows.Forms.DialogResult]::Yes) {
         Start-Update
     } else {
-        $script:UpdateStatus = "Update $tag available"
+        $script:UpdateStatus = "Update $display available"
     }
 }
 
@@ -1117,7 +1255,7 @@ function Start-Update {
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $updater, '-ApplyUpdate', $update.Url, '-UpdateTarget', $RepoRoot)
     $script:Updater = Start-Process -FilePath $script:PowerShellExe -ArgumentList (ConvertTo-ArgumentString $arguments) -WindowStyle Hidden -PassThru
     $script:Updating = $true
-    $script:UpdateStatus = "Downloading update $($update.Tag)... the monitor restarts when it is ready."
+    $script:UpdateStatus = "Downloading update $(Get-DisplayVersion $update.Tag)... the monitor restarts when it is ready."
     Write-Log "Updating to $($update.Tag)"
 }
 
@@ -1160,6 +1298,9 @@ function Update-PanelButtons {
     $script:PanelToggle.Text = if ($toStart.Count -gt 0 -or $open.Count -eq 0) { 'Start recording' } else { 'Stop recording' }
     $script:PanelToggle.Enabled = $open.Count -gt 0
     $script:PanelOpen.Enabled = @($selected | Where-Object { $_.UserClosed }).Count -gt 0
+    $active = @(Get-TargetSessions @())
+    $script:PanelStartAll.Enabled = @($active | Where-Object { -not $_.Recording }).Count -gt 0
+    $script:PanelStopAll.Enabled = @($active | Where-Object { $_.Recording }).Count -gt 0
 }
 
 function Update-Panel {
@@ -1194,6 +1335,7 @@ function Update-Panel {
 }
 
 function Show-Panel {
+    $script:PanelPending = $false
     if (-not $script:Panel -or $script:Panel.IsDisposed) { return }
     $script:Panel.Show()
     [void][ScrcpyMonitor.Window]::ShowWindow($script:Panel.Handle, 5)
@@ -1220,7 +1362,7 @@ function New-PanelButton([System.Windows.Forms.Control]$Parent, [string]$Text, [
 function New-Panel {
     Add-Type -Namespace ScrcpyMonitor -Name Window -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = if ($script:UpdateConfig) { "scrcpy monitor $($script:UpdateConfig.Version)" } else { 'scrcpy monitor' }
+    $form.Text = if ($script:UpdateConfig) { "scrcpy monitor $($script:UpdateConfig.Display)" } else { 'scrcpy monitor' }
     $form.Size = New-Object System.Drawing.Size(720, 380)
     $form.MinimumSize = New-Object System.Drawing.Size(560, 260)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -1247,6 +1389,7 @@ function New-Panel {
     $globalButtons = New-Object System.Windows.Forms.FlowLayoutPanel
     $globalButtons.Dock = [System.Windows.Forms.DockStyle]::Bottom
     $globalButtons.AutoSize = $true
+    $globalButtons.WrapContents = $false
     $globalButtons.Padding = New-Object System.Windows.Forms.Padding(4)
     $form.Controls.Add($globalButtons)
 
@@ -1269,13 +1412,16 @@ function New-Panel {
     $script:PanelOpen = New-PanelButton $deviceButtons 'Open window' { Open-Window @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
     $list.add_DoubleClick({ Invoke-Safely { $script:PanelToggle.PerformClick() } })
 
-    [void](New-PanelButton $globalButtons 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } })
-    [void](New-PanelButton $globalButtons 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } })
+    $script:PanelStartAll = New-PanelButton $globalButtons 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } }
+    $script:PanelStopAll = New-PanelButton $globalButtons 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } }
     [void](New-PanelButton $globalButtons 'Open recordings folder' { Open-RecordFolder })
     [void](New-PanelButton $globalButtons 'Change folder...' { Select-RecordFolder })
     [void](New-PanelButton $globalButtons 'Open log' { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" })
     if ($script:UpdateConfig) { [void](New-PanelButton $globalButtons 'Check for updates' { Start-UpdateCheck $true }) }
+    [void](New-PanelButton $globalButtons 'About' { Show-About })
     [void](New-PanelButton $globalButtons 'Exit' { $script:ExitRequested = $true })
+    $minWidth = [Math]::Max(560, $globalButtons.PreferredSize.Width + $form.Width - $form.ClientSize.Width)
+    $form.MinimumSize = New-Object System.Drawing.Size($minWidth, 260)
 
     $form.add_FormClosing({
         param($sender, $e)
@@ -1283,6 +1429,10 @@ function New-Panel {
         $e.Cancel = $true
         if ($e.CloseReason -ne [System.Windows.Forms.CloseReason]::WindowsShutDown -and $script:Tray) {
             $sender.Hide()
+            if (-not $script:PanelHiddenOnce) {
+                $script:PanelHiddenOnce = $true
+                Show-Notification 'scrcpy monitor keeps running in the tray. Double-click the tray icon to show the control panel.'
+            }
         } else {
             $script:ExitRequested = $true
         }
@@ -1382,6 +1532,12 @@ $script:OpenWindowsRequested = $false
 $script:RecordOnStart = [bool]$Record
 $script:Tray = $null
 $script:Panel = $null
+$script:PanelHiddenOnce = $false
+$script:PanelPending = $false
+$script:About = $null
+$script:ScrcpyVersion = $null
+$script:Author = 'Charles Manalo'
+$script:DefaultRepo = 'cktmanalo/scrcpy'
 $script:UpdateConfig = Get-UpdateConfig
 $script:UpdateCheck = $null
 $script:UpdateStatus = ''
@@ -1400,7 +1556,7 @@ if (-not $NoTray) {
     $script:Tray.Icon = if ($script:Icon) { $script:Icon } else { [System.Drawing.SystemIcons]::Application }
     $script:Tray.ContextMenuStrip = New-Object System.Windows.Forms.ContextMenuStrip
     $script:Tray.ContextMenuStrip.add_Opening({ Invoke-Safely { Update-TrayMenu } })
-    $script:Tray.add_DoubleClick({ Invoke-Safely { Open-RecordFolder } })
+    $script:Tray.add_DoubleClick({ Invoke-Safely { if ($script:Panel) { Show-Panel } else { Open-RecordFolder } } })
     $script:Tray.Text = 'scrcpy monitor'
     $script:Tray.Visible = $true
 }
@@ -1433,6 +1589,7 @@ $script:FastTimer.add_Tick({
 })
 $script:FastTimer.Start()
 
+$script:PanelPending = [bool]$script:Panel
 if (-not $NoUpdateCheck) { Invoke-Safely { Start-UpdateCheck $false } }
 
 try {
