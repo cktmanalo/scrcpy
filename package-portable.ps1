@@ -100,7 +100,7 @@ Write-Host 'Collecting files...'
 Copy-Required $scrcpy $package
 Copy-Required $server $package
 foreach ($file in 'icon.ico', 'scrcpy.png', 'disconnected.png') { Copy-Required (Join-Path $root "app\data\$file") $package }
-foreach ($file in 'scrcpy-monitor.ps1', 'scrcpy-monitor.vbs') { Copy-Required (Join-Path $root $file) $package }
+foreach ($file in 'scrcpy-monitor.ps1', 'scrcpy-monitor.vbs', 'scrcpy-monitor-guide.docx') { Copy-Required (Join-Path $root $file) $package }
 Copy-Required (Join-Path $root 'LICENSE') $package
 foreach ($file in 'ffmpeg.exe', 'ffprobe.exe') { Copy-Required (Join-Path $mingwBin $file) $package }
 foreach ($file in 'adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll') { Copy-Required (Join-Path $AdbDir $file) $package }
@@ -142,6 +142,8 @@ scrcpy monitor (portable) - $version
 
 Mirror one or more Android devices, keep each window open while the device restarts, and record the
 screen (recordings continue across device restarts).
+
+See scrcpy-monitor-guide.docx in this folder for the full how-to guide.
 
 SETUP (once)
   1. Extract the whole ZIP to a folder of your choice (for example C:\Tools\scrcpy-monitor).
@@ -211,7 +213,7 @@ if ($Publish) {
     Set-Content -LiteralPath $notesFile -Value $text -Encoding UTF8
     try {
         Write-Host "Publishing $tag to $UpdateRepo..."
-        & gh release create $tag $zip --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
+        & gh release create $tag $zip (Join-Path $root 'scrcpy-monitor-guide.docx') --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
         if ($LASTEXITCODE) { throw "gh release create failed ($LASTEXITCODE)." }
     } finally {
         Remove-Item -LiteralPath $notesFile -Force -ErrorAction SilentlyContinue

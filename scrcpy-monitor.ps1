@@ -181,8 +181,14 @@ if ($ApplyUpdate) {
 
         Write-Log "Update: copying files to $UpdateTarget"
         $robocopy = Join-Path $env:SystemRoot 'System32\robocopy.exe'
-        & $robocopy $source.DirectoryName $UpdateTarget /E /R:10 /W:1 /NP /NFL /NDL /NJH /NJS | Out-Null
+        $guideName = 'scrcpy-monitor-guide.docx'
+        & $robocopy $source.DirectoryName $UpdateTarget /E /R:10 /W:1 /NP /NFL /NDL /NJH /NJS /XF $guideName | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "Copying the update failed (robocopy exit code $LASTEXITCODE)." }
+        $guide = Join-Path $source.DirectoryName $guideName
+        if (Test-Path -LiteralPath $guide) {
+            try { Copy-Item -LiteralPath $guide -Destination $UpdateTarget -Force -ErrorAction Stop }
+            catch { Write-Log "Update: could not replace $guideName (close it if it is open): $($_.Exception.Message)" }
+        }
         Write-Log 'Update: installed.'
     } catch {
         Show-Error "Update failed: $($_.Exception.Message)"
