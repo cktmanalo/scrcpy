@@ -157,6 +157,22 @@ START
   A window opens for every connected device (USB or Wi-Fi/TCP), and the "scrcpy monitor" control
   panel appears as soon as the first device screen starts sharing. Running it again while it is
   already running shows the control panel and reopens any device window you closed.
+  The Connection column shows whether each device uses USB or Wi-Fi.
+
+WI-FI
+  - "Switch to Wi-Fi" (device on USB): turns on ADB over Wi-Fi and mirrors the device over Wi-Fi.
+    You can then unplug the cable. "Switch to USB" (Wi-Fi device, cable plugged in) does the reverse.
+  - "Connect Wi-Fi device..." (control panel or tray menu): connects a device by IP address and port.
+    Pick a port or type any port; a port that works is remembered and added to "Scan now".
+  - "Scan now": finds devices on the local network with ADB over Wi-Fi turned on and connects them.
+  - If a connection fails, a message explains why (no device at that address, port not open, or
+    debugging not allowed) and "Retry" reopens the dialog with the same IP address and port.
+  - "Disconnect" ends a Wi-Fi connection; "Reconnect" connects it again. Wi-Fi devices are
+    remembered and reconnected automatically.
+  - A device connected over both USB and Wi-Fi is mirrored over USB (unless it is already recording
+    over Wi-Fi); the other entry shows "Standby (using ...)". If USB is unplugged for 30 seconds,
+    Wi-Fi takes over the mirroring; a recording over USB waits for the cable instead. If Wi-Fi is
+    lost for 30 seconds while USB is connected, its recording is saved and a new one starts over USB.
 
 RECORD
   - Click the round button in the top-right corner of a device window (red dot = start, white square =
@@ -172,21 +188,36 @@ RECORD
   The default folder is "Videos\scrcpy Recordings". Use "Change folder..." in the control panel to
   change it, and "Open recordings folder" to open it.
 
+RECORD COMBINED
+  Select two or more devices in the control panel and click "Record combined". Each device is recorded
+  and saved as above; when all of them have stopped (stop them together or one by one), their recordings
+  are also joined side by side into one video:
+    <Recordings folder>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
+  A device that stops early or restarts shows black in its place until the others stop. The combined
+  video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
+  the combined video; if it is not finished by then, it is cancelled.
+
 CLOSE
   Closing a device window stops mirroring that device (use "Open window" in the control panel or the
   tray icon menu to reopen it). Closing the control panel keeps the monitor running in the tray
-  (double-click the tray icon to show it again); the monitor exits once every device window is closed.
+  (double-click the tray icon to show it again); the monitor exits once every device window is closed
+  and any combined recording is saved.
   Use "Exit" to quit. Exiting stops and saves any recording in progress.
 
 UPDATES
   At startup, and when you click "Check for updates" in the control panel (or the tray menu), the
   monitor checks https://github.com/$UpdateRepo/releases for a newer version. Accept the prompt to
-  download it; the monitor stops (saving any recording), updates this folder and restarts.
-  Your recordings folder setting is kept.
+  download it; the monitor stops (saving any recording), updates this folder and restarts, then shows
+  "Updated to scrcpy monitor <version>". If you decline, the status bar shows "Update <version>
+  available" and About offers "Install update". Your recordings folder setting is kept.
 
 TROUBLESHOOTING
   - No device listed: check the USB cable and USB debugging authorization ("adb.exe devices" in this
     folder lists the devices).
+  - Status "Allow USB debugging on device": unlock the device and tap "Allow" on the USB
+    debugging prompt. A requested recording starts automatically once allowed.
+  - Wi-Fi device stays "Waiting for device" after a reboot: most devices turn off ADB over Wi-Fi
+    when they restart. Connect it with USB and use "Switch to Wi-Fi" again.
   - "Open log" in the control panel shows what happened; per-device logs are in
     %TEMP%\scrcpy-monitor\logs. "About" shows the version to include when reporting a problem.
   - If Windows blocks the files after downloading the ZIP: right-click the ZIP > Properties >

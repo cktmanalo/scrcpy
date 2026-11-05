@@ -18,9 +18,18 @@
         <RecordDir>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
     If the device cannot run a second hardware video encoder, the recorder switches to a software encoder.
 
+    "Record combined" in the control panel records the selected devices as usual and, once all of them have
+    stopped, also joins their recordings into one grid video (no audio, synchronized to about one second):
+        <RecordDir>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
+
     The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
     default. When scrcpy.exe is next to this script (portable package), scrcpy, adb and ffmpeg are used from
     this folder.
+
+    Wi-Fi devices that advertise adb on the network (mDNS, for example after "adb tcpip 5555") are found and
+    connected automatically unless -NoDiscovery or -Serial is given. "Connect Wi-Fi device..." in the control
+    panel or tray icon connects a device by IP address, and "Disconnect" saves any recording, closes the
+    window and ends the adb connection of a Wi-Fi device until it is reconnected.
 
     At startup (unless -NoUpdateCheck) and from "Check for updates" in the control panel or tray icon, the
     monitor checks its GitHub repository for a newer release. A portable package built with
@@ -57,6 +66,7 @@ param(
     [switch]$NoTray,
     [switch]$NoPanel,
     [switch]$NoUpdateCheck,
+    [switch]$NoDiscovery,
     [ValidateRange(1, 60)]
     [int]$PollSeconds = 2,
     [Parameter(DontShow)]
@@ -107,7 +117,7 @@ function Show-Error([string]$Message) {
     Write-Log "ERROR: $Message"
     try {
         Add-Type -AssemblyName System.Windows.Forms
-        [void][System.Windows.Forms.MessageBox]::Show($Message, 'scrcpy monitor', 'OK', 'Error')
+        [void][System.Windows.Forms.MessageBox]::Show($Message, 'Scrcpy Monitor', 'OK', 'Error')
     } catch { }
 }
 
@@ -190,6 +200,7 @@ if ($ApplyUpdate) {
             catch { Write-Log "Update: could not replace $guideName (close it if it is open): $($_.Exception.Message)" }
         }
         Write-Log 'Update: installed.'
+        try { Set-Content -LiteralPath (Join-Path $script:StateDir 'updated.txt') -Value $UpdateTarget -Encoding UTF8 } catch { }
     } catch {
         Show-Error "Update failed: $($_.Exception.Message)"
     } finally {
@@ -291,6 +302,12 @@ function Get-AdbDevices {
     $devices
 }
 
+function Get-ConnectionType([string]$DeviceSerial) {
+    if ($DeviceSerial -match '^emulator-\d+$') { return 'Emulator' }
+    if ($DeviceSerial -match ':\d+$' -or $DeviceSerial -match '\._adb(-tls-connect)?\._tcp') { return 'Wi-Fi' }
+    'USB'
+}
+
 function Get-DeviceProp([string]$DeviceSerial, [string]$Name) {
     (Invoke-Adb @('-s', $DeviceSerial, 'shell', 'getprop', $Name) 5000).Trim()
 }
@@ -388,46 +405,79 @@ function Get-RecordCodec {
     $codec
 }
 
-function Get-CachedEncoder([string]$DeviceSerial) {
+function Get-EncoderCacheKeys([string]$DeviceSerial, [string]$Model) {
+    $codec = Get-RecordCodec
+    $keys = @("$DeviceSerial|$codec")
+    if ($Model -and $Model -ne $DeviceSerial) { $keys += "model:$Model|$codec" }
+    $keys
+}
+
+function Get-CachedEncoder([string]$DeviceSerial, [string]$Model) {
     try {
         $cache = Get-Content -LiteralPath $script:EncoderCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
-        $value = $cache.PSObject.Properties["$DeviceSerial|$(Get-RecordCodec)"]
-        if ($value) { return [string]$value.Value }
+        foreach ($key in (Get-EncoderCacheKeys $DeviceSerial $Model)) {
+            $value = $cache.PSObject.Properties[$key]
+            if ($value -and $value.Value) { return [string]$value.Value }
+        }
     } catch { }
     return $null
 }
 
-function Set-CachedEncoder([string]$DeviceSerial, [string]$Encoder) {
+function Set-CachedEncoder([string]$DeviceSerial, [string]$Model, [string]$Encoder) {
     $cache = @{}
     try {
         $json = Get-Content -LiteralPath $script:EncoderCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
         foreach ($property in $json.PSObject.Properties) { $cache[$property.Name] = $property.Value }
     } catch { }
-    $key = "$DeviceSerial|$(Get-RecordCodec)"
-    if ($Encoder) { $cache[$key] = $Encoder } else { $cache.Remove($key) }
+    foreach ($key in (Get-EncoderCacheKeys $DeviceSerial $Model)) {
+        if ($Encoder) { $cache[$key] = $Encoder } else { $cache.Remove($key) }
+    }
     try { $cache | ConvertTo-Json | Set-Content -LiteralPath $script:EncoderCachePath -Encoding UTF8 } catch { }
 }
 
 function Show-Notification([string]$Message, [string]$Icon = 'Info') {
     Write-Log $Message
     if ($script:Tray) {
-        try { $script:Tray.ShowBalloonTip(4000, 'scrcpy monitor', $Message, $Icon) } catch { }
+        try { $script:Tray.ShowBalloonTip(4000, 'Scrcpy Monitor', $Message, $Icon) } catch { }
     }
 }
 
-function New-Session([string]$DeviceSerial) {
+function Get-FreePortBlock {
+    $used = @($script:Sessions.Values | ForEach-Object { $_.Port })
+    for ($port = 27200; $port -lt 29200; $port += 4) {
+        if ($used -notcontains $port) { return $port }
+    }
+    27200
+}
+
+function Test-HasPortArg($Arguments) {
+    [bool]@($Arguments | Where-Object { $_ -match '^(--port|-p)' }).Count
+}
+
+function New-Session([string]$DeviceSerial, [string]$State) {
     $session = [pscustomobject]@{
         Serial             = $DeviceSerial
+        Port               = Get-FreePortBlock
         SafeSerial         = ConvertTo-SafeName $DeviceSerial
         Name               = $null
         Title              = $DeviceSerial
+        Connection         = Get-ConnectionType $DeviceSerial
         LastState          = $null
         BootedAt           = $null
         NextConnect        = Get-Date
         Connector          = $null
         UserClosed         = $false
+        Disconnected       = $false
+        MissingSince       = $null
+        PendingAction      = $null
+        MovedTo            = $null
+        MoveAddress        = $null
+        MoveDeadline       = Get-Date
         Display            = $null
         DisplayStartedAt   = $null
+        WindowShown        = $false
+        ScrcpyPid          = 0
+        NextWake           = Get-Date
         DisplayFailures    = 0
         NextDisplayAttempt = Get-Date
         Recording          = $false
@@ -443,10 +493,13 @@ function New-Session([string]$DeviceSerial) {
         SoftwareEncoder    = $(if ($RecordEncoder -eq 'auto') { Get-CachedEncoder $DeviceSerial } else { $null })
         ControlPath        = Join-Path $script:ControlDir "$(ConvertTo-SafeName $DeviceSerial).state"
         Stopping           = $false
+        RecordPending      = $script:RecordOnStart
+        CombineMember      = $null
+        PartStarts         = @{}
+        PartStartPending   = $false
     }
     $script:Sessions[$DeviceSerial] = $session
     Set-RecordState $session
-    if ($script:RecordOnStart) { Start-Recording $session }
     $session
 }
 
@@ -491,19 +544,47 @@ function Test-DeviceReady($Session, $Devices) {
 function Start-Display($Session) {
     $arguments = @('-s', $Session.Serial, '--reconnect', "--record-control=$($Session.ControlPath)")
     if (-not ($ScrcpyArgs | Where-Object { $_ -like '--window-title*' })) { $arguments += "--window-title=$($Session.Title)" }
+    if (-not (Test-HasPortArg $ScrcpyArgs)) { $arguments += "--port=$($Session.Port):$($Session.Port + 1)" }
     $arguments += $ScrcpyArgs
     $log = Join-Path $script:LogDir "$($Session.SafeSerial)-display.log"
     Stop-OrphanServers $Session.Serial
     Write-Log "[$($Session.Serial)] Starting scrcpy window: $(ConvertTo-ArgumentString $arguments)"
     $Session.Display = Start-ScrcpyProcess $arguments $log
     $Session.DisplayStartedAt = Get-Date
+    $Session.WindowShown = $false
+    $Session.ScrcpyPid = 0
+    $Session.NextWake = (Get-Date).AddSeconds(5)
     if ($script:PanelPending) { Show-Panel }
+}
+
+function Test-WindowShown($Session) {
+    if (-not $Session.ScrcpyPid) {
+        $child = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($Session.Display.Id) AND Name='scrcpy.exe'" -ErrorAction SilentlyContinue) | Select-Object -First 1
+        if (-not $child) { return $false }
+        $Session.ScrcpyPid = [int]$child.ProcessId
+    }
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById($Session.ScrcpyPid)
+        try { return $process.MainWindowHandle -ne [IntPtr]::Zero } finally { $process.Dispose() }
+    } catch { return $false }
 }
 
 function Update-Display($Session, $Devices, [ref]$Ready) {
     $now = Get-Date
     if ($Session.Display) {
-        if (-not $Session.Display.HasExited) { return }
+        if (-not $Session.Display.HasExited) {
+            if ($Session.WindowShown) { return }
+            if (Test-WindowShown $Session) {
+                $Session.WindowShown = $true
+                return
+            }
+            if ($now -ge $Session.NextWake) {
+                $Session.NextWake = $now.AddSeconds(10)
+                Write-Log "[$($Session.Serial)] No video yet; waking the device screen."
+                [void](Invoke-Adb @('-s', $Session.Serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP') 3000)
+            }
+            return
+        }
 
         $exitCode = $Session.Display.ExitCode
         $ranSeconds = ($now - $Session.DisplayStartedAt).TotalSeconds
@@ -538,7 +619,7 @@ function Update-Display($Session, $Devices, [ref]$Ready) {
 }
 
 function Start-Recording($Session) {
-    if ($Session.Recording -or $Session.UserClosed) { return }
+    if ($Session.Recording -or $Session.UserClosed -or $script:Standby.ContainsKey($Session.Serial)) { return }
     $Session.Recording = $true
     $Session.RecordingStartedAt = Get-Date
     $Session.RecordingBase = $null
@@ -567,10 +648,12 @@ function Start-RecorderPart($Session) {
         $Session.RecordingBase = $base
     }
 
+    if ($RecordEncoder -eq 'auto' -and -not $Session.SoftwareEncoder) { $Session.SoftwareEncoder = Get-CachedEncoder $Session.Serial $Session.Name }
     $part = '{0}_part{1:D2}.mp4' -f $Session.RecordingBase, ($Session.Parts.Count + 1)
     $arguments = @('-s', $Session.Serial, '--no-window', '--no-playback', '--no-control', "--record=$part", '--record-format=mp4')
     if ($RecordEncoder -ne 'auto') { $arguments += "--video-encoder=$RecordEncoder" }
     elseif ($Session.SoftwareEncoder) { $arguments += "--video-encoder=$($Session.SoftwareEncoder)" }
+    if (-not (Test-HasPortArg $RecordArgs)) { $arguments += "--port=$($Session.Port + 2):$($Session.Port + 3)" }
     $arguments += $RecordArgs
 
     $Session.RecorderLog = Join-Path $script:LogDir ('{0}-record-part{1:D2}.log' -f $Session.SafeSerial, ($Session.Parts.Count + 1))
@@ -580,6 +663,29 @@ function Start-RecorderPart($Session) {
     $Session.RecorderStartedAt = Get-Date
     $Session.RecorderPart = $part
     [void]$Session.Parts.Add($part)
+    if ($Session.CombineMember) {
+        $Session.PartStarts[$part] = $Session.RecorderStartedAt
+        $Session.PartStartPending = $true
+    }
+}
+
+function Update-PartStarts {
+    foreach ($session in @($script:Sessions.Values | Where-Object { $_.PartStartPending })) {
+        $part = $session.RecorderPart
+        if (-not $session.CombineMember -or -not $part -or -not $session.PartStarts.ContainsKey($part)) {
+            $session.PartStartPending = $false
+            continue
+        }
+        try {
+            $file = New-Object System.IO.FileInfo $part
+            if ($file.Exists -and $file.Length -gt 0) {
+                $session.PartStarts[$part] = Get-Date
+                $session.PartStartPending = $false
+            }
+        } catch {
+            $session.PartStartPending = $false
+        }
+    }
 }
 
 function Test-EncoderFailure($Session) {
@@ -622,7 +728,7 @@ function Update-Recorder($Session, $Devices, [ref]$Ready) {
             $encoder = Get-SoftwareEncoder $Session.Serial
             if ($encoder) {
                 $Session.SoftwareEncoder = $encoder
-                Set-CachedEncoder $Session.Serial $encoder
+                Set-CachedEncoder $Session.Serial $Session.Name $encoder
                 $Session.NextRecordAttempt = $now
                 Write-Log "[$($Session.Serial)] Hardware encoder busy; recording with software encoder $encoder."
             } else {
@@ -636,7 +742,7 @@ function Update-Recorder($Session, $Devices, [ref]$Ready) {
             if ($Session.RecorderFailures -eq 5) {
                 if ($Session.SoftwareEncoder) {
                     $Session.SoftwareEncoder = $null
-                    Set-CachedEncoder $Session.Serial $null
+                    Set-CachedEncoder $Session.Serial $Session.Name $null
                 }
                 Show-Notification "Recording for $($Session.Title) keeps failing; still retrying (log: $($Session.RecorderLog))." 'Warning'
             }
@@ -677,7 +783,12 @@ function Stop-Recording($Session) {
         Title    = $Session.Title
         Base     = $Session.RecordingBase
         Parts    = @($Session.Parts)
+        Member   = $Session.CombineMember
+        Starts   = $Session.PartStarts
     }
+    $Session.CombineMember = $null
+    $Session.PartStarts = @{}
+    $Session.PartStartPending = $false
     $Session.Recorder = $null
     $Session.Parts.Clear()
     $Session.Stopping = $true
@@ -706,31 +817,39 @@ function Update-Stops([int]$TimeoutMs = 0) {
             if ($stop.Helper) { $stop.Helper.Dispose(); $stop.Helper = $null }
             $script:Stops.Remove($stop)
             if (-not @($script:Stops | Where-Object { $_.Session -eq $stop.Session }).Count) { $stop.Session.Stopping = $false }
-            Complete-Recording $stop.Title $stop.Base $stop.Parts
+            Complete-Recording $stop.Title $stop.Base $stop.Parts $stop.Member $stop.Starts
         }
         if ($script:Stops.Count -eq 0 -or (Get-Date) -ge $deadline) { break }
         Start-Sleep -Milliseconds 200
     } while ($true)
 }
 
-function Complete-Recording([string]$Title, [string]$Base, [string[]]$AllParts) {
+function Complete-Recording([string]$Title, [string]$Base, [string[]]$AllParts, $Member = $null, [hashtable]$PartStarts = $null) {
     $parts = @($AllParts | Where-Object { $_ -and (Test-VideoFile $_) })
     foreach ($part in @($AllParts | Where-Object { $_ -and $parts -notcontains $_ })) {
         Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
     }
+    $segments = @(if ($Member) { Get-CombineSegments $parts $PartStarts })
     if (-not $Base -or $parts.Count -eq 0) {
         Show-Notification "Recording stopped for $Title; nothing was recorded."
+        if ($Member) { Complete-CombineMember $Member @() }
         return
     }
 
     $output = "$Base.mp4"
     if ($parts.Count -eq 1) {
-        Move-Item -LiteralPath $parts[0] -Destination $output
-        Show-Notification "Recording saved: $output"
+        try {
+            Move-Item -LiteralPath $parts[0] -Destination $output
+            Show-Notification "Recording saved: $output"
+            foreach ($segment in $segments) { $segment.Path = $output }
+        } finally {
+            if ($Member) { Complete-CombineMember $Member $segments }
+        }
         return
     }
     if (-not $script:Ffmpeg) {
         Show-Notification "Recording saved in $($parts.Count) parts next to $output (ffmpeg not found to join them)."
+        if ($Member) { Complete-CombineMember $Member $segments }
         return
     }
 
@@ -745,7 +864,7 @@ function Complete-Recording([string]$Title, [string]$Base, [string[]]$AllParts) 
     [System.IO.File]::WriteAllLines($listFile, [string[]]$lines)
     [void]$steps.Add(@('-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', $listFile, '-c', 'copy', '-movflags', '+faststart', $output))
 
-    $merge = [pscustomobject]@{ Process = $null; Steps = $steps; Parts = $parts; Temps = @($temps); Output = $output; ListFile = $listFile }
+    $merge = [pscustomobject]@{ Process = $null; Steps = $steps; Parts = $parts; Temps = @($temps); Output = $output; ListFile = $listFile; Member = $Member; Segments = $segments }
     try {
         $merge.Process = Start-MergeStep $merge
     } catch {
@@ -788,15 +907,257 @@ function Update-Merges([int]$TimeoutMs = 0) {
                 foreach ($part in $merge.Parts) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
             }
             Show-Notification "Recording saved: $($merge.Output)"
+            if ($merge.Member) {
+                $position = 0.0
+                foreach ($segment in $merge.Segments) {
+                    $segment.Path = $merge.Output
+                    $segment.Position = $position
+                    $position += $segment.Duration
+                }
+                Complete-CombineMember $merge.Member $merge.Segments
+            }
         } else {
             Remove-Item -LiteralPath $merge.Output -Force -ErrorAction SilentlyContinue
             Show-Notification "Could not join recording parts (ffmpeg exit code $exitCode); the parts were kept next to $($merge.Output)." 'Warning'
+            if ($merge.Member) { Complete-CombineMember $merge.Member $merge.Segments }
         }
     }
 }
 
+function Format-Seconds([double]$Value) {
+    $Value.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-VideoDuration([string]$Path) {
+    $value = 0.0
+    if (-not $script:Ffprobe) { return $value }
+    $text = (Invoke-Hidden $script:Ffprobe @('-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', $Path) 30000).Trim()
+    if (-not [double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { $value = 0.0 }
+    $value
+}
+
+function Get-VideoSize([string]$Path) {
+    $text = (Invoke-Hidden $script:Ffprobe @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', $Path) 30000).Trim()
+    if ($text -match '^(\d+)x(\d+)' -and [int]$Matches[1] -gt 0 -and [int]$Matches[2] -gt 0) { return @([int]$Matches[1], [int]$Matches[2]) }
+    @(1080, 1920)
+}
+
+function Get-CombineSegments([string[]]$Parts, [hashtable]$PartStarts) {
+    foreach ($part in $Parts) {
+        $start = if ($PartStarts -and $PartStarts.ContainsKey($part)) { $PartStarts[$part] } else { $null }
+        [pscustomobject]@{ Path = $part; Position = 0.0; Duration = (Get-VideoDuration $part); Start = $start }
+    }
+}
+
+function Start-CombinedRecording($Sessions) {
+    $group = [pscustomobject]@{ RequestedAt = Get-Date; Members = New-Object System.Collections.ArrayList; Finished = $false }
+    $started = New-Object System.Collections.ArrayList
+    foreach ($session in @($Sessions | Sort-Object Title)) {
+        if ($session.Recording -or $session.Stopping) { continue }
+        Start-Recording $session
+        if (-not $session.Recording) { continue }
+        $member = [pscustomobject]@{ Group = $group; Title = $session.Title; Segments = @(); Open = 1; Done = $false }
+        [void]$group.Members.Add($member)
+        $session.CombineMember = $member
+        $session.PartStarts = @{}
+        $session.PartStartPending = $false
+        [void]$started.Add($session)
+    }
+    if ($group.Members.Count -ge 2) {
+        Show-Notification "Combined recording started for $($group.Members.Count) devices. One video with all screens is saved after they all stop."
+        return
+    }
+    $group.Finished = $true
+    foreach ($session in $started) { $session.CombineMember = $null }
+    if ($started.Count) { Show-Notification "Record combined needs at least two devices; recording $($started[0].Title) on its own." }
+}
+
+function Complete-CombineMember($Member, $Segments) {
+    try {
+        if ($Member.Done) { return }
+        $Member.Segments = @($Member.Segments) + @($Segments | Where-Object { $_ -and $_.Path -and $_.Duration -gt 0 })
+        $Member.Open--
+        if ($Member.Open -gt 0) { return }
+        $Member.Done = $true
+        $group = $Member.Group
+        if ($group.Finished -or @($group.Members | Where-Object { -not $_.Done }).Count) { return }
+        $group.Finished = $true
+        if (-not $script:Ffmpeg -or -not $script:Ffprobe) {
+            Show-Notification 'Combined recording skipped: ffmpeg was not found. Each device recording was saved.' 'Warning'
+            return
+        }
+        $recorded = @($group.Members | Where-Object { $_.Segments.Count -gt 0 })
+        if ($recorded.Count -lt 2) {
+            Show-Notification 'Combined recording skipped: fewer than two devices recorded video. Each device recording was saved.'
+            return
+        }
+        Start-Combine $group $recorded
+    } catch {
+        Write-Log "Combined recording failed: $($_.Exception.Message)"
+        Show-Notification 'Could not create the combined recording. Each device recording was saved.' 'Warning'
+    }
+}
+
+function Join-CombineHandover($Session) {
+    foreach ($handover in @($script:CombineHandovers | Where-Object { $_.Session -eq $Session })) {
+        $script:CombineHandovers.Remove($handover)
+        if ($Session.Recording -and -not $Session.CombineMember -and -not $handover.Member.Group.Finished) {
+            $Session.CombineMember = $handover.Member
+            $Session.PartStarts = @{}
+            $Session.PartStartPending = $false
+        } else {
+            Complete-CombineMember $handover.Member @()
+        }
+    }
+}
+
+function Update-CombineHandovers([switch]$All) {
+    foreach ($handover in @($script:CombineHandovers)) {
+        if (-not $All -and ((Get-Date) - $handover.At).TotalSeconds -lt 60) { continue }
+        $script:CombineHandovers.Remove($handover)
+        Write-Log "[$($handover.Session.Serial)] Recording did not continue over USB; the combined recording keeps the Wi-Fi part only."
+        Complete-CombineMember $handover.Member @()
+    }
+}
+
+function Test-CombineActive {
+    if ($script:Combines.Count -or $script:CombineHandovers.Count) { return $true }
+    if (@($script:Sessions.Values | Where-Object { $_.CombineMember }).Count) { return $true }
+    if (@($script:Stops | Where-Object { $_.Member }).Count) { return $true }
+    @($script:Merges | Where-Object { $_.Member }).Count -gt 0
+}
+
+function Get-CombineEncoderArgs {
+    if (-not $script:CombineEncoderArgs) {
+        $list = Invoke-Hidden $script:Ffmpeg @('-hide_banner', '-encoders') 15000
+        $encoder = if ($list -match '\slibx264\s') { @('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23') }
+                   elseif ($list -match '\slibopenh264\s') { @('-c:v', 'libopenh264', '-b:v', '8M') }
+                   else { @('-c:v', 'mpeg4', '-q:v', '4') }
+        if (-not $list) { return $encoder }
+        $script:CombineEncoderArgs = $encoder
+    }
+    $script:CombineEncoderArgs
+}
+
+function Start-Combine($Group, $Members) {
+    $t0 = $null
+    foreach ($member in $Members) {
+        foreach ($segment in $member.Segments) {
+            if (-not $segment.Start) { $segment.Start = $Group.RequestedAt }
+            if (-not $t0 -or $segment.Start -lt $t0) { $t0 = $segment.Start }
+        }
+    }
+    $count = $Members.Count
+    $cols = if ($count -le 3) { $count } else { [int][math]::Ceiling([math]::Sqrt($count)) }
+    $rows = [int][math]::Ceiling($count / $cols)
+    $sizes = @(foreach ($member in $Members) { , (Get-VideoSize $member.Segments[0].Path) })
+    $cellH = [double][math]::Min(1280, ($sizes | ForEach-Object { $_[1] } | Measure-Object -Maximum).Maximum)
+    $cellW = [double]($sizes | ForEach-Object { $_[0] * $cellH / $_[1] } | Measure-Object -Maximum).Maximum
+    $scale = [math]::Min(1.0, [math]::Min(3840 / ($cols * $cellW), 2160 / ($rows * $cellH)))
+    $cellW = [int][math]::Max(16, [math]::Floor($cellW * $scale / 2) * 2)
+    $cellH = [int][math]::Max(16, [math]::Floor($cellH * $scale / 2) * 2)
+
+    $chain = "scale=${cellW}:${cellH}:force_original_aspect_ratio=decrease:force_divisible_by=2:eval=frame,pad=${cellW}:${cellH}:(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1"
+    $inputs = New-Object System.Collections.Generic.List[string]
+    $filters = New-Object System.Collections.Generic.List[string]
+    $overlays = New-Object System.Collections.Generic.List[string]
+    $total = 0.0
+    $index = 0
+    for ($m = 0; $m -lt $count; $m++) {
+        $x = ($m % $cols) * $cellW
+        $y = [int][math]::Floor($m / $cols) * $cellH
+        foreach ($segment in $Members[$m].Segments) {
+            $offset = [math]::Max(0.0, ($segment.Start - $t0).TotalSeconds)
+            $total = [math]::Max($total, $offset + $segment.Duration)
+            $inputs.AddRange([string[]]@('-reinit_filter', '0', '-ss', (Format-Seconds $segment.Position), '-t', (Format-Seconds $segment.Duration), '-i', $segment.Path))
+            $filters.Add("[${index}:v]setpts=PTS-STARTPTS+$(Format-Seconds $offset)/TB,$chain[v$index]")
+            $overlays.Add("[b$index][v$index]overlay=x=${x}:y=${y}:eof_action=pass[b$($index + 1)]")
+            $index++
+        }
+    }
+    $graph = (@("color=c=black:s=$($cols * $cellW)x$($rows * $cellH):r=30:d=$(Format-Seconds $total)[b0]") + $filters + $overlays) -join ';'
+
+    $folder = Join-Path $RecordDir 'Combined'
+    [void](New-Item -ItemType Directory -Force -Path $folder)
+    $stem = 'Screen_Recording_Combined_{0:yyyyMMdd_HHmmss}' -f $Group.RequestedAt
+    $output = Join-Path $folder "$stem.mp4"
+    $suffix = 2
+    while ((Test-Path -LiteralPath $output) -or @($script:Combines | Where-Object { $_.Output -eq $output }).Count) {
+        $output = Join-Path $folder "${stem}_$suffix.mp4"
+        $suffix++
+    }
+    $temp = $output -replace '\.mp4$', '_combining.mp4'
+    $arguments = @('-hide_banner', '-nostdin', '-loglevel', 'error', '-y') + $inputs + @('-filter_complex', $graph, '-map', "[b$index]", '-an') +
+                 (Get-CombineEncoderArgs) + @('-pix_fmt', 'yuv420p', '-r', '30', '-movflags', '+faststart', '-t', (Format-Seconds $total), $temp)
+    $argumentString = ConvertTo-ArgumentString $arguments
+    if ($argumentString.Length -gt 30000) {
+        Show-Notification 'Combined recording skipped: too many recording parts. Each device recording was saved.' 'Warning'
+        return
+    }
+
+    $log = Join-Path $script:LogDir ('combine-{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
+    $psi = New-HiddenStartInfo $script:Ffmpeg $argumentString
+    $psi.EnvironmentVariables['FFREPORT'] = 'file=' + (($log -replace '\\', '/') -replace ':', '\:') + ':level=16'
+    $process = [System.Diagnostics.Process]::Start($psi)
+    try { $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
+    [void]$script:Combines.Add([pscustomobject]@{ Process = $process; Output = $output; Temp = $temp; Log = $log; Size = -1L; ProgressAt = Get-Date })
+    Write-Log "Combining $count device recordings ($index part(s), $(Format-Seconds $total)s) into $output (log: $log)"
+    Show-Notification "Combining $count device recordings into one video..."
+}
+
+function Update-Combines([int]$TimeoutMs = 0) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    foreach ($combine in @($script:Combines)) {
+        $wait = [int][math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+        if (-not $combine.Process.WaitForExit($wait)) {
+            $size = 0L
+            try { $file = New-Object System.IO.FileInfo $combine.Temp; if ($file.Exists) { $size = $file.Length } } catch { }
+            if ($size -ne $combine.Size) {
+                $combine.Size = $size
+                $combine.ProgressAt = Get-Date
+                continue
+            }
+            if (((Get-Date) - $combine.ProgressAt).TotalMinutes -lt 5) { continue }
+            Write-Log "Combined recording made no progress for 5 minutes; stopping ffmpeg."
+            Stop-ProcessTree $combine.Process.Id
+            [void]$combine.Process.WaitForExit(5000)
+        }
+        $exitCode = if ($combine.Process.HasExited) { $combine.Process.ExitCode } else { -1 }
+        $combine.Process.Dispose()
+        $script:Combines.Remove($combine)
+        if ($exitCode -eq 0 -and (Test-VideoFile $combine.Temp)) {
+            try {
+                Move-Item -LiteralPath $combine.Temp -Destination $combine.Output -ErrorAction Stop
+                Remove-Item -LiteralPath $combine.Log -Force -ErrorAction SilentlyContinue
+                Show-Notification "Combined recording saved: $($combine.Output)"
+            } catch {
+                Show-Notification "Combined recording saved as $($combine.Temp) (could not rename it: $($_.Exception.Message))." 'Warning'
+            }
+        } else {
+            Remove-Item -LiteralPath $combine.Temp -Force -ErrorAction SilentlyContinue
+            Show-Notification "Could not create the combined recording (ffmpeg exit code $exitCode; log: $($combine.Log)). Each device recording was saved." 'Warning'
+        }
+    }
+}
+
+function Stop-Combines {
+    foreach ($combine in @($script:Combines)) {
+        try {
+            if (-not $combine.Process.HasExited) {
+                Stop-ProcessTree $combine.Process.Id
+                [void]$combine.Process.WaitForExit(5000)
+            }
+            $combine.Process.Dispose()
+        } catch { }
+        $script:Combines.Remove($combine)
+        Remove-Item -LiteralPath $combine.Temp -Force -ErrorAction SilentlyContinue
+        Write-Log "Combined recording $($combine.Output) cancelled at exit; each device recording was saved."
+        Show-Notification 'The combined recording was not finished before exit and was cancelled. Each device recording was saved.' 'Warning'
+    }
+}
+
 function Get-TargetSessions([string[]]$Serials) {
-    $all = @($script:Sessions.Values | Where-Object { -not $_.UserClosed })
+    $all = @($script:Sessions.Values | Where-Object { -not $_.UserClosed -and -not $script:Standby.ContainsKey($_.Serial) })
     if (-not $Serials -or $Serials.Count -eq 0) { return $all }
     @($all | Where-Object { $Serials -contains $_.Serial })
 }
@@ -821,24 +1182,336 @@ function Invoke-Requests {
     }
 }
 
+function Start-AdbJob([string[]]$Arguments) {
+    $psi = New-HiddenStartInfo $script:Adb (ConvertTo-ArgumentString $Arguments)
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    @{ Process = $process; Output = $process.StandardOutput.ReadToEndAsync(); Error = $process.StandardError.ReadToEndAsync(); StartedAt = Get-Date }
+}
+
+function Complete-AdbJob($Job, [int]$TimeoutSeconds = 20) {
+    if (-not $Job.Process.HasExited) {
+        if (((Get-Date) - $Job.StartedAt).TotalSeconds -lt $TimeoutSeconds) { return $null }
+        try { $Job.Process.Kill(); [void]$Job.Process.WaitForExit(2000) } catch { }
+    }
+    $text = ''
+    if ($Job.Output.Wait(1000)) { $text += $Job.Output.Result }
+    if ($Job.Error.Wait(1000)) { $text += $Job.Error.Result }
+    $Job.Process.Dispose()
+    $text.Trim()
+}
+
+function Stop-AdbJobs {
+    foreach ($job in @(@($script:Connects) + @($script:Discovery) | Where-Object { $_ })) {
+        try { if (-not $job.Process.HasExited) { $job.Process.Kill() } } catch { }
+        $job.Process.Dispose()
+    }
+    $script:Connects.Clear()
+    $script:Discovery = $null
+    Stop-Probe
+}
+
+function Start-Connect([string]$Address, [bool]$Manual) {
+    if (@($script:Connects | Where-Object { $_.Address -eq $Address }).Count) { return }
+    try {
+        $job = Start-AdbJob @('connect', $Address)
+    } catch {
+        Write-Log "adb connect $Address failed: $($_.Exception.Message)"
+        return
+    }
+    $job.Address = $Address
+    $job.Manual = $Manual
+    [void]$script:Connects.Add($job)
+}
+
+function Update-Connects($Devices) {
+    foreach ($job in @($script:Connects)) {
+        $output = Complete-AdbJob $job
+        if ($null -eq $output) { continue }
+        $script:Connects.Remove($job)
+        Write-Log "adb connect $($job.Address): $output"
+        $connected = $output -match '^(already )?connected to '
+        if ($connected -and -not $job.Manual -and $output -notmatch '^already') {
+            $usb = @($Devices.Keys | Where-Object { $Devices[$_] -eq 'device' -and (Get-ConnectionType $_) -eq 'USB' -and -not $script:MovedUsb.ContainsKey($_) -and -not ($script:Sessions.ContainsKey($_) -and $script:Sessions[$_].UserClosed) })
+            if ($usb.Count -and $usb -contains (Get-DeviceProp $job.Address 'ro.serialno')) {
+                Write-Log "$($job.Address) is a device already connected over USB; disconnecting the Wi-Fi connection."
+                [void](Invoke-Adb @('disconnect', $job.Address) 5000)
+                $Devices.Remove($job.Address)
+                Remove-KnownWifi $job.Address
+                $script:DiscoveryRetry[$job.Address] = (Get-Date).AddMinutes(10)
+                continue
+            }
+        }
+        if (-not $job.Manual) { continue }
+        $moving = @($script:Sessions.Values | Where-Object { $_.MovedTo -eq 'Wi-Fi' -and $_.MoveAddress -eq $job.Address }) | Select-Object -First 1
+        if ($moving) {
+            if (-not $connected) { Undo-Move $moving "adb connect failed ($output)" }
+            continue
+        }
+        if ($connected) {
+            Add-ScanPort ([int]($job.Address -replace '^.*:', ''))
+            Show-Notification "Connected to $($job.Address)."
+        }
+        else { [void]$script:ConnectFailures.Add(@{ Address = $job.Address; Output = $output }) }
+    }
+}
+
+function Get-ConnectFailureReason([string]$Address, [string]$Output) {
+    $ip = $Address -replace ':\d+$', ''
+    $port = $Address -replace '^.*:', ''
+    if ($Output -match '10061|refused') {
+        return "The device at $ip answered, but port $port is not open for ADB. Check the port number and that ADB over Wi-Fi is turned on for this port on the device (for example adb tcpip $port)."
+    }
+    if ($Output -match '11001|resolve|no such host|not known') { return "The address $ip could not be found. Check the IP address." }
+    if ($Output -match 'authenticat|unauthorized') { return 'Unlock the device and accept the "Allow debugging" prompt, then try again.' }
+    if (-not $Output -or $Output -match '10060|10065|10051|timed out|did not properly respond|unreachable|failed to connect') {
+        return "No device answered at $Address. Check that the IP address and port are correct, the device is turned on and on the same network as this PC, and ADB over Wi-Fi is turned on."
+    }
+    $Output
+}
+
+function Show-ConnectFailures {
+    if ($script:ConnectPrompting -or -not $script:ConnectFailures.Count) { return }
+    $failure = $script:ConnectFailures[0]
+    $script:ConnectFailures.RemoveAt(0)
+    $script:ConnectPrompting = $true
+    try {
+        $reason = Get-ConnectFailureReason $failure.Address $failure.Output
+        $answer = Show-Message "Could not connect to $($failure.Address).`n`n$reason`n`nTry again?" 'RetryCancel' 'Warning'
+        if ($answer -eq [System.Windows.Forms.DialogResult]::Retry) {
+            Show-ConnectDialog ($failure.Address -replace ':\d+$', '') ($failure.Address -replace '^.*:', '')
+        }
+    } finally {
+        $script:ConnectPrompting = $false
+    }
+}
+
+function Update-Discovery($Devices) {
+    if ($NoDiscovery -or $Serial.Count) { return }
+    $now = Get-Date
+    if ($script:Discovery) {
+        $output = Complete-AdbJob $script:Discovery
+        if ($null -ne $output) {
+            $script:Discovery = $null
+            foreach ($line in ($output -split "`r?`n")) {
+                if ($line -notmatch '^\s*(\S+)\s+_adb\._tcp\.?\s+(\S+:\d+)\s*$') { continue }
+                $name = $Matches[1]
+                $address = $Matches[2]
+                [void]$script:ScanFound.Add($address)
+                if (@($Devices.Keys | Where-Object { $name -eq "adb-$_" }).Count) { continue }
+                Connect-Found $address $name $Devices $now
+            }
+        }
+    }
+    if ($script:Probe) {
+        $open = Complete-Probe
+        if ($null -ne $open) {
+            foreach ($address in $open) {
+                [void]$script:ScanFound.Add($address)
+                Connect-Found $address 'port scan' $Devices $now
+            }
+        }
+    }
+    if ($script:Discovery -or $script:Probe) { return }
+    if ($script:Scanning) {
+        $script:Scanning = $false
+        $connected = @($Devices.Keys | Where-Object { $Devices[$_] -eq 'device' } | ForEach-Object { Get-ConnectionType $_ })
+        $script:DiscoveryStatus = "Last scan $($now.ToString('HH:mm:ss')): $(@($connected | Where-Object { $_ -eq 'Wi-Fi' }).Count) Wi-Fi, $(@($connected | Where-Object { $_ -eq 'USB' }).Count) USB"
+    }
+    if ($now -lt $script:NextDiscovery) { return }
+    $script:NextDiscovery = $now.AddSeconds(15)
+    $script:ScanFound.Clear()
+    foreach ($address in @($script:KnownWifi)) { Connect-Found $address 'remembered' $Devices $now }
+    try {
+        $script:Discovery = Start-AdbJob @('mdns', 'services')
+    } catch {
+        Write-Log "adb mdns services failed: $($_.Exception.Message)"
+    }
+    if ($script:ProbeRequested) {
+        $script:ProbeRequested = $false
+        try { Start-Probe } catch { Write-Log "Wi-Fi port scan failed: $($_.Exception.Message)" }
+    }
+    if ($script:Discovery -or $script:Probe) {
+        $script:Scanning = $true
+        if ($script:Probe) { $script:DiscoveryStatus = 'Scanning for devices...' }
+    } else {
+        $script:DiscoveryStatus = 'Wi-Fi scan: unavailable'
+    }
+}
+
+function Connect-Found([string]$Address, [string]$Source, $Devices, [datetime]$Now) {
+    if ($Devices.ContainsKey($Address) -or $script:Sessions.ContainsKey($Address)) { return }
+    if ($script:DiscoveryRetry.ContainsKey($Address) -and $Now -lt $script:DiscoveryRetry[$Address]) { return }
+    $script:DiscoveryRetry[$Address] = $Now.AddSeconds(60)
+    Write-Log "Found Wi-Fi device $Address ($Source); connecting."
+    Start-Connect $Address $false
+}
+
+function Get-ProbeHosts {
+    $hosts = New-Object System.Collections.Generic.HashSet[string]
+    $own = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($nic.OperationalStatus -ne 'Up' -or $nic.NetworkInterfaceType -in @('Loopback', 'Tunnel')) { continue }
+        $properties = $nic.GetIPProperties()
+        if (-not @($properties.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' }).Count) { continue }
+        foreach ($unicast in $properties.UnicastAddresses) {
+            if ($unicast.Address.AddressFamily -ne 'InterNetwork' -or $unicast.Address.ToString() -like '169.254.*') { continue }
+            [void]$own.Add($unicast.Address.ToString())
+            $prefix = $unicast.PrefixLength
+            if ($prefix -lt 22 -or $prefix -gt 30) { $prefix = 24 }
+            $bytes = $unicast.Address.GetAddressBytes(); [array]::Reverse($bytes)
+            $ip = [BitConverter]::ToUInt32($bytes, 0)
+            $size = [uint32][math]::Pow(2, 32 - $prefix)
+            $network = $ip - ($ip % $size)
+            for ($i = 1; $i -lt $size - 1; $i++) {
+                $hostBytes = [BitConverter]::GetBytes([uint32]($network + $i)); [array]::Reverse($hostBytes)
+                [void]$hosts.Add(([System.Net.IPAddress]$hostBytes).ToString())
+            }
+        }
+    }
+    @($hosts | Where-Object { -not $own.Contains($_) })
+}
+
+function Get-ScanPorts {
+    @(@(5555, 5037) + @($script:ScanPorts) + @($script:KnownWifi | ForEach-Object { [int]($_ -replace '^.*:', '') }) | Select-Object -Unique)
+}
+
+function Read-ScanPorts {
+    $list = New-Object System.Collections.ArrayList
+    try {
+        $json = Get-Content -LiteralPath $script:ScanPortsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        foreach ($port in @($json)) {
+            $value = 0
+            if ([int]::TryParse([string]$port, [ref]$value) -and $value -ge 1 -and $value -le 65535 -and -not $list.Contains($value)) { [void]$list.Add($value) }
+        }
+    } catch { }
+    , $list
+}
+
+function Add-ScanPort([int]$Port) {
+    if ($Port -in @(5555, 5037) -or $script:ScanPorts.Contains($Port)) { return }
+    [void]$script:ScanPorts.Add($Port)
+    Write-Log "Adding port $Port to the Wi-Fi scan."
+    try {
+        [void](New-Item -ItemType Directory -Force -Path (Split-Path $script:ScanPortsPath))
+        ConvertTo-Json -InputObject @($script:ScanPorts) | Set-Content -LiteralPath $script:ScanPortsPath -Encoding UTF8
+    } catch { Write-Log "Could not save $($script:ScanPortsPath): $($_.Exception.Message)" }
+}
+
+function Start-Probe {
+    $targets = New-Object System.Collections.Generic.HashSet[string]
+    $ports = Get-ScanPorts
+    foreach ($ip in (Get-ProbeHosts)) { foreach ($port in $ports) { [void]$targets.Add("${ip}:$port") } }
+    foreach ($address in $script:KnownWifi) { if ($address -match '^\d+\.\d+\.\d+\.\d+:\d+$') { [void]$targets.Add($address) } }
+    $probes = New-Object System.Collections.ArrayList
+    foreach ($address in $targets) {
+        $ip, $port = $address -split ':'
+        $client = New-Object System.Net.Sockets.TcpClient
+        try { [void]$probes.Add(@{ Address = $address; Client = $client; Task = $client.ConnectAsync([System.Net.IPAddress]::Parse($ip), [int]$port) }) }
+        catch { $client.Close() }
+    }
+    Write-Log "Scanning $($probes.Count) address(es) on port(s) $($ports -join ', ')."
+    $script:Probe = @{ Probes = $probes; StartedAt = Get-Date }
+}
+
+function Complete-Probe {
+    if (((Get-Date) - $script:Probe.StartedAt).TotalSeconds -lt 1.5) { return $null }
+    $probes = $script:Probe.Probes
+    $open = @($probes | Where-Object { $_.Task.Status -eq 'RanToCompletion' -and $_.Client.Connected } | ForEach-Object { $_.Address })
+    Stop-Probe
+    $open
+}
+
+function Stop-Probe {
+    if (-not $script:Probe) { return }
+    foreach ($probe in $script:Probe.Probes) { try { $probe.Client.Close() } catch { } }
+    $script:Probe = $null
+}
+
+function Read-KnownWifi {
+    $list = New-Object System.Collections.ArrayList
+    try {
+        $json = Get-Content -LiteralPath $script:KnownWifiPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        foreach ($address in @($json)) {
+            if ([string]$address -match '^\S+:\d+$' -and -not $list.Contains([string]$address)) { [void]$list.Add([string]$address) }
+        }
+    } catch { }
+    , $list
+}
+
+function Update-KnownWifi($Devices) {
+    $added = @($Devices.Keys | Where-Object { $Devices[$_] -eq 'device' -and $_ -match '^\d+\.\d+\.\d+\.\d+:\d+$' -and -not $script:KnownWifi.Contains($_) })
+    foreach ($address in $added) { Add-KnownWifi $address }
+}
+
+function Add-KnownWifi([string]$Address) {
+    if (-not $Address -or $script:KnownWifi.Contains($Address)) { return }
+    [void]$script:KnownWifi.Add($Address)
+    Write-Log "Remembering Wi-Fi device $Address."
+    Save-KnownWifi
+}
+
+function Remove-KnownWifi([string]$Address) {
+    if (-not $script:KnownWifi.Contains($Address)) { return }
+    $script:KnownWifi.Remove($Address)
+    Write-Log "Forgetting Wi-Fi device $Address."
+    Save-KnownWifi
+}
+
+function Save-KnownWifi {
+    try {
+        [void](New-Item -ItemType Directory -Force -Path (Split-Path $script:KnownWifiPath))
+        ConvertTo-Json -InputObject @($script:KnownWifi) | Set-Content -LiteralPath $script:KnownWifiPath -Encoding UTF8
+    } catch { Write-Log "Could not save $($script:KnownWifiPath): $($_.Exception.Message)" }
+}
+
+function Start-Scan {
+    if ($NoDiscovery -or $Serial.Count -or $script:Discovery -or $script:Probe) { return }
+    $script:DiscoveryRetry.Clear()
+    $script:NextDiscovery = Get-Date
+    $script:ProbeRequested = $true
+    $script:DiscoveryStatus = 'Scanning for devices...'
+    Write-Log 'Device scan requested.'
+    Request-Tick
+}
+
 function Invoke-Tick {
     Invoke-Requests
     if ($script:Exiting) { return }
     Update-Merges
+    Update-Combines
+    Update-CombineHandovers
 
     $now = Get-Date
     $devices = Get-AdbDevices
-    $targets = if ($Serial.Count) { $Serial } else { @($devices.Keys | Where-Object { $devices[$_] -eq 'device' }) + @($script:Sessions.Keys) | Select-Object -Unique }
+    $script:RemovedSerials.Clear()
+    Update-Connects $devices
+    Update-KnownWifi $devices
+    Update-Discovery $devices
+    Update-Moves $devices
+    Update-UsbPriority $devices
+    foreach ($address in @($script:DelayedConnects.Keys)) {
+        if ($now -lt $script:DelayedConnects[$address]) { continue }
+        $script:DelayedConnects.Remove($address)
+        Connect-WifiDevice $address
+    }
+    $targets = if ($Serial.Count) { $Serial } else { @($devices.Keys | Where-Object { $devices[$_] -match '^(device|unauthorized|authorizing)$' }) + @($script:Sessions.Keys) | Select-Object -Unique }
+    $targets = @($targets | Where-Object { -not (Test-MovedAway $_ $devices) })
 
     foreach ($deviceSerial in $targets) {
-        $session = if ($script:Sessions.ContainsKey($deviceSerial)) { $script:Sessions[$deviceSerial] } else { New-Session $deviceSerial }
+        if ($script:RemovedSerials.Contains($deviceSerial)) { continue }
+        $session = if ($script:Sessions.ContainsKey($deviceSerial)) { $script:Sessions[$deviceSerial] } else { New-Session $deviceSerial $devices[$deviceSerial] }
+        if ($session.PendingAction -and -not $session.Stopping) { Invoke-PendingAction $session }
         if ($session.UserClosed) { continue }
 
         $state = if ($devices.ContainsKey($deviceSerial)) { $devices[$deviceSerial] } else { 'missing' }
         if ($state -ne $session.LastState) {
             Write-Log "[$deviceSerial] adb state: $state"
+            if ($state -eq 'device') { $script:WifiSerials.Remove($deviceSerial) }
             $session.LastState = $state
         }
+        if ($state -eq 'device') { $session.MissingSince = $null } elseif (-not $session.MissingSince) { $session.MissingSince = $now }
         if ($state -ne 'device') { $session.BootedAt = $null }
         if ($session.Connector -and $session.Connector.HasExited) {
             $session.Connector.Dispose()
@@ -849,6 +1522,24 @@ function Invoke-Tick {
             if ($state -eq 'offline') { [void](Invoke-Adb @('disconnect', $deviceSerial) 5000) }
             $session.Connector = [System.Diagnostics.Process]::Start((New-HiddenStartInfo $script:Adb (ConvertTo-ArgumentString @('connect', $deviceSerial))))
         }
+        if ($script:Standby.ContainsKey($deviceSerial)) {
+            if (-not $session.Name -and $state -eq 'device') { [void](Test-DeviceReady $session $devices) }
+            if ($session.RecordPending) {
+                $active = $script:Sessions[$script:Standby[$deviceSerial]]
+                if ($active -and $active.Recording) {
+                    $session.RecordPending = $false
+                    Write-Log "[$deviceSerial] Recording continues over $(Get-ConnectionType $script:Standby[$deviceSerial])."
+                }
+            }
+            if ($session.Display) { Write-Log "[$deviceSerial] Standby: the device is mirrored over $(Get-ConnectionType $script:Standby[$deviceSerial])." }
+            Stop-Display $session
+            continue
+        }
+        if ($session.RecordPending -and $state -eq 'device') {
+            $session.RecordPending = $false
+            Start-Recording $session
+            Join-CombineHandover $session
+        }
 
         $ready = $null
         Update-Display $session $devices ([ref]$ready)
@@ -856,14 +1547,15 @@ function Invoke-Tick {
     }
 
     $tracked = @($script:Sessions.Values)
+    $monitored = @($tracked | Where-Object { -not $_.Disconnected -and $_.Name -and -not $script:Standby.ContainsKey($_.Serial) })
     if ($script:OpenWindowsRequested) {
         $script:OpenWindowsRequested = $false
-        $closed = @($tracked | Where-Object { $_.UserClosed } | ForEach-Object { $_.Serial })
+        $closed = @($tracked | Where-Object { $_.UserClosed -and -not $_.Disconnected } | ForEach-Object { $_.Serial })
         if ($closed.Count) { Open-Window $closed }
         if ($script:Panel) { Show-Panel }
         elseif (-not $closed.Count) { Show-Notification 'scrcpy monitor is already running. Right-click the tray icon for recording and settings.' }
     }
-    if (-not ($script:Panel -and $script:Panel.Visible) -and $tracked.Count -gt 0 -and -not ($tracked | Where-Object { -not $_.UserClosed })) {
+    if (-not ($script:Panel -and $script:Panel.Visible) -and $monitored.Count -gt 0 -and -not ($monitored | Where-Object { -not $_.UserClosed }) -and -not ($tracked | Where-Object { $_.MovedTo }) -and -not (Test-CombineActive)) {
         Write-Log 'All scrcpy windows were closed.'
         Stop-Monitor
         return
@@ -874,7 +1566,7 @@ function Invoke-Tick {
 function Update-TrayText {
     if (-not $script:Tray) { return }
     $recording = @($script:Sessions.Values | Where-Object { $_.Recording }).Count
-    $text = if ($recording) { "scrcpy monitor - recording $recording device(s)" } else { 'scrcpy monitor' }
+    $text = if ($recording) { "Scrcpy Monitor - recording $recording device(s)" } else { 'Scrcpy Monitor' }
     $script:Tray.Text = $text.Substring(0, [Math]::Min(63, $text.Length))
 }
 
@@ -897,7 +1589,20 @@ function Update-TrayMenu {
         [void]$menu.Items.Add($empty)
     }
     foreach ($session in $sessions) {
-        $label = if ($session.Recording) { "$($session.Title)  [REC]" } else { $session.Title }
+        $label = "$($session.Title) - $($session.Connection)"
+        if ($script:Standby.ContainsKey($session.Serial)) {
+            $label += '  [standby]'
+            $item = New-Object System.Windows.Forms.ToolStripMenuItem $label
+            if ($session.Connection -eq 'Wi-Fi') {
+                $disconnect = New-Object System.Windows.Forms.ToolStripMenuItem 'Disconnect'
+                $disconnect.Tag = $session.Serial
+                $disconnect.add_Click({ param($sender, $e) Invoke-Safely { Disconnect-Device @($sender.Tag) } })
+                [void]$item.DropDownItems.Add($disconnect)
+            } else { $item.Enabled = $false }
+            [void]$menu.Items.Add($item)
+            continue
+        }
+        if ($session.Recording) { $label += '  [REC]' }
         $item = New-Object System.Windows.Forms.ToolStripMenuItem $label
         $toggle = New-Object System.Windows.Forms.ToolStripMenuItem $(if ($session.Recording) { 'Stop recording' } else { 'Start recording' })
         $toggle.Tag = $session.Serial
@@ -910,11 +1615,25 @@ function Update-TrayMenu {
             }
         })
         [void]$item.DropDownItems.Add($toggle)
+        if ($session.Connection -in @('Wi-Fi', 'USB')) {
+            $switch = New-Object System.Windows.Forms.ToolStripMenuItem $(if ($session.Connection -eq 'Wi-Fi') { 'Switch to USB' } else { 'Switch to Wi-Fi' })
+            $switch.Tag = $session.Serial
+            $switch.Enabled = $session.LastState -eq 'device'
+            $switch.add_Click({ param($sender, $e) Invoke-Safely { Switch-Connection @($sender.Tag) } })
+            [void]$item.DropDownItems.Add($switch)
+        }
+        if ($session.Connection -eq 'Wi-Fi') {
+            $disconnect = New-Object System.Windows.Forms.ToolStripMenuItem 'Disconnect'
+            $disconnect.Tag = $session.Serial
+            $disconnect.add_Click({ param($sender, $e) Invoke-Safely { Disconnect-Device @($sender.Tag) } })
+            [void]$item.DropDownItems.Add($disconnect)
+        }
         [void]$menu.Items.Add($item)
     }
     foreach ($session in $closed) {
-        $item = New-Object System.Windows.Forms.ToolStripMenuItem "$($session.Title)  [closed]"
-        $open = New-Object System.Windows.Forms.ToolStripMenuItem 'Open window'
+        $state = if ($session.MovedTo) { "switching to $($session.MovedTo)" } elseif ($session.Disconnected) { 'disconnected' } else { 'closed' }
+        $item = New-Object System.Windows.Forms.ToolStripMenuItem "$($session.Title) - $($session.Connection)  [$state]"
+        $open = New-Object System.Windows.Forms.ToolStripMenuItem $(if ($session.Disconnected) { 'Reconnect' } else { 'Open window' })
         $open.Tag = $session.Serial
         $open.add_Click({ param($sender, $e) Invoke-Safely { Open-Window @($sender.Tag) } })
         [void]$item.DropDownItems.Add($open)
@@ -923,11 +1642,13 @@ function Update-TrayMenu {
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $startAll = $menu.Items.Add('Start recording on all devices')
-    $startAll.Enabled = @($sessions | Where-Object { -not $_.Recording }).Count -gt 0
+    $startAll.Enabled = @($sessions | Where-Object { -not $_.Recording -and -not $script:Standby.ContainsKey($_.Serial) }).Count -gt 0
     $startAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s }; Update-TrayText } })
     $stopAll = $menu.Items.Add('Stop recording on all devices')
     $stopAll.Enabled = @($sessions | Where-Object { $_.Recording }).Count -gt 0
     $stopAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s }; Update-TrayText } })
+    $connectWifi = $menu.Items.Add('Connect Wi-Fi device...')
+    $connectWifi.add_Click({ Invoke-Safely { Show-ConnectDialog } })
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $openFolder = $menu.Items.Add('Open recordings folder')
     $openFolder.add_Click({ Invoke-Safely { Open-RecordFolder } })
@@ -966,7 +1687,7 @@ function Show-About {
     $engine = if ($scrcpyVersion) { "scrcpy $scrcpyVersion" } else { 'scrcpy' }
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'About scrcpy monitor'
+    $form.Text = 'About Scrcpy Monitor'
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
@@ -984,19 +1705,26 @@ function Show-About {
     $form.Controls.Add($layout)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = 'scrcpy monitor'
+    $title.Text = 'Scrcpy Monitor'
     $title.AutoSize = $true
     $title.Font = New-Object System.Drawing.Font($form.Font.FontFamily, 14, [System.Drawing.FontStyle]::Bold)
     $layout.Controls.Add($title)
 
     $details = New-Object System.Windows.Forms.Label
     $details.AutoSize = $true
-    $details.MaximumSize = New-Object System.Drawing.Size(440, 0)
+    $details.MaximumSize = New-Object System.Drawing.Size(480, 0)
     $details.Margin = New-Object System.Windows.Forms.Padding(3, 6, 3, 6)
     $details.Text = "Version: $version`nMirroring engine: $engine`nAuthor: $script:Author`n`n" +
-        'Mirrors one or more Android devices over USB or Wi-Fi/TCP, each in its own window. A window stays open while its device restarts and mirroring resumes automatically. ' +
-        'Screen recording can be started and stopped per device or for all devices from the window button (Alt+E), this control panel or the tray icon; recordings continue across device restarts and are saved as a single MP4 per device.' +
-        "`n`nBuilt on scrcpy by Genymobile (Apache License 2.0)."
+        "Mirrors one or more Android devices in separate windows and keeps each window open while its device restarts or reconnects.`n`n" +
+        "- Detects devices connected over USB or Wi-Fi and shows the connection type of each.`n" +
+        "- Scan now finds devices on the local Wi-Fi network (ports 5555, 5037 and any port you connected with) and connects them automatically.`n" +
+        "- Connect a Wi-Fi device by IP address and port, disconnect it or reconnect it later; Wi-Fi devices are remembered.`n" +
+        "- A device connected over both USB and Wi-Fi is mirrored over USB; the Wi-Fi connection is kept on standby.`n" +
+        "- Switch a device between USB and Wi-Fi; the old entry is removed, and if the switch fails the previous connection is restored.`n" +
+        "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device.`n" +
+                "- Record combined also joins the recordings of the selected devices into one side-by-side video.`n" +
+                "- Checks for updates; the portable version updates itself.`n`n" +
+        'Built on scrcpy by Genymobile (Apache License 2.0).'
     $layout.Controls.Add($details)
 
     $link = New-Object System.Windows.Forms.LinkLabel
@@ -1005,14 +1733,37 @@ function Show-About {
     $link.add_LinkClicked({ param($sender, $e) Invoke-Safely { Start-Process $sender.Text } })
     $layout.Controls.Add($link)
 
+    $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $buttons.AutoSize = $true
+    $buttons.WrapContents = $false
+    $buttons.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+    $buttons.Margin = New-Object System.Windows.Forms.Padding(0, 12, 0, 0)
+    if ($script:Updating -or $script:AvailableUpdate) {
+        $update = New-Object System.Windows.Forms.Label
+        $update.AutoSize = $true
+        $update.Margin = New-Object System.Windows.Forms.Padding(3, 12, 3, 0)
+        $update.Font = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
+        if ($script:Updating) {
+            $update.Text = "Installing update $(Get-DisplayVersion $script:AvailableUpdate.Tag)... the monitor restarts when it is ready."
+        } else {
+            $update.Text = "Update $(Get-DisplayVersion $script:AvailableUpdate.Tag) is available."
+            $install = New-Object System.Windows.Forms.Button
+            $install.Text = 'Install update'
+            $install.AutoSize = $true
+            $install.add_Click({ param($sender, $e) Invoke-Safely { if (Confirm-Update) { $sender.FindForm().Close(); Start-Update } } })
+            $buttons.Controls.Add($install)
+        }
+        $layout.Controls.Add($update)
+    }
+    $layout.Controls.Add($buttons)
+
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = 'OK'
-    $ok.Anchor = [System.Windows.Forms.AnchorStyles]::Right
-    $ok.Margin = New-Object System.Windows.Forms.Padding(3, 12, 3, 3)
     $ok.add_Click({ param($sender, $e) $sender.FindForm().Close() })
-    $layout.Controls.Add($ok)
+    $buttons.Controls.Add($ok)
     $form.AcceptButton = $ok
     $form.CancelButton = $ok
+    $form.ActiveControl = $ok
 
     $form.add_FormClosed({ param($sender, $e) $sender.Dispose(); $script:About = $null })
     $script:About = $form
@@ -1042,8 +1793,13 @@ function Stop-Monitor {
         }
     }
     try {
+        Invoke-Safely { Stop-AdbJobs }
         foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-Recording $session } }
         Invoke-Safely { Update-Stops 45000 }
+        Invoke-Safely { Update-CombineHandovers -All }
+        foreach ($session in @($script:Sessions.Values | Where-Object { $_.PendingAction })) {
+            Invoke-Safely { Invoke-PendingAction $session }
+        }
         foreach ($session in @($script:Sessions.Values)) {
             Invoke-Safely {
                 if ($session.Connector) {
@@ -1059,6 +1815,8 @@ function Stop-Monitor {
             }
         }
         Invoke-Safely { Update-Merges 600000 }
+        Invoke-Safely { Update-Combines 120000 }
+        Invoke-Safely { Stop-Combines }
     } finally {
         if ($script:Tray) {
             $script:Tray.Visible = $false
@@ -1069,6 +1827,12 @@ function Stop-Monitor {
     }
 }
 
+function Request-Tick {
+    $script:Timer.Stop()
+    $script:Timer.Interval = 100
+    $script:Timer.Start()
+}
+
 function Open-Window([string[]]$Serials) {
     foreach ($serial in $Serials) {
         $session = $script:Sessions[$serial]
@@ -1076,11 +1840,328 @@ function Open-Window([string[]]$Serials) {
         $session.UserClosed = $false
         $session.DisplayFailures = 0
         $session.NextDisplayAttempt = Get-Date
-        Write-Log "[$serial] Reopening scrcpy window."
+        if ($session.Disconnected) {
+            $session.Disconnected = $false
+            $session.PendingAction = $null
+            $session.MovedTo = $null
+            $session.NextConnect = Get-Date
+            Write-Log "[$serial] Reconnecting."
+        } else {
+            Write-Log "[$serial] Reopening scrcpy window."
+        }
     }
-    $script:Timer.Stop()
-    $script:Timer.Interval = 100
-    $script:Timer.Start()
+    Request-Tick
+}
+
+function Confirm-StopRecording($Sessions, [string]$Action) {
+    if (-not @($Sessions | Where-Object { $_.Recording }).Count) { return $true }
+    $text = "$Action $(($Sessions | ForEach-Object { $_.Title }) -join ', ')?`n`nThe recording in progress is stopped and saved."
+    (Show-Message $text 'YesNo' 'Question') -eq [System.Windows.Forms.DialogResult]::Yes
+}
+
+function Stop-Display($Session) {
+    if (-not $Session.Display) { return }
+    try {
+        if (-not $Session.Display.HasExited -and -not $Session.ScrcpyPid) { [void](Test-WindowShown $Session) }
+        if (-not $Session.Display.HasExited -and $Session.ScrcpyPid) {
+            $scrcpy = [System.Diagnostics.Process]::GetProcessById($Session.ScrcpyPid)
+            try { if ($scrcpy.ProcessName -eq 'scrcpy') { $scrcpy.Kill() } } finally { $scrcpy.Dispose() }
+        }
+    } catch { }
+    try { if (-not $Session.Display.HasExited) { $Session.Display.Kill() } } catch { }
+    $Session.Display.Dispose()
+    $Session.Display = $null
+    $Session.WindowShown = $false
+    $Session.ScrcpyPid = 0
+}
+
+function Close-Session($Session, [string]$Action) {
+    $Session.Disconnected = $true
+    $Session.UserClosed = $true
+    $Session.PendingAction = $Action
+    Stop-Recording $Session
+    if ($Session.Connector) {
+        if (-not $Session.Connector.HasExited) { $Session.Connector.Kill() }
+        $Session.Connector.Dispose()
+        $Session.Connector = $null
+    }
+    Stop-Display $Session
+}
+
+function Update-UsbPriority($Devices) {
+    $script:Standby.Clear()
+    if ($Serial.Count) { return }
+    $known = @(@($Devices.Keys) + @($script:Sessions.Keys) | Select-Object -Unique)
+    if (-not @($known | Where-Object { (Get-ConnectionType $_) -eq 'USB' }).Count) { return }
+    foreach ($address in @($known | Where-Object { (Get-ConnectionType $_) -eq 'Wi-Fi' })) {
+        if (-not $script:WifiSerials.ContainsKey($address)) {
+            if ($Devices[$address] -ne 'device') { continue }
+            $script:WifiSerials[$address] = Get-DeviceProp $address 'ro.serialno'
+        }
+        $usbSerial = $script:WifiSerials[$address]
+        if (-not $usbSerial -or $script:MovedUsb.ContainsKey($usbSerial)) { continue }
+        $usbSession = $script:Sessions[$usbSerial]
+        $wifi = $script:Sessions[$address]
+        $usbOnline = $Devices[$usbSerial] -eq 'device'
+        if (-not $usbOnline -and -not ($usbSession -and -not $usbSession.UserClosed)) { continue }
+        if (($wifi -and ($wifi.MovedTo -or $wifi.UserClosed)) -or ($usbSession -and $usbSession.MovedTo)) { continue }
+        $usbPreferred = $usbOnline -or $Devices[$address] -ne 'device' -or $usbSession.Recording -or -not $usbSession.MissingSince -or ((Get-Date) - $usbSession.MissingSince).TotalSeconds -lt 30
+        $wifiRecording = $wifi -and $wifi.Recording
+        if ($wifiRecording -and $usbOnline -and $Devices[$address] -ne 'device' -and $wifi.MissingSince -and ((Get-Date) - $wifi.MissingSince).TotalSeconds -ge 30) {
+            Write-Log "[$address] Missing for 30 seconds; continuing the recording over USB ($usbSerial)."
+            if ($usbSession -and $wifi.CombineMember) {
+                $wifi.CombineMember.Open++
+                [void]$script:CombineHandovers.Add([pscustomobject]@{ Session = $usbSession; Member = $wifi.CombineMember; At = Get-Date })
+            }
+            Stop-Recording $wifi
+            if ($usbSession) { $usbSession.RecordPending = $true }
+            $wifiRecording = $false
+        }
+        if ($usbPreferred -and -not $wifiRecording) { $script:Standby[$address] = $usbSerial }
+        elseif (-not ($usbSession -and ($usbSession.UserClosed -or $usbSession.Recording))) { $script:Standby[$usbSerial] = $address }
+    }
+}
+
+function Invoke-PendingAction($Session) {
+    $action = $Session.PendingAction
+    $Session.PendingAction = $null
+    $serial = $Session.Serial
+    switch ($action) {
+        'disconnect' {
+            Write-Log "[$serial] adb disconnect: $((Invoke-Adb @('disconnect', $serial) 5000).Trim())"
+        }
+        'usb' {
+            $output = (Invoke-Adb @('-s', $serial, 'usb') 5000).Trim()
+            Write-Log "[$serial] adb usb: $output"
+            if ($output -notmatch 'restarting in USB mode') { Undo-Move $Session "adb usb failed ($output)"; return }
+            [void](Invoke-Adb @('disconnect', $serial) 5000)
+            Remove-KnownWifi $serial
+            $usbSession = $script:Sessions[$Session.MoveAddress]
+            if ($usbSession -and $usbSession.UserClosed) { Open-Window @($usbSession.Serial) }
+            $Session.MoveDeadline = (Get-Date).AddSeconds(30)
+        }
+        'tcpip' {
+            $output = (Invoke-Adb @('-s', $serial, 'tcpip', '5555') 5000).Trim()
+            Write-Log "[$serial] adb tcpip 5555: $output"
+            if ($output -notmatch 'restarting in TCP mode') { Undo-Move $Session "adb tcpip failed ($output)"; return }
+            $script:DelayedConnects[$Session.MoveAddress] = (Get-Date).AddSeconds(3)
+            $Session.MoveDeadline = (Get-Date).AddSeconds(30)
+        }
+    }
+}
+
+function Remove-Session($Session) {
+    Close-Session $Session $null
+    $script:Sessions.Remove($Session.Serial)
+    [void]$script:RemovedSerials.Add($Session.Serial)
+    if ($script:PanelList -and -not $script:PanelList.IsDisposed) { $script:PanelList.Items.RemoveByKey($Session.Serial) }
+}
+
+function Update-Moves($Devices) {
+    foreach ($session in @($script:Sessions.Values | Where-Object { $_.MovedTo -and -not $_.PendingAction })) {
+        $target = $session.MoveAddress
+        if ($Devices[$target] -eq 'device') {
+            Write-Log "[$($session.Serial)] Switched to $($session.MovedTo) ($target)."
+            if ($session.MovedTo -eq 'Wi-Fi') {
+                $script:MovedUsb[$session.Serial] = $target
+                Add-KnownWifi $target
+            }
+            Remove-Session $session
+            Show-Notification "$($session.Title) switched to $($session.MovedTo) ($target)."
+        } elseif ((Get-Date) -ge $session.MoveDeadline) {
+            Undo-Move $session "the device did not appear over $($session.MovedTo) within 30 seconds"
+        }
+    }
+}
+
+function Undo-Move($Session, [string]$Reason) {
+    $to = $Session.MovedTo
+    $target = $Session.MoveAddress
+    Write-Log "[$($Session.Serial)] Switch to $to failed: $Reason"
+    if ($to -eq 'Wi-Fi' -and $target) {
+        $script:DelayedConnects.Remove($target)
+        $wifi = $script:Sessions[$target]
+        if ($wifi) { Remove-Session $wifi }
+        [void](Invoke-Adb @('disconnect', $target) 5000)
+    }
+    Open-Window @($Session.Serial)
+    Show-Notification "Could not switch $($Session.Title) to ${to}: $Reason. Restored the $($Session.Connection) connection." 'Warning'
+}
+
+function Test-MovedAway([string]$DeviceSerial, $Devices) {
+    $address = $script:MovedUsb[$DeviceSerial]
+    if (-not $address) { return $false }
+    $wifi = $script:Sessions[$address]
+    if ($wifi) {
+        $wifiLost = $Devices[$address] -ne 'device' -and $wifi.MissingSince -and ((Get-Date) - $wifi.MissingSince).TotalSeconds -ge 30 -and $Devices[$DeviceSerial] -eq 'device'
+        if (-not $wifi.Disconnected -and -not $wifiLost) { return $true }
+    }
+    elseif ($Devices[$address] -eq 'device') { return $true }
+    $script:MovedUsb.Remove($DeviceSerial)
+    $false
+}
+
+function Get-WifiAddress([string]$DeviceSerial) {
+    $interface = ''
+    $candidates = @()
+    foreach ($line in ((Invoke-Adb @('-s', $DeviceSerial, 'shell', 'ip', '-f', 'inet', 'addr', 'show') 5000) -split "`r?`n")) {
+        if ($line -match '^\d+:\s+([^:@\s]+)') { $interface = $Matches[1]; continue }
+        if ($line -notmatch '^\s+inet (\d+\.\d+\.\d+\.\d+)/') { continue }
+        $ip = $Matches[1]
+        if ($ip -like '127.*' -or $interface -match '^(lo|rmnet|dummy|tun|p2p|ccmni)') { continue }
+        $candidates += [pscustomobject]@{ Interface = $interface; Ip = $ip }
+    }
+    $pick = @(@($candidates | Where-Object { $_.Interface -like 'wlan*' }) + @($candidates | Where-Object { $_.Interface -like 'eth*' }) + $candidates) | Select-Object -First 1
+    if ($pick) { $pick.Ip } else { $null }
+}
+
+function Switch-Connection([string[]]$Serials) {
+    $sessions = @($Serials | ForEach-Object { $script:Sessions[$_] } | Where-Object { $_ -and -not $_.Disconnected -and $_.LastState -eq 'device' -and $_.Connection -in @('Wi-Fi', 'USB') })
+    $kinds = @($sessions | ForEach-Object { $_.Connection } | Select-Object -Unique)
+    if ($kinds.Count -ne 1) { return }
+    $target = if ($kinds[0] -eq 'Wi-Fi') { 'USB' } else { 'Wi-Fi' }
+    $usbSerials = @{}
+    $addresses = @{}
+    $devices = Get-AdbDevices
+    foreach ($session in @($sessions)) {
+        if ($target -eq 'USB') {
+            $usbSerial = Get-DeviceProp $session.Serial 'ro.serialno'
+            if ($usbSerial -and $devices[$usbSerial] -eq 'device') { $usbSerials[$session.Serial] = $usbSerial; continue }
+            [void](Show-Message "$($session.Title) is not connected over USB. Plug in its USB cable (and allow USB debugging) first, then try again." 'OK' 'Warning')
+            $sessions = @($sessions | Where-Object { $_ -ne $session })
+            continue
+        }
+        $ip = Get-WifiAddress $session.Serial
+        if ($ip) { $addresses[$session.Serial] = "${ip}:5555"; continue }
+        [void](Show-Message "$($session.Title) is not connected to a Wi-Fi network. Connect it to the same network as this PC and try again." 'OK' 'Warning')
+        $sessions = @($sessions | Where-Object { $_ -ne $session })
+    }
+    if (-not $sessions.Count) { return }
+    if (-not (Confirm-StopRecording $sessions "Switch to $target")) { return }
+    foreach ($session in $sessions) {
+        $session.MovedTo = $target
+        if ($target -eq 'USB') {
+            $usbSerial = $usbSerials[$session.Serial]
+            $session.MoveAddress = $usbSerial
+            $script:MovedUsb.Remove($usbSerial)
+            if ($Serial.Count -and $Serial -notcontains $usbSerial) { $script:Serial = @($Serial) + $usbSerial }
+            Write-Log "[$($session.Serial)] Switching to USB ($usbSerial)."
+            Close-Session $session 'usb'
+        } else {
+            $usbSerial = $session.Serial
+            $standby = @($script:Standby.Keys | Where-Object { $script:Standby[$_] -eq $usbSerial -and             (Get-ConnectionType $_) -eq 'Wi-Fi' -and $devices[$_] -eq 'device' }) | Select-Object -First 1
+            if ($standby) {
+                $session.MoveAddress = $standby
+                Write-Log "[$usbSerial] Switching to Wi-Fi ($standby, already connected)."
+                Close-Session $session $null
+                $session.MoveDeadline = (Get-Date).AddSeconds(30)
+                continue
+            }
+            $session.MoveAddress = $addresses[$session.Serial]
+            Write-Log "[$($session.Serial)] Switching to Wi-Fi ($($session.MoveAddress))."
+            Close-Session $session 'tcpip'
+        }
+    }
+    Request-Tick
+}
+
+function Disconnect-Device([string[]]$Serials) {
+    $sessions = @($Serials | ForEach-Object { $script:Sessions[$_] } | Where-Object { $_ -and $_.Connection -eq 'Wi-Fi' -and -not $_.Disconnected })
+    if (-not $sessions.Count) { return }
+    if (-not (Confirm-StopRecording $sessions 'Disconnect')) { return }
+    foreach ($session in $sessions) {
+        Write-Log "[$($session.Serial)] Disconnecting."
+        Close-Session $session 'disconnect'
+    }
+    Request-Tick
+}
+
+function Connect-WifiDevice([string]$Address) {
+    if ($Address -notmatch ':\d+$') { $Address += ':5555' }
+    if ($Serial.Count -and $Serial -notcontains $Address) { $script:Serial = @($Serial) + $Address }
+    $session = $script:Sessions[$Address]
+    if ($session -and $session.UserClosed) { Open-Window @($Address); return }
+    Write-Log "Connecting to $Address."
+    Start-Connect $Address $true
+    Request-Tick
+}
+
+function Show-ConnectDialog([string]$InitialAddress = '', [string]$InitialPort = '5555') {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Connect Wi-Fi device'
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $false
+    $form.AutoSize = $true
+    $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $form.Padding = New-Object System.Windows.Forms.Padding(10)
+    if ($script:Icon) { $form.Icon = $script:Icon }
+    $layout = New-Object System.Windows.Forms.FlowLayoutPanel
+    $layout.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+    $layout.AutoSize = $true
+    $layout.WrapContents = $false
+    $form.Controls.Add($layout)
+    $label = New-Object System.Windows.Forms.Label
+    $label.AutoSize = $true
+    $label.MaximumSize = New-Object System.Drawing.Size(340, 0)
+    $label.Text = "ADB over Wi-Fi must be enabled on the device (for example adb tcpip 5555).`n`nIP address:"
+    $layout.Controls.Add($label)
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Width = 340
+    $box.Text = $InitialAddress
+    $layout.Controls.Add($box)
+    $portLabel = New-Object System.Windows.Forms.Label
+    $portLabel.AutoSize = $true
+    $portLabel.Text = 'Port:'
+    $layout.Controls.Add($portLabel)
+    $portBox = New-Object System.Windows.Forms.ComboBox
+    $portBox.Width = 120
+    $portBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    foreach ($port in (Get-ScanPorts)) { [void]$portBox.Items.Add([string]$port) }
+    $portBox.Text = $InitialPort
+    $layout.Controls.Add($portBox)
+    $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+    $buttons.AutoSize = $true
+    $buttons.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $buttons.Width = 346
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $connect = New-Object System.Windows.Forms.Button
+    $connect.Text = 'Connect'
+    $connect.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $buttons.Controls.AddRange(@($cancel, $connect))
+    $layout.Controls.Add($buttons)
+    $form.AcceptButton = $connect
+    $form.CancelButton = $cancel
+    try {
+        $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
+        if ($owner) {
+            $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+            $result = $form.ShowDialog($owner)
+        } else {
+            $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+            $form.TopMost = $true
+            $result = $form.ShowDialog()
+        }
+        $address = $box.Text.Trim()
+        $portText = $portBox.Text.Trim()
+    } finally {
+        $form.Dispose()
+    }
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $address) { return }
+    if ($address -match '^(.+):(\d{1,5})$') { $address = $Matches[1]; $portText = $Matches[2] }
+    if ($address -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$') {
+        [void](Show-Message "'$address' is not a valid address. Enter an IP address such as 192.168.1.20." 'OK' 'Warning')
+        return
+    }
+    $port = 0
+    if (-not [int]::TryParse($portText, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        [void](Show-Message "'$portText' is not a valid port. Enter a number from 1 to 65535, such as 5555." 'OK' 'Warning')
+        return
+    }
+    Connect-WifiDevice "${address}:$port"
 }
 
 function Get-SettingsRecordDir {
@@ -1177,12 +2258,19 @@ function Get-UpdateConfig {
 
 function Show-Message([string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'Information') {
     $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
-    if ($owner) { return [System.Windows.Forms.MessageBox]::Show($owner, $Text, 'scrcpy monitor', $Buttons, $Icon) }
-    [System.Windows.Forms.MessageBox]::Show($Text, 'scrcpy monitor', $Buttons, $Icon)
+    if ($owner) { return [System.Windows.Forms.MessageBox]::Show($owner, $Text, 'Scrcpy Monitor', $Buttons, $Icon) }
+    [System.Windows.Forms.MessageBox]::Show($Text, 'Scrcpy Monitor', $Buttons, $Icon)
 }
 
 function Start-UpdateCheck([bool]$Manual) {
-    if (-not $script:UpdateConfig -or $script:UpdateCheck -or $script:Updating) { return }
+    if (-not $script:UpdateConfig -or $script:Updating) { return }
+    if ($script:UpdateCheck) {
+        if ($Manual) {
+            $script:UpdateCheck.Manual = $true
+            $script:UpdateStatus = 'Checking for updates...'
+        }
+        return
+    }
     $shell = [PowerShell]::Create()
     [void]$shell.AddScript({
         param($Repo)
@@ -1203,6 +2291,10 @@ function Complete-UpdateCheck {
     $check = $script:UpdateCheck
     if (-not $check -or -not $check.Handle.IsCompleted) { return }
     $script:UpdateCheck = $null
+    if ($script:Updating) {
+        try { [void]$check.Shell.EndInvoke($check.Handle) } catch { } finally { $check.Shell.Dispose() }
+        return
+    }
     $script:UpdateStatus = ''
     try {
         $release = @($check.Shell.EndInvoke($check.Handle)) | Select-Object -First 1
@@ -1246,11 +2338,31 @@ function Complete-UpdateCheck {
     if ($notes) { $text += "`n`n$notes" }
     $text += "`n`nUpdate now? The monitor restarts"
     $text += if ($recording) { " and the $recording recording(s) in progress are stopped and saved." } else { '.' }
+    if (Test-CombineActive) { $text += ' A combined recording that is not finished within 2 minutes is cancelled.' }
     if ((Show-Message $text 'YesNo' 'Question') -eq [System.Windows.Forms.DialogResult]::Yes) {
         Start-Update
     } else {
         $script:UpdateStatus = "Update $display available"
     }
+}
+
+function Confirm-Update {
+    $recording = @($script:Sessions.Values | Where-Object { $_.Recording }).Count
+    $combining = Test-CombineActive
+    if (-not $recording -and -not $combining) { return $true }
+    $text = 'The monitor restarts to install the update'
+    $text += if ($recording) { " and the $recording recording(s) in progress are stopped and saved." } else { '.' }
+    if ($combining) { $text += ' A combined recording that is not finished within 2 minutes is cancelled.' }
+    (Show-Message "$text`n`nInstall now?" 'YesNo' 'Question') -eq [System.Windows.Forms.DialogResult]::Yes
+}
+
+function Show-UpdateInstalled {
+    $marker = Join-Path $script:StateDir 'updated.txt'
+    if (-not (Test-Path -LiteralPath $marker)) { return }
+    $target = (Get-Content -LiteralPath $marker -Raw -ErrorAction SilentlyContinue)
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if (-not $target -or $target.Trim() -ne $RepoRoot) { return }
+    if ($script:UpdateConfig) { Show-Notification "Updated to scrcpy monitor $($script:UpdateConfig.Display)." }
 }
 
 function Start-Update {
@@ -1275,18 +2387,23 @@ function Update-UpdaterState {
 }
 
 function Get-SessionStatus($Session) {
+    if ($Session.MovedTo) { return "Switching to $($Session.MovedTo)..." }
+    if ($Session.Disconnected) { return 'Disconnected' }
     if ($Session.UserClosed) { return 'Window closed' }
+    if ($script:Standby.ContainsKey($Session.Serial)) { return "Standby (using $(Get-ConnectionType $script:Standby[$Session.Serial]))" }
+    if ($Session.LastState -eq 'unauthorized') { return 'Allow USB debugging on device' }
     if ($Session.LastState -ne 'device') {
         $state = if ($Session.LastState) { $Session.LastState } else { 'missing' }
         return "Waiting for device ($state)"
     }
-    if ($Session.Display) { return 'Mirroring' }
+    if ($Session.Display) { return $(if ($Session.WindowShown) { 'Mirroring' } else { 'Waiting for video' }) }
     'Opening window'
 }
 
 function Get-SessionRecordingText($Session) {
     if (-not $Session.Recording) { return $(if ($Session.Stopping) { 'Saving...' } else { '' }) }
     $text = 'REC {0:hh\:mm\:ss}' -f ((Get-Date) - $Session.RecordingStartedAt)
+    if ($Session.CombineMember) { $text = "REC combined $($text.Substring(4))" }
     if ($Session.Stopping) { $text += ' (saving previous)' }
     elseif (-not $Session.Recorder) { $text += ' (waiting for device)' }
     elseif ($Session.Parts.Count -gt 1) { $text += " (part $($Session.Parts.Count))" }
@@ -1299,11 +2416,23 @@ function Get-SelectedSessions {
 
 function Update-PanelButtons {
     $selected = Get-SelectedSessions
-    $open = @($selected | Where-Object { -not $_.UserClosed })
+    $standby = @($selected | Where-Object { $script:Standby.ContainsKey($_.Serial) })
+    $active = @($selected | Where-Object { -not $script:Standby.ContainsKey($_.Serial) })
+    $open = @($active | Where-Object { -not $_.UserClosed })
     $toStart = @($open | Where-Object { -not $_.Recording })
     $script:PanelToggle.Text = if ($toStart.Count -gt 0 -or $open.Count -eq 0) { 'Start recording' } else { 'Stop recording' }
     $script:PanelToggle.Enabled = $open.Count -gt 0
-    $script:PanelOpen.Enabled = @($selected | Where-Object { $_.UserClosed }).Count -gt 0
+    $script:PanelCombine.Enabled = $open.Count -ge 2 -and -not @($open | Where-Object { $_.Recording -or $_.Stopping }).Count
+    $closed = @($selected | Where-Object { $_.UserClosed })
+    $openText = if ($closed.Count -and -not @($closed | Where-Object { -not $_.Disconnected }).Count) { 'Reconnect' } else { 'Open window' }
+    if ($script:PanelOpen.Text -ne $openText) { $script:PanelOpen.Text = $openText }
+    $script:PanelOpen.Enabled = $closed.Count -gt 0
+    $script:PanelDisconnect.Enabled = @($selected | Where-Object { $_.Connection -eq 'Wi-Fi' -and -not $_.Disconnected }).Count -gt 0
+    $kinds = @($selected | ForEach-Object { $_.Connection } | Select-Object -Unique)
+    $switchText = if ($kinds.Count -eq 1 -and $kinds[0] -eq 'USB') { 'Switch to Wi-Fi' } else { 'Switch to USB' }
+    if ($script:PanelSwitch.Text -ne $switchText) { $script:PanelSwitch.Text = $switchText }
+    $script:PanelSwitch.Enabled = -not $standby.Count -and $kinds.Count -eq 1 -and $kinds[0] -in @('Wi-Fi', 'USB') -and @($selected | Where-Object { -not $_.Disconnected -and $_.LastState -eq 'device' }).Count -gt 0
+    $script:PanelScanNow.Enabled = -not ($NoDiscovery -or $Serial.Count -or $script:Discovery -or $script:Probe)
     $active = @(Get-TargetSessions @())
     $script:PanelStartAll.Enabled = @($active | Where-Object { -not $_.Recording }).Count -gt 0
     $script:PanelStopAll.Enabled = @($active | Where-Object { $_.Recording }).Count -gt 0
@@ -1320,23 +2449,29 @@ function Update-Panel {
                 $item = $list.Items.Add($session.Serial, $session.Title, -1)
                 [void]$item.SubItems.Add('')
                 [void]$item.SubItems.Add('')
+                [void]$item.SubItems.Add('')
             } else {
                 $item = $list.Items[$index]
             }
-            $texts = @($session.Title, (Get-SessionStatus $session), (Get-SessionRecordingText $session))
+            $texts = @($session.Title, $session.Connection, (Get-SessionStatus $session), (Get-SessionRecordingText $session))
             for ($i = 0; $i -lt $texts.Count; $i++) {
                 if ($item.SubItems[$i].Text -ne $texts[$i]) { $item.SubItems[$i].Text = $texts[$i] }
             }
-            $color = if ($session.Recording) { [System.Drawing.Color]::Firebrick } elseif ($session.UserClosed) { [System.Drawing.SystemColors]::GrayText } else { [System.Drawing.SystemColors]::WindowText }
+            $color = if ($session.Recording) { [System.Drawing.Color]::Firebrick } elseif ($session.UserClosed -or $script:Standby.ContainsKey($session.Serial)) { [System.Drawing.SystemColors]::GrayText } else { [System.Drawing.SystemColors]::WindowText }
             if ($item.ForeColor -ne $color) { $item.ForeColor = $color }
         }
     } finally {
         $list.EndUpdate()
     }
     $status = "Recordings: $RecordDir"
+    $connecting = @($script:Connects | Where-Object { $_.Manual } | ForEach-Object { $_.Address })
+    if ($connecting.Count) { $status = "Connecting to $($connecting -join ', ')...  $status" }
     if ($script:Merges.Count -gt 0) { $status = "Joining $($script:Merges.Count) recording(s)...  $status" }
+    if ($script:Combines.Count -gt 0) { $status = "Combining $($script:Combines.Count) recording(s)...  $status" }
     if ($script:UpdateStatus) { $status = "$($script:UpdateStatus)  |  $status" }
     if ($script:PanelStatus.Text -ne $status) { $script:PanelStatus.Text = $status }
+    $scan = if ($NoDiscovery -or $Serial.Count) { 'Wi-Fi scan: off' } else { $script:DiscoveryStatus }
+    if ($script:PanelScan.Text -ne $scan) { $script:PanelScan.Text = $scan }
     Update-PanelButtons
 }
 
@@ -1368,7 +2503,7 @@ function New-PanelButton([System.Windows.Forms.Control]$Parent, [string]$Text, [
 function New-Panel {
     Add-Type -Namespace ScrcpyMonitor -Name Window -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = if ($script:UpdateConfig) { "scrcpy monitor $($script:UpdateConfig.Display)" } else { 'scrcpy monitor' }
+    $form.Text = if ($script:UpdateConfig) { "Scrcpy Monitor $($script:UpdateConfig.Display)" } else { 'Scrcpy Monitor' }
     $form.Size = New-Object System.Drawing.Size(720, 380)
     $form.MinimumSize = New-Object System.Drawing.Size(560, 260)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -1380,9 +2515,10 @@ function New-Panel {
     $list.HideSelection = $false
     $list.Sorting = [System.Windows.Forms.SortOrder]::Ascending
     $list.Dock = [System.Windows.Forms.DockStyle]::Fill
-    [void]$list.Columns.Add('Device', 270)
-    [void]$list.Columns.Add('Status', 190)
-    [void]$list.Columns.Add('Recording', 190)
+    [void]$list.Columns.Add('Device', 250)
+    [void]$list.Columns.Add('Connection', 85)
+    [void]$list.Columns.Add('Status', 170)
+    [void]$list.Columns.Add('Recording', 165)
     $list.add_SelectedIndexChanged({ Invoke-Safely { Update-PanelButtons } })
     $form.Controls.Add($list)
 
@@ -1405,6 +2541,10 @@ function New-Panel {
     $status.Spring = $true
     $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
     [void]$statusStrip.Items.Add($status)
+    $scan = New-Object System.Windows.Forms.ToolStripStatusLabel
+    $scan.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    [void]$statusStrip.Items.Add($scan)
+    $script:PanelScan = $scan
     $form.Controls.Add($statusStrip)
 
     $script:PanelList = $list
@@ -1415,7 +2555,14 @@ function New-Panel {
         if ($toStart.Count -gt 0) { foreach ($s in $toStart) { Start-Recording $s } }
         else { foreach ($s in $selected) { Stop-Recording $s } }
     }
+    $script:PanelCombine = New-PanelButton $deviceButtons 'Record combined' {
+        Start-CombinedRecording @(Get-SelectedSessions | Where-Object { -not $_.UserClosed -and -not $script:Standby.ContainsKey($_.Serial) })
+    }
     $script:PanelOpen = New-PanelButton $deviceButtons 'Open window' { Open-Window @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
+    $script:PanelDisconnect = New-PanelButton $deviceButtons 'Disconnect' { Disconnect-Device @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
+    $script:PanelSwitch = New-PanelButton $deviceButtons 'Switch to USB' { Switch-Connection @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
+    [void](New-PanelButton $deviceButtons 'Connect Wi-Fi device...' { Show-ConnectDialog })
+    $script:PanelScanNow = New-PanelButton $deviceButtons 'Scan now' { Start-Scan }
     $list.add_DoubleClick({ Invoke-Safely { $script:PanelToggle.PerformClick() } })
 
     $script:PanelStartAll = New-PanelButton $globalButtons 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } }
@@ -1502,7 +2649,7 @@ if ($List) {
     if ($devices.Count -eq 0) { Write-Host 'No devices found.' }
     foreach ($key in ($devices.Keys | Sort-Object)) {
         $model = if ($devices[$key] -eq 'device') { Get-DeviceProp $key 'ro.product.model' } else { '' }
-        Write-Host ('{0,-30} {1,-14} {2}' -f $key, $devices[$key], $model)
+        Write-Host ('{0,-30} {1,-9} {2,-14} {3}' -f $key, (Get-ConnectionType $key), $devices[$key], $model)
     }
     exit 0
 }
@@ -1531,7 +2678,30 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 $script:Sessions = @{}
 $script:Merges = New-Object System.Collections.ArrayList
+$script:Combines = New-Object System.Collections.ArrayList
+$script:CombineHandovers = New-Object System.Collections.ArrayList
+$script:CombineEncoderArgs = $null
 $script:Stops = New-Object System.Collections.ArrayList
+$script:Connects = New-Object System.Collections.ArrayList
+$script:ConnectFailures = New-Object System.Collections.ArrayList
+$script:ConnectPrompting = $false
+$script:Discovery = $null
+$script:NextDiscovery = Get-Date
+$script:DiscoveryRetry = @{}
+$script:DiscoveryStatus = 'Wi-Fi scan: waiting'
+$script:Probe = $null
+$script:ProbeRequested = $true
+$script:Scanning = $false
+$script:ScanFound = New-Object System.Collections.Generic.HashSet[string]
+$script:KnownWifiPath = Join-Path $env:LOCALAPPDATA 'scrcpy-monitor\wifi-devices.json'
+$script:KnownWifi = Read-KnownWifi
+$script:ScanPortsPath = Join-Path $env:LOCALAPPDATA 'scrcpy-monitor\scan-ports.json'
+$script:ScanPorts = Read-ScanPorts
+$script:DelayedConnects = @{}
+$script:MovedUsb = @{}
+$script:RemovedSerials = New-Object System.Collections.Generic.HashSet[string]
+$script:Standby = @{}
+$script:WifiSerials = @{}
 $script:Exiting = $false
 $script:ExitRequested = $false
 $script:OpenWindowsRequested = $false
@@ -1563,7 +2733,7 @@ if (-not $NoTray) {
     $script:Tray.ContextMenuStrip = New-Object System.Windows.Forms.ContextMenuStrip
     $script:Tray.ContextMenuStrip.add_Opening({ Invoke-Safely { Update-TrayMenu } })
     $script:Tray.add_DoubleClick({ Invoke-Safely { if ($script:Panel) { Show-Panel } else { Open-RecordFolder } } })
-    $script:Tray.Text = 'scrcpy monitor'
+    $script:Tray.Text = 'Scrcpy Monitor'
     $script:Tray.Visible = $true
 }
 
@@ -1588,14 +2758,17 @@ $script:FastTimer.add_Tick({
     if ($script:ExitRequested) { Invoke-Safely { Stop-Monitor }; return }
     Invoke-Safely { Invoke-ControlRequests }
     Invoke-Safely { Update-Stops }
+    Invoke-Safely { Update-PartStarts }
     Invoke-Safely { Complete-UpdateCheck }
     Invoke-Safely { Update-UpdaterState }
+    Invoke-Safely { Show-ConnectFailures }
     $script:FastTimerTicks++
     if ($script:FastTimerTicks % 3 -eq 0) { Invoke-Safely { Update-Panel } }
 })
 $script:FastTimer.Start()
 
 $script:PanelPending = [bool]$script:Panel
+Invoke-Safely { Show-UpdateInstalled }
 if (-not $NoUpdateCheck) { Invoke-Safely { Start-UpdateCheck $false } }
 
 try {

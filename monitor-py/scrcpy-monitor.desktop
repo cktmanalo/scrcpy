@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Scrcpy Monitor
+GenericName=Android screen mirroring
+Comment=Mirror and record every connected Android device with scrcpy
+Exec=scrcpy-monitor
+Icon=scrcpy-monitor
+Terminal=false
+Categories=Utility;Development;
+Keywords=android;adb;scrcpy;mirror;record;
+StartupNotify=false
