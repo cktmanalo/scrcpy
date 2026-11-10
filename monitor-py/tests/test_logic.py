@@ -92,6 +92,25 @@ class DisplayVersionTest(unittest.TestCase):
         self.assertEqual(logic.display_version('qa-abc1234'), 'abc1234')
         self.assertEqual(logic.display_version(''), '')
 
+    def test_parse_version(self):
+        self.assertEqual(logic.parse_version('5.0.1.11'), (5, 0, 1, 11))
+        self.assertEqual(logic.parse_version('5.0'), (5, 0))
+        self.assertIsNone(logic.parse_version('5'))
+        self.assertIsNone(logic.parse_version('1.2.3.4.5'))
+        self.assertIsNone(logic.parse_version('abc1234'))
+        self.assertIsNone(logic.parse_version('5.0.99999999999'))
+        self.assertIsNone(logic.parse_version(None))
+
+    def test_newer_version(self):
+        self.assertTrue(logic.is_newer_version('qa-v5.0.1-12-gdef5678', 'qa-v5.0.1-11-gabc1234'))
+        self.assertTrue(logic.is_newer_version('qa-v5.0.2', 'qa-v5.0.1-11-gabc1234'))
+        self.assertTrue(logic.is_newer_version('qa-v5.0.1-11-gabc1234', 'qa-v5.0.1-2-gabc1234'))
+        self.assertFalse(logic.is_newer_version('qa-v5.0.1-10-gdef5678', 'qa-v5.0.1-11-gabc1234'))
+        self.assertFalse(logic.is_newer_version('qa-v5.0.1-11-gdef5678', 'qa-v5.0.1-11-gabc1234-dirty'))
+        self.assertFalse(logic.is_newer_version('qa-v5.0.1', 'qa-v5.0.1-0-gabc1234'))
+        self.assertTrue(logic.is_newer_version('qa-v5.0.1-12-gdef5678', 'qa-abc1234'))
+        self.assertTrue(logic.is_newer_version('qa-def5678', 'qa-v5.0.1-11-gabc1234'))
+
 
 class FreePortBlockTest(unittest.TestCase):
     def test_first_free(self):
@@ -189,6 +208,12 @@ class UsbPriorityTest(unittest.TestCase):
         devices = {self.USB: 'offline', self.WIFI: 'device'}
         self.assertEqual(self.run_priority(devices, {self.WIFI: session()}), ({}, []))
 
+    def test_skipped_address(self):
+        devices = {self.USB: 'device', self.WIFI: 'device'}
+        sessions = {self.USB: session(), self.WIFI: session()}
+        self.assertEqual(logic.usb_priority(devices, sessions, {self.WIFI: self.USB}, {}, NOW, skip={self.WIFI}),
+                         ({}, []))
+
 
 class MovedAwayTest(unittest.TestCase):
     WIFI = '192.168.68.103:5555'
@@ -253,6 +278,12 @@ class UpdateTest(unittest.TestCase):
         release = self.release(tag='qa-v5.0.1-11-gabc1234')
         self.assertIsNone(logic.find_update(release, 'qa-v5.0.1-11-gabc1234', self.BUILT, 'darwin', 'arm64'))
 
+    def test_older_version(self):
+        release = self.release(tag='qa-v5.0.1-10-gdef5678')
+        self.assertIsNone(logic.find_update(release, 'qa-v5.0.1-11-gabc1234', self.BUILT, 'darwin', 'arm64'))
+        release = self.release(tag='qa-v5.0.1-11-gdef5678')
+        self.assertIsNone(logic.find_update(release, 'qa-v5.0.1-11-gabc1234', self.BUILT, 'linux', 'x86_64'))
+
     def test_missing_asset(self):
         release = self.release(assets=['scrcpy-monitor-portable-x.zip'])
         self.assertIsNone(logic.find_update(release, 'qa-v5.0.1-11-gabc1234', self.BUILT, 'darwin', 'arm64'))
@@ -306,6 +337,25 @@ class MiscLogicTest(unittest.TestCase):
     def test_safe_name(self):
         self.assertEqual(logic.safe_name('192.168.68.103:5555'), '192.168.68.103_5555')
 
+    def test_power_watch(self):
+        self.assertEqual(logic.parse_power_watch('1/'), 'restarting')
+        self.assertEqual(logic.parse_power_watch('1,reboot/\n'), 'restarting')
+        self.assertEqual(logic.parse_power_watch('/reboot,userrequested'), 'restarting')
+        self.assertEqual(logic.parse_power_watch('/Reboot'), 'restarting')
+        self.assertEqual(logic.parse_power_watch('0userrequested/'), 'off')
+        self.assertEqual(logic.parse_power_watch('/shutdown,userrequested'), 'off')
+        self.assertIsNone(logic.parse_power_watch('/'))
+        self.assertIsNone(logic.parse_power_watch(''))
+        self.assertIsNone(logic.parse_power_watch(None))
+        self.assertIsNone(logic.parse_power_watch('error: closed'))
+
+    def test_sort_key(self):
+        self.assertEqual(logic.sort_key(['Pixel', 'USB', 'Mirroring', ''], 0), ('pixel', ''))
+        self.assertEqual(logic.sort_key(['Pixel', 'USB', 'Mirroring', ''], 1), ('usb', 'pixel'))
+        rows = [['b', 'Wi-Fi'], ['A', 'USB'], ['c', 'usb']]
+        self.assertEqual([r[0] for r in sorted(rows, key=lambda r: logic.sort_key(r, 0))], ['A', 'b', 'c'])
+        self.assertEqual([r[0] for r in sorted(rows, key=lambda r: logic.sort_key(r, 1))], ['A', 'c', 'b'])
+
 
 class CombineTest(unittest.TestCase):
     def test_format_seconds(self):
@@ -322,39 +372,178 @@ class CombineTest(unittest.TestCase):
         self.assertEqual(logic.combine_grid(10), (4, 3))
 
     def test_cell_matches_windows_output(self):
-        self.assertEqual(logic.combine_cell([(320, 480), (720, 1280), (720, 1440)], 3, 1), (852, 1280))
-        self.assertEqual(logic.combine_cell([(720, 1280)] * 4, 2, 2), (606, 1080))
+        self.assertEqual(logic.combine_cell([(320, 480), (720, 1280), (720, 1440)], 3, 1), (640, 1280))
+        self.assertEqual(logic.combine_cell([(720, 1280)] * 4, 2, 2), (578, 1028))
+
+    def test_scale_keeps_device_proportions(self):
+        factor, cell_w, cell_h = logic.combine_scale([(320, 480), (720, 1280), (720, 1440)], 3, 1)
+        self.assertAlmostEqual(factor, 1280 / 1440)
+        self.assertEqual(logic.combine_scale([(320, 480), (720, 1280)], 2, 1), (1.0, 720, 1280))
+        chain = logic.combine_chain(factor, cell_w, cell_h)
+        self.assertEqual(chain, "scale=w='max(2,trunc(iw*min(0.888889,min(640/iw,1280/ih))/2)*2)':"
+                                "h='max(2,trunc(ih*min(0.888889,min(640/iw,1280/ih))/2)*2)':eval=frame,"
+                                'pad=640:1280:(ow-iw)/2:0:eval=frame,setsar=1')
 
     def test_cell_limits_to_4k(self):
-        self.assertEqual(logic.combine_cell([(1080, 2400)] * 9, 3, 3), (324, 720))
+        self.assertEqual(logic.combine_cell([(1080, 2400)] * 9, 3, 3), (308, 684))
 
-    def test_command(self):
+    def test_header_height(self):
+        self.assertEqual(logic.combine_header_height(1080), 54)
+        self.assertEqual(logic.combine_header_height(1028), 50)
+        self.assertEqual(logic.combine_header_height(684), 34)
+        self.assertEqual(logic.combine_header_height(300), 16)
+
+    def test_layout(self):
+        self.assertEqual(logic.combine_layout([(720, 1280)] * 4), (2, 2, 578, 1028, 50))
+        self.assertEqual(logic.combine_layout([(1080, 2400)] * 9), (3, 3, 308, 684, 34))
+        cols, rows, _, cell_h, header_h = logic.combine_layout([(1080, 2400)] * 9)
+        self.assertLessEqual(rows * (cell_h + header_h), 2160)
+
+    def members(self):
         t0 = NOW
-        members = [
+        return [
             [{'path': 'a.mp4', 'position': 0.0, 'duration': 6.0, 'start': t0 + timedelta(seconds=0.5)}],
             [{'path': 'c.mp4', 'position': 0.0, 'duration': 2.0, 'start': t0},
              {'path': 'c.mp4', 'position': 2.0, 'duration': 1.5, 'start': t0 + timedelta(seconds=4)}],
         ]
-        args, total, count = logic.combine_command(members, [(720, 1280), (1280, 720)], t0, ['-c:v', 'mpeg4'],
-                                                   'out.mp4')
+
+    def test_command(self):
+        args, total, count = logic.combine_command(self.members(), [(720, 1280), (1280, 720)], NOW,
+                                                   ['-c:v', 'mpeg4'], 'out.mp4')
         self.assertEqual((total, count), (6.5, 3))
         self.assertEqual(args[-1], 'out.mp4')
         self.assertEqual(args[-3:-1], ['-t', '6.5'])
         self.assertEqual(args.count('-reinit_filter'), 3)
         graph = args[args.index('-filter_complex') + 1]
-        self.assertTrue(graph.startswith('color=c=black:s=3840x1080:r=30:d=6.5[b0];'))
-        self.assertIn('[0:v]setpts=PTS-STARTPTS+0.5/TB,scale=1920:1080:', graph)
+        self.assertTrue(graph.startswith('color=c=black:s=2560x1344:r=30:d=6.5[b0];'))
+        self.assertIn("[0:v]setpts=PTS-STARTPTS+0.5/TB,scale=w='max(2,trunc(iw*min(1.000000,min(1280/iw,1280/ih))/2)*2)'", graph)
         self.assertIn('[2:v]setpts=PTS-STARTPTS+4/TB,', graph)
-        self.assertIn('[b0][v0]overlay=x=0:y=0:eof_action=pass[b1]', graph)
-        self.assertIn('[b2][v2]overlay=x=1920:y=0:eof_action=pass[b3]', graph)
+        self.assertIn('[b0][v0]overlay=x=0:y=64:eof_action=pass[b1]', graph)
+        self.assertIn('[b2][v2]overlay=x=1280:y=64:eof_action=pass[b3]', graph)
         self.assertEqual(args[args.index('-map') + 1], '[b3]')
         second = args.index('-i', args.index('-i') + 1)
         self.assertEqual(args[second - 4:second + 2], ['-ss', '0', '-t', '2', '-i', 'c.mp4'])
+
+    def test_command_with_headers(self):
+        args, _, count = logic.combine_command(self.members(), [(720, 1280), (1280, 720)], NOW,
+                                               ['-c:v', 'mpeg4'], 'out.mp4', ['h1.png', 'h2.png'])
+        self.assertEqual(count, 3)
+        graph = args[args.index('-filter_complex') + 1]
+        self.assertTrue(graph.startswith('color=c=black:s=2560x1344:r=30:d=6.5[h0];[h0][3:v]overlay=x=0:y=0[h1];'
+                                         '[h1][4:v]overlay=x=1280:y=0[b0];[0:v]'))
+        self.assertIn('[b2][v2]overlay=x=1280:y=64:eof_action=pass[b3]', graph)
+        self.assertEqual(args[args.index('-map') + 1], '[b3]')
+        inputs = args[:args.index('-filter_complex')]
+        self.assertEqual(inputs[-4:], ['-i', 'h1.png', '-i', 'h2.png'])
+        self.assertEqual(inputs.count('-i'), 5)
+
+    def test_command_header_rows(self):
+        members = [[{'path': f'{n}.mp4', 'position': 0.0, 'duration': 1.0, 'start': NOW}] for n in range(4)]
+        args, _, _ = logic.combine_command(members, [(720, 1280)] * 4, NOW, [], 'out.mp4',
+                                           [f'h{n}.png' for n in range(4)])
+        graph = args[args.index('-filter_complex') + 1]
+        self.assertTrue(graph.startswith('color=c=black:s=1156x2156:r=30:d=1[h0];'))
+        self.assertIn('[h2][6:v]overlay=x=0:y=1078[h3]', graph)
+        self.assertIn('[h3][7:v]overlay=x=578:y=1078[b0]', graph)
+        self.assertIn('[b3][v3]overlay=x=578:y=1128:eof_action=pass[b4]', graph)
 
     def test_encoder_choice(self):
         self.assertEqual(logic.combine_encoder_args(' V....D libx264   H.264 ')[1], 'libx264')
         self.assertEqual(logic.combine_encoder_args(' V....D libopenh264 OpenH264 ')[1], 'libopenh264')
         self.assertEqual(logic.combine_encoder_args('')[1], 'mpeg4')
+
+
+class LabelTest(unittest.TestCase):
+    def test_fps_args_follow_ffmpeg_version(self):
+        time_base = ['-enc_time_base', '1:60000']
+        self.assertEqual(logic.fps_passthrough_args('ffmpeg version 3.4.11 Copyright'), ['-vsync', 'passthrough'])
+        self.assertEqual(logic.fps_passthrough_args('ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright'),
+                         ['-vsync', 'passthrough'] + time_base)
+        self.assertEqual(logic.fps_passthrough_args('ffmpeg version n5.0.1 Copyright'),
+                         ['-vsync', 'passthrough'] + time_base)
+        self.assertEqual(logic.fps_passthrough_args('ffmpeg version 5.1.2 Copyright'),
+                         ['-fps_mode', 'passthrough'] + time_base)
+        self.assertEqual(logic.fps_passthrough_args('ffmpeg version 9.0.2 Copyright'),
+                         ['-fps_mode', 'passthrough'] + time_base)
+        self.assertEqual(logic.fps_passthrough_args('ffmpeg version N-112233-gabc Copyright'),
+                         ['-fps_mode', 'passthrough'] + time_base)
+        self.assertEqual(logic.fps_passthrough_args(''), ['-fps_mode', 'passthrough'] + time_base)
+
+    def test_layout_is_even_and_scales_header(self):
+        self.assertEqual(logic.label_layout(720, 1280), (720, 1280, 64))
+        self.assertEqual(logic.label_layout(1081, 2401), (1082, 2402, 120))
+        self.assertEqual(logic.label_layout(8, 8), (16, 16, 16))
+
+    def test_command_stacks_header_and_keeps_audio(self):
+        args = logic.label_command('in.mp4', 'h.png', 720, 1280, 64, ['-c:v', 'libx264'], ['-fps_mode', 'passthrough'],
+                                   'out.mp4')
+        graph = args[args.index('-filter_complex') + 1]
+        self.assertIn('pad=720:1344:(ow-iw)/2:64+(1280-ih)/2:eval=frame', graph)
+        self.assertIn('[v][1:v]overlay=x=0:y=0[out]', graph)
+        self.assertEqual(args[args.index('-reinit_filter') + 1], '0')
+        self.assertIn('0:a?', args)
+        self.assertEqual(args[args.index('-c:a') + 1], 'copy')
+        self.assertEqual(args[args.index('-bf') + 1], '0')
+        self.assertEqual(args[-1], 'out.mp4')
+        self.assertLess(args.index('in.mp4'), args.index('h.png'))
+
+
+class WindowLayoutTest(unittest.TestCase):
+    AREA = (1920, 0, 1920, 1032)
+
+    @staticmethod
+    def item(width, height, frame_height=32):
+        return {'aspect': width / height, 'frame_width': 0, 'frame_height': frame_height, 'max_height': height}
+
+    def check(self, area, items, rects):
+        left, top, width, height = area
+        self.assertEqual(len(rects), len(items))
+        for index, (x, y, w, h) in enumerate(rects):
+            self.assertGreaterEqual(x, left)
+            self.assertGreaterEqual(y, top)
+            self.assertLessEqual(x + w, left + width)
+            self.assertLessEqual(y + h, top + height)
+            for other in rects[index + 1:]:
+                ox, oy, ow, oh = other
+                self.assertTrue(x + w <= ox or ox + ow <= x or y + h <= oy or oy + oh <= y)
+
+    def test_single_device_is_centered_at_natural_size(self):
+        rects = logic.window_layout(self.AREA, [self.item(320, 480)])
+        self.assertEqual(rects, [(1920 + 800, 260, 320, 512)])
+
+    def test_large_devices_scale_down_to_fit(self):
+        items = [self.item(320, 480), self.item(720, 1280), self.item(720, 1440)]
+        rects = logic.window_layout(self.AREA, items)
+        self.check(self.AREA, items, rects)
+        self.assertEqual(rects[0][2:], (320, 512))
+        self.assertLess(rects[1][3], 1280)
+        left_margin = rects[0][0] - 1920
+        right_margin = 1920 + 1920 - (rects[2][0] + rects[2][2])
+        self.assertLessEqual(abs(left_margin - right_margin), 1)
+        self.assertEqual(rects[1][0] - (rects[0][0] + rects[0][2]), 8)
+
+    def test_many_devices_use_rows(self):
+        for count in (2, 3, 5, 8, 12):
+            items = [self.item(720, 1280)] * count
+            rects = logic.window_layout(self.AREA, items)
+            self.check(self.AREA, items, rects)
+        rects = logic.window_layout(self.AREA, [self.item(720, 1280)] * 12)
+        self.assertGreater(len({y for _, y, _, _ in rects}), 1)
+
+    def test_landscape_and_small_screen(self):
+        items = [self.item(1280, 720), self.item(1280, 720)]
+        self.check(self.AREA, items, logic.window_layout(self.AREA, items))
+        small = (0, 0, 800, 600)
+        items = [self.item(720, 1280)] * 3
+        self.check(small, items, logic.window_layout(small, items))
+        self.assertIsNone(logic.window_layout((0, 0, 100, 100), items))
+        self.assertIsNone(logic.window_layout(self.AREA, []))
+
+    def test_arguments(self):
+        self.assertTrue(logic.has_placement_arg(['--window-x=10']))
+        self.assertTrue(logic.has_placement_arg(['-f']))
+        self.assertTrue(logic.has_placement_arg(['--fullscreen']))
+        self.assertFalse(logic.has_placement_arg(['--window-title=x', '-m1024', '--force-adb-forward']))
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 # Scrcpy Monitor (Python / PySide6)
 
-Cross-platform port of `scrcpy-monitor.ps1` for macOS, Linux and Windows. It mirrors every connected adb device in its own scrcpy window and keeps the window open across reboots and reconnects with the fork's `--reconnect` option. It records each device in parts with a separate `scrcpy --no-window --record` process. The in-window record button uses `--record-control`. "Record combined" in the control panel also joins the recordings of the selected devices into one grid video under `Combined/` once all of them stop. The app also handles Wi-Fi devices, USB/Wi-Fi switching, USB-priority standby and self-update from the `cktmanalo/scrcpy` GitHub releases.
+Cross-platform port of `scrcpy-monitor.ps1` for macOS, Linux and Windows. It mirrors every connected adb device in its own scrcpy window and keeps the window open across reboots and reconnects with the fork's `--reconnect` option. Device windows open centered without overlapping, at 100% when they fit (macOS and Linux; on Windows use the ps1 for window arranging). It records each device in parts with a separate `scrcpy --no-window --record` process; with ffmpeg, each saved recording gets a header with the device name above the screen. The in-window record button uses `--record-control`. "Record combined" in the control panel also joins the recordings of the selected devices into one grid video under `Combined/` once all of them stop; each screen has a header with its device name, and every screen is scaled by the same factor so smaller devices keep their real size and proportions instead of being stretched. The app also handles Wi-Fi devices, USB/Wi-Fi switching, USB-priority standby and self-update from the `cktmanalo/scrcpy` GitHub releases.
 
 All features of the Windows tray app are available on every platform.
 
@@ -28,7 +28,24 @@ Options:
 
 Options the monitor does not recognize, and everything after `--`, are passed to scrcpy.
 
-Only one instance runs at a time; it uses `QLocalServer`. A second launch asks the running instance to reopen closed scrcpy windows, as the ps1 does. If the running instance is exiting, the second launch waits for it to finish and then starts.
+Only one instance runs at a time; it uses `QLocalServer`. A second launch asks the running instance to show the panel and show again any device you closed, as the ps1 does. If the running instance is exiting, the second launch waits for it to finish and then starts.
+
+## Control panel and device list
+
+Global actions are in the panel's menu bar: **File** (Open recordings folder, Change recordings folder, Open log, Exit), **Recording** (Start all, Stop all), **Window** (Arrange windows) and **Help** (User guide, Check for updates, Check for updates automatically, About). **Help > User guide** shows the how-to guide for the current OS inside the app (`scrcpy-monitor-guide.html` on Windows, `scrcpy-monitor-guide-macos-linux.html` on macOS and Linux, bundled with the packaged app). On macOS these menus appear in the top screen menu bar, and Qt moves About and Exit (as Quit) into the application menu. Click a column header to sort the list.
+
+- A restarting device stays in the list as "Device restarting" and reconnects in the same window. The monitor detects a restart from the power menu or `svc power reboot`; a restart started with `adb reboot` is not detected, so that device is removed and reappears when it is back.
+- A device that is turned off is removed right away. One that is unplugged or drops off Wi-Fi is removed after 30 seconds. A device is never removed while it is recording.
+- Closing a device window, or **Stop and close** in the panel or tray menu, stops that device and removes it from the list. **Refresh** shows it again.
+
+## Device windows
+
+Device windows are arranged as in the Windows ps1 on macOS and Linux (the Python build on Windows leaves them where scrcpy opens them), on the screen where the control panel is (the primary screen when the panel is hidden): one device is centered, and several devices are laid out side by side, or in rows, around the center without overlapping. A window shows the device at full resolution (100%) when it fits; a larger device screen is scaled down to fit, never cropped. The windows are arranged again whenever a device window opens or closes; minimized, maximized and fullscreen windows are left as they are. **Window > Arrange windows** in the panel, or **Arrange device windows** in the tray menu, arranges them on demand. Passing `--window-x`, `--window-y`, `--window-width`, `--window-height`, `--fullscreen` or `-f` turns automatic arranging off.
+
+`windowing.py` moves the scrcpy windows:
+
+- **Linux:** Xlib through ctypes. It finds each window by `_NET_WM_PID` and moves it with `_NET_MOVERESIZE_WINDOW`, or with `XMoveResizeWindow` when the window manager does not support it. On a Wayland session that has XWayland (`DISPLAY` is set), the monitor starts scrcpy with `SDL_VIDEO_DRIVER=x11`, because native Wayland windows cannot be moved by another app. Under fractional scaling, XWayland windows can look slightly blurry. Without X11 or XWayland, windows open where the compositor puts them.
+- **macOS:** the Accessibility API. Allow Scrcpy Monitor (or Terminal, when running from source) in **System Settings > Privacy & Security > Accessibility**. Until it is allowed, windows open where macOS puts them, and **Arrange windows** shows the permission prompt.
 
 ## Tool lookup
 
@@ -79,7 +96,7 @@ On macOS and Linux the update is downloaded to a temporary folder and unpacked: 
 3. On macOS, it runs `xattr -dr com.apple.quarantine`.
 4. It relaunches the app: `open` on macOS, the executable on Linux.
 
-The settings folder is not touched.
+The settings folder is not touched. Turn off **Help > Check for updates automatically** to skip the startup check; the choice is saved in the settings.
 
 ## Packaging (CI)
 
@@ -142,7 +159,7 @@ Ship it as `tar -C dist -czf scrcpy-monitor-linux-x86_64-<tag>.tar.gz scrcpy-mon
 
 To install, extract the archive and run `./scrcpy-monitor/install.sh`. The script copies the folder to `~/.local/opt/scrcpy-monitor` and installs `scrcpy-monitor.desktop` into `~/.local/share/applications`. Run `install.sh --uninstall` to remove both.
 
-Some desktops have no system tray, for example GNOME without the AppIndicator extension. There, the panel opens at startup, and closing the panel does not quit the app; use the panel's **Exit** button instead.
+Some desktops have no system tray, for example GNOME without the AppIndicator extension. There, the panel opens at startup.
 
 You may need udev rules for USB debugging; `android-sdk-platform-tools-common` provides them on Debian/Ubuntu.
 

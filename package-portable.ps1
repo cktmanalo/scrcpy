@@ -66,7 +66,7 @@ function Copy-Required([string]$Source, [string]$Destination) {
 if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) { throw "MSYS2 not found in '$MsysRoot' (use -MsysRoot)." }
 if (-not (Test-Path -LiteralPath (Join-Path $AdbDir 'adb.exe') -PathType Leaf)) { throw "adb.exe not found in '$AdbDir' (use -AdbDir)." }
 
-$version = (& git -C $root describe --tags --match 'v[0-9]*' --always --dirty 2>$null)
+$version = (& git -C $root describe --tags --first-parent --match 'v[0-9]*' --always --dirty 2>$null)
 if (-not $version) { $version = Get-Date -Format 'yyyyMMdd' }
 $tag = "qa-$version"
 $displayVersion = if ($version -match '^v?(\d+(?:\.\d+)+)(?:-(\d+)-g[0-9a-f]+)?(?:-dirty)?$') { '{0}.{1}' -f $Matches[1], $(if ($Matches[2]) { $Matches[2] } else { '0' }) } else { $version }
@@ -100,7 +100,7 @@ Write-Host 'Collecting files...'
 Copy-Required $scrcpy $package
 Copy-Required $server $package
 foreach ($file in 'icon.ico', 'scrcpy.png', 'disconnected.png') { Copy-Required (Join-Path $root "app\data\$file") $package }
-foreach ($file in 'scrcpy-monitor.ps1', 'scrcpy-monitor.vbs', 'scrcpy-monitor-guide.docx') { Copy-Required (Join-Path $root $file) $package }
+foreach ($file in 'scrcpy-monitor.ps1', 'scrcpy-monitor.vbs', 'scrcpy-monitor-guide.docx', 'scrcpy-monitor-guide.html') { Copy-Required (Join-Path $root $file) $package }
 Copy-Required (Join-Path $root 'LICENSE') $package
 foreach ($file in 'ffmpeg.exe', 'ffprobe.exe') { Copy-Required (Join-Path $mingwBin $file) $package }
 foreach ($file in 'adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll') { Copy-Required (Join-Path $AdbDir $file) $package }
@@ -140,10 +140,12 @@ MsgBox "The ""scrcpy monitor"" shortcut was added to your desktop.", vbInformati
 scrcpy monitor (portable) - $version
 =====================================
 
-Mirror one or more Android devices, keep each window open while the device restarts, and record the
-screen (recordings continue across device restarts).
+Mirror one or more Android devices, keep each window open while the device restarts, arrange the
+windows without overlapping, and record the screen (recordings continue across device restarts;
+Record combined joins several devices into one video that keeps the proportions of each device).
 
-See scrcpy-monitor-guide.docx in this folder for the full how-to guide.
+See Help > "User guide" in the control panel (scrcpy-monitor-guide.html) or scrcpy-monitor-guide.docx
+in this folder for the full how-to guide.
 
 SETUP (once)
   1. Extract the whole ZIP to a folder of your choice (for example C:\Tools\scrcpy-monitor).
@@ -156,15 +158,27 @@ START
   Double-click "scrcpy-monitor.vbs" (or the desktop shortcut).
   A window opens for every connected device (USB or Wi-Fi/TCP), and the "scrcpy monitor" control
   panel appears as soon as the first device screen starts sharing. Running it again while it is
-  already running shows the control panel and reopens any device window you closed.
-  The Connection column shows whether each device uses USB or Wi-Fi.
+  already running shows the control panel and shows again any device you closed.
+  The Connection column shows whether each device uses USB or Wi-Fi. Click a column header to sort
+  the list. Global actions are in the File, Recording, Window and Help menus of the control panel.
+
+DEVICE WINDOWS
+  Device windows are arranged on the screen where the control panel is: one device is centered, and
+  several devices are placed side by side (or in rows) around the center without overlapping. Each
+  window is shown at the device's full resolution (100%) when it fits; a larger device screen is scaled
+  down to fit, never cropped. The windows are arranged again whenever a device window opens or closes;
+  minimized, maximized and fullscreen windows are left as they are. To put windows back after moving
+  them, use Window > "Arrange windows" in the control panel (or "Arrange device windows" in the tray
+  menu). Starting the monitor with --window-x, --window-y, --window-width, --window-height or
+  --fullscreen turns automatic arranging off.
 
 WI-FI
   - "Switch to Wi-Fi" (device on USB): turns on ADB over Wi-Fi and mirrors the device over Wi-Fi.
     You can then unplug the cable. "Switch to USB" (Wi-Fi device, cable plugged in) does the reverse.
   - "Connect Wi-Fi device..." (control panel or tray menu): connects a device by IP address and port.
-    Pick a port or type any port; a port that works is remembered and added to "Scan now".
-  - "Scan now": finds devices on the local network with ADB over Wi-Fi turned on and connects them.
+    Pick a port or type any port; a port that works is remembered and added to "Refresh".
+  - "Refresh": shows closed devices again, and finds devices on the local network with ADB over
+    Wi-Fi turned on and connects them.
   - If a connection fails, a message explains why (no device at that address, port not open, or
     debugging not allowed) and "Retry" reopens the dialog with the same IP address and port.
   - "Disconnect" ends a Wi-Fi connection; "Reconnect" connects it again. Wi-Fi devices are
@@ -177,48 +191,58 @@ WI-FI
 RECORD
   - Click the round button in the top-right corner of a device window (red dot = start, white square =
     stop), or press Alt+E in that window.
-  - Or use the control panel: select devices, then "Start recording"/"Stop recording", or "Start all"
-    and "Stop all".
+  - Or use the control panel: select devices, then "Start recording"/"Stop recording", or
+    Recording > "Start all" and "Stop all".
   - Or right-click the tray icon.
   If the device restarts while recording, the recording continues automatically; the parts are
-  joined into a single MP4 when the recording stops.
+  joined into a single MP4 when the recording stops. Each saved recording has a header with the
+  device name above the screen, added with ffmpeg a few seconds after you stop (the status bar shows
+  "Adding device name header to <n> recording(s)..."). If it cannot be added, the recording is kept
+  without it.
 
   Recordings are saved as:
     <Recordings folder>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
-  The default folder is "Videos\scrcpy Recordings". Use "Change folder..." in the control panel to
-  change it, and "Open recordings folder" to open it.
+  The default folder is "Videos\scrcpy Recordings". Use File > "Change recordings folder..." in the
+  control panel to change it, and File > "Open recordings folder" to open it.
 
 RECORD COMBINED
   Select two or more devices in the control panel and click "Record combined". Each device is recorded
   and saved as above; when all of them have stopped (stop them together or one by one), their recordings
   are also joined side by side into one video:
     <Recordings folder>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
-  A device that stops early or restarts shows black in its place until the others stop. The combined
-  video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
+  Each screen has a header with its device name. Every device keeps its own proportions and relative size:
+  a smaller screen (for example P630) is not stretched to match the others. A device that stops early or restarts shows black in
+  its place until the others stop. The combined video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
   the combined video; if it is not finished by then, it is cancelled.
 
+DEVICE LIST
+  A restarting device stays in the list as "Device restarting" and reconnects in the same window.
+  A device that is turned off is removed; one that is unplugged or drops off Wi-Fi is removed after
+  30 seconds (not while recording). A restart started with "adb reboot" is not detected, so that
+  device is removed and reappears when it is back.
+
 CLOSE
-  Closing a device window stops mirroring that device (use "Open window" in the control panel or the
-  tray icon menu to reopen it). Closing the control panel keeps the monitor running in the tray
-  (double-click the tray icon to show it again); the monitor exits once every device window is closed
-  and any combined recording is saved.
-  Use "Exit" to quit. Exiting stops and saves any recording in progress.
+  Closing a device window, or "Stop and close" in the control panel or tray menu, stops that device
+  and removes it from the list ("Refresh" shows it again). Closing the control panel exits the monitor,
+  the same as "Exit": recordings in progress are stopped and saved and every device window is closed.
+  The monitor also exits once every device window is closed and any combined recording is saved.
 
 UPDATES
-  At startup, and when you click "Check for updates" in the control panel (or the tray menu), the
+  At startup, and when you click Help > "Check for updates" in the control panel (or the tray menu), the
   monitor checks https://github.com/$UpdateRepo/releases for a newer version. Accept the prompt to
   download it; the monitor stops (saving any recording), updates this folder and restarts, then shows
   "Updated to scrcpy monitor <version>". If you decline, the status bar shows "Update <version>
-  available" and About offers "Install update". Your recordings folder setting is kept.
+  available" and About offers "Install update". Turn off Help > "Check for updates automatically" to
+  skip the startup check. Your settings are kept.
 
 TROUBLESHOOTING
   - No device listed: check the USB cable and USB debugging authorization ("adb.exe devices" in this
     folder lists the devices).
   - Status "Allow USB debugging on device": unlock the device and tap "Allow" on the USB
     debugging prompt. A requested recording starts automatically once allowed.
-  - Wi-Fi device stays "Waiting for device" after a reboot: most devices turn off ADB over Wi-Fi
-    when they restart. Connect it with USB and use "Switch to Wi-Fi" again.
-  - "Open log" in the control panel shows what happened; per-device logs are in
+  - Wi-Fi device stays "Device restarting" or is removed after a reboot: most devices turn off ADB
+    over Wi-Fi when they restart. Connect it with USB and use "Switch to Wi-Fi" again.
+  - File > "Open log" in the control panel shows what happened; per-device logs are in
     %TEMP%\scrcpy-monitor\logs. "About" shows the version to include when reporting a problem.
   - If Windows blocks the files after downloading the ZIP: right-click the ZIP > Properties >
     Unblock, then extract it again.
