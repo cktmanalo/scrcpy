@@ -6,11 +6,12 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QStatusBar,
-                               QStyle, QSystemTrayIcon, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QHeaderView, QLabel, QLineEdit, QMenu, QMenuBar, QMessageBox, QPushButton, QStatusBar,
+                               QStyle, QSystemTrayIcon, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from . import logic, updater
-from .system import IS_MAC, log, open_path, write_json
+from .system import IS_MAC, IS_WINDOWS, SOURCE_DIR, find_resource, get_setting, log, open_path, set_setting
 
 TITLE = 'Scrcpy Monitor'
 AUTHOR = 'Charles Manalo'
@@ -81,21 +82,31 @@ class AboutDialog(QDialog):
         shortcut = 'Cmd+E' if IS_MAC else 'Alt+E'
         details = QLabel(
             f'Version: {version}\nMirroring engine: {engine_text}\nAuthor: {AUTHOR}\n\n'
-            'Mirrors one or more Android devices in separate windows and keeps each window open while its device '
-            'restarts or reconnects.\n\n'
+            'Mirrors one or more Android devices in separate windows arranged without overlapping, keeps each '
+            'window open while its device restarts or reconnects, and records the screens.\n\n'
             '- Detects devices connected over USB or Wi-Fi and shows the connection type of each.\n'
-            '- Scan now finds devices on the local Wi-Fi network (ports 5555, 5037 and any port you connected with) '
-            'and connects them automatically.\n'
+            '- A restarting device stays in the list as Device restarting; a device that is turned off or unplugged '
+            'is removed.\n'
+            '- Closing a window or Stop and close removes the device from the list; Refresh shows it again and finds '
+            'devices on the local Wi-Fi network (ports 5555, 5037 and any port you connected with).\n'
             '- Connect a Wi-Fi device by IP address and port, disconnect it or reconnect it later; Wi-Fi devices are '
             'remembered.\n'
             '- A device connected over both USB and Wi-Fi is mirrored over USB; the Wi-Fi connection is kept on '
             'standby.\n'
             '- Switch a device between USB and Wi-Fi; the old entry is removed, and if the switch fails the previous '
             'connection is restored.\n'
+            + ('' if IS_WINDOWS else
+               '- Device windows open centered without overlapping, at 100% when they fit, and are arranged again '
+               'when a window opens or closes (Window > Arrange windows).\n') +
             f'- Record per device or all devices from the window button ({shortcut}), this panel or the tray icon; '
-            'recordings continue across restarts and are saved as one MP4 per device.\n'
-            '- Record combined also joins the recordings of the selected devices into one side-by-side video.\n'
-            '- Checks for updates; the packaged version updates itself.\n\n'
+            'recordings continue across restarts and are saved as one MP4 per device with the device name as a header '
+            'above the screen.\n'
+            '- Record combined also joins the recordings of the selected devices into one side-by-side video, with '
+            'each device name above its screen; each device keeps its real size and proportions.\n'
+            '- Click a column header to sort the list; global actions are in the File, Recording, Window and Help '
+            'menus.\n'
+            '- Checks for updates at startup (Help > Check for updates automatically) or on request; the packaged '
+            'version updates itself.\n\n'
             'Built on scrcpy by Genymobile (Apache License 2.0).')
         details.setWordWrap(True)
         details.setFixedWidth(480)
@@ -113,6 +124,87 @@ class AboutDialog(QDialog):
         self.setFixedSize(self.sizeHint())
 
 
+GUIDE_NAME = 'scrcpy-monitor-guide.html' if IS_WINDOWS else 'scrcpy-monitor-guide-macos-linux.html'
+
+
+def guide_path():
+    path = find_resource(GUIDE_NAME)
+    if path is None:
+        candidate = SOURCE_DIR.parent / GUIDE_NAME
+        if candidate.is_file():
+            path = candidate
+    return path
+
+
+class GuideDialog(QDialog):
+    def __init__(self, path):
+        super().__init__(None)
+        self.setWindowTitle('Scrcpy Monitor user guide')
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setSource(QUrl.fromLocalFile(str(path)))
+        layout.addWidget(browser)
+        self.setMinimumSize(480, 360)
+        screen = QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else None
+        width, height = 1000, 800
+        if area is not None:
+            width = min(width, int(area.width() * 0.8))
+            height = min(height, int(area.height() * 0.85))
+        self.resize(width, height)
+
+
+class DeviceItem(QTreeWidgetItem):
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        column = tree.sort_column if isinstance(tree, DeviceList) else 0
+        count = self.columnCount()
+        mine = logic.sort_key([self.text(i) for i in range(count)], column)
+        theirs = logic.sort_key([other.text(i) for i in range(other.columnCount())], column)
+        return mine < theirs
+
+
+class DeviceList(QTreeWidget):
+    LABELS = ('Device', 'Connection', 'Status', 'Recording')
+
+    def __init__(self):
+        super().__init__()
+        self.sort_column = 0
+        self.sort_descending = False
+        self.setColumnCount(len(self.LABELS))
+        self.update_headers()
+        self.header().setSectionsClickable(True)
+        self.header().setSortIndicatorShown(False)
+        self.header().sectionClicked.connect(safely(self.header_clicked))
+
+    def header_clicked(self, column):
+        if column == self.sort_column:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column = column
+            self.sort_descending = False
+        self.update_headers()
+        self.sort()
+
+    def update_headers(self):
+        labels = []
+        for column, text in enumerate(self.LABELS):
+            if column == self.sort_column:
+                text += ' ' + ('\u25bc' if self.sort_descending else '\u25b2')
+            labels.append(text)
+        self.setHeaderLabels(labels)
+
+    def sort(self):
+        order = Qt.SortOrder.DescendingOrder if self.sort_descending else Qt.SortOrder.AscendingOrder
+        self.sortItems(self.sort_column, order)
+        self.header().setSortIndicatorShown(False)
+
+
 class Panel(QWidget):
     def __init__(self, controller, title):
         super().__init__()
@@ -123,46 +215,56 @@ class Panel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.list = QTreeWidget()
-        self.list.setColumnCount(4)
-        self.list.setHeaderLabels(['Device', 'Connection', 'Status', 'Recording'])
+        self.list = DeviceList()
         for column, width in enumerate((250, 85, 170, 165)):
             self.list.setColumnWidth(column, width)
         self.list.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.list.setRootIsDecorated(False)
         self.list.setUniformRowHeights(True)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list.setSortingEnabled(True)
-        self.list.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.list.itemSelectionChanged.connect(safely(self.update_buttons))
         self.list.itemDoubleClicked.connect(safely(lambda *_: self.toggle.isEnabled() and self.toggle.click()))
         layout.addWidget(self.list, 1)
 
         devices = QHBoxLayout()
-        devices.setContentsMargins(6, 6, 6, 2)
+        devices.setContentsMargins(6, 6, 6, 6)
         self.toggle = self._button(devices, 'Start recording', controller.panel_toggle)
         self.combine = self._button(devices, 'Record combined', controller.panel_combine)
         self.open = self._button(devices, 'Open window', lambda: controller.open_window(self.selected_serials()))
+        self.close_button = self._button(devices, 'Stop and close',
+                                         lambda: controller.close_device(self.selected_serials()))
         self.disconnect = self._button(devices, 'Disconnect', lambda: controller.disconnect(self.selected_serials()))
         self.switch = self._button(devices, 'Switch to USB', lambda: controller.switch(self.selected_serials()))
         self._button(devices, 'Connect Wi-Fi device...', controller.show_connect_dialog)
-        self.scan = self._button(devices, 'Scan now', controller.scan_now)
+        self.scan = self._button(devices, 'Refresh', controller.refresh_devices)
         devices.addStretch(1)
         layout.addLayout(devices)
 
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(6, 2, 6, 6)
-        self.start_all = self._button(buttons, 'Start all', controller.start_all)
-        self.stop_all = self._button(buttons, 'Stop all', controller.stop_all)
-        self._button(buttons, 'Open recordings folder', controller.open_record_folder)
-        self._button(buttons, 'Change folder...', controller.select_record_folder)
-        self._button(buttons, 'Open log', controller.open_log)
+        menu_bar = QMenuBar(self)
+        layout.setMenuBar(menu_bar)
+        file_menu = menu_bar.addMenu('&File')
+        recording_menu = menu_bar.addMenu('&Recording')
+        window_menu = menu_bar.addMenu('&Window')
+        help_menu = menu_bar.addMenu('&Help')
+        self._menu_item(window_menu, 'Arrange windows', controller.arrange_windows)
+        self._menu_item(file_menu, 'Open recordings folder', controller.open_record_folder)
+        self._menu_item(file_menu, 'Change recordings folder...', controller.select_record_folder)
+        self._menu_item(file_menu, 'Open log', controller.open_log)
+        file_menu.addSeparator()
+        self._menu_item(file_menu, 'Exit', controller.request_exit)
+        self.start_all = self._menu_item(recording_menu, 'Start all', controller.start_all)
+        self.stop_all = self._menu_item(recording_menu, 'Stop all', controller.stop_all)
+        self._menu_item(help_menu, 'User guide', controller.show_guide)
+        help_menu.addSeparator()
+        self.auto_update = None
         if controller.version.enabled:
-            self._button(buttons, 'Check for updates', lambda: controller.start_update_check(True))
-        self._button(buttons, 'About', controller.show_about)
-        self._button(buttons, 'Exit', controller.request_exit)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
+            self._menu_item(help_menu, 'Check for updates', lambda: controller.start_update_check(True))
+            self.auto_update = self._menu_item(help_menu, 'Check for updates automatically',
+                                               controller.toggle_auto_update_check)
+            self.auto_update.setCheckable(True)
+            self.auto_update.setChecked(controller.auto_update_check)
+            help_menu.addSeparator()
+        self._menu_item(help_menu, 'About', controller.show_about)
 
         self.status_bar = QStatusBar()
         self.status_bar.setSizeGripEnabled(False)
@@ -171,7 +273,21 @@ class Panel(QWidget):
         self.status_bar.addWidget(self.status, 1)
         self.status_bar.addPermanentWidget(self.scan_label)
         layout.addWidget(self.status_bar)
-        self.setMinimumSize(max(560, buttons.sizeHint().width()), 260)
+        min_width = max(560, devices.sizeHint().width())
+        self.setMinimumSize(min_width, 260)
+        if self.width() < min_width:
+            self.resize(min_width, self.height())
+
+    def _menu_item(self, menu, text, action):
+        item = QAction(text, menu)
+
+        def triggered(*_):
+            action()
+            self.controller.refresh_soon()
+
+        item.triggered.connect(safely(triggered))
+        menu.addAction(item)
+        return item
 
     def _button(self, layout, text, action):
         button = QPushButton(text)
@@ -202,19 +318,22 @@ class Panel(QWidget):
         gray = QBrush(palette.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text))
         normal = QBrush(palette.color(QPalette.ColorRole.Text))
         seen = set()
-        sorting = self.list.isSortingEnabled()
-        self.list.setSortingEnabled(False)
+        resort = False
+        sort_column = self.list.sort_column
         for view in snapshot.sessions:
             seen.add(view.serial)
             item = self.items.get(view.serial)
             if item is None:
-                item = QTreeWidgetItem(['', '', '', ''])
+                item = DeviceItem(['', '', '', ''])
                 item.setData(0, Qt.ItemDataRole.UserRole, view.serial)
                 self.list.addTopLevelItem(item)
                 self.items[view.serial] = item
+                resort = True
             for column, text in enumerate((view.title, view.connection, view.status, view.recording_text)):
                 if item.text(column) != text:
                     item.setText(column, text)
+                    if column in (sort_column, 0):
+                        resort = True
             brush = FIREBRICK if view.recording else (gray if view.user_closed or view.standby else normal)
             brush = QBrush(brush) if isinstance(brush, QColor) else brush
             if item.foreground(0) != brush:
@@ -223,7 +342,8 @@ class Panel(QWidget):
         for serial in [s for s in self.items if s not in seen]:
             item = self.items.pop(serial)
             self.list.takeTopLevelItem(self.list.indexOfTopLevelItem(item))
-        self.list.setSortingEnabled(sorting)
+        if resort:
+            self.list.sort()
         status = self.controller.status_text(snapshot)
         if self.status.text() != status:
             self.status.setText(status)
@@ -247,6 +367,7 @@ class Panel(QWidget):
         if self.open.text() != open_text:
             self.open.setText(open_text)
         self.open.setEnabled(bool(closed))
+        self.close_button.setEnabled(any(not v.moved_to for v in selected))
         self.disconnect.setEnabled(any(v.connection == 'Wi-Fi' and not v.disconnected for v in selected))
         kinds = list(dict.fromkeys(v.connection for v in selected))
         switch_text = 'Switch to Wi-Fi' if kinds == ['USB'] else 'Switch to USB'
@@ -254,7 +375,7 @@ class Panel(QWidget):
             self.switch.setText(switch_text)
         self.switch.setEnabled(not standby and len(kinds) == 1 and kinds[0] in ('Wi-Fi', 'USB')
                                and any(not v.disconnected and v.last_state == 'device' for v in selected))
-        self.scan.setEnabled(snapshot.scan_enabled and not snapshot.exiting)
+        self.scan.setEnabled(snapshot.refresh_enabled and not snapshot.exiting)
         targets = [v for v in snapshot.sessions if not v.user_closed and not v.standby]
         self.start_all.setEnabled(any(not v.recording for v in targets))
         self.stop_all.setEnabled(any(v.recording for v in targets))
@@ -272,7 +393,6 @@ class Controller(QObject):
         self.pending_events = collections.deque()
         self.exit_requested = False
         self.exit_posted = False
-        self.panel_hidden_once = False
         self.update_status = ''
         self.update_worker = None
         self.update_manual = False
@@ -280,7 +400,9 @@ class Controller(QObject):
         self.update_job = None
         self.updating = False
         self.about = None
+        self.guide = None
         self.fast_ticks = 0
+        self.auto_update_check = get_setting(paths.settings, 'AutoUpdateCheck') is not False
         self.tray_available = QSystemTrayIcon.isSystemTrayAvailable()
         self.icon = self._load_icon(options.icon_path)
         app.setWindowIcon(self.icon)
@@ -325,7 +447,7 @@ class Controller(QObject):
         QTimer.singleShot(100, safely(self.engine.post_tick))
         if self.no_tray_fallback and self.panel:
             self.show_panel()
-        if not self.options.no_update_check:
+        if not self.options.no_update_check and self.auto_update_check:
             self.start_update_check(False)
 
     def snapshot(self):
@@ -362,11 +484,22 @@ class Controller(QObject):
         self.engine.post(lambda: function(*args))
         self.refresh_soon()
 
+    def arrange_area(self):
+        screen = self.panel.screen() if self.panel and self.panel.isVisible() else None
+        screen = screen or QApplication.primaryScreen()
+        if screen is None:
+            return None
+        bounds, area = screen.geometry(), screen.availableGeometry()
+        ratio = 1 if IS_MAC else screen.devicePixelRatio()
+        return (bounds.x() + round((area.x() - bounds.x()) * ratio), bounds.y() + round((area.y() - bounds.y()) * ratio),
+                round(area.width() * ratio), round(area.height() * ratio))
+
     def fast_tick(self):
         if self.engine.finished.is_set():
             self.finish()
             return
         self.engine.panel_visible = bool(self.panel and self.panel.isVisible())
+        self.engine.arrange_area = self.arrange_area()
         if self.exit_requested and not self.exit_posted:
             self.exit_posted = True
             self.engine.post('exit')
@@ -442,18 +575,7 @@ class Controller(QObject):
             event.accept()
             return
         event.ignore()
-        if self.tray:
-            self.panel.hide()
-            if not self.panel_hidden_once:
-                self.panel_hidden_once = True
-                where = 'menu bar' if IS_MAC else 'tray'
-                action = 'Click' if IS_MAC else 'Double-click'
-                self.engine.notify(f'scrcpy monitor keeps running in the {where}. {action} the {where} icon to show '
-                                   f'the control panel.')
-        elif self.no_tray_fallback:
-            self.panel.showMinimized()
-        else:
-            self.request_exit()
+        self.request_exit()
 
     def show_panel(self):
         self.engine.panel_pending = False
@@ -524,6 +646,7 @@ class Controller(QObject):
                              lambda s=serial: self.switch([s]), enabled=view.last_state == 'device')
             if view.connection == 'Wi-Fi':
                 self._action(sub, 'Disconnect', lambda s=serial: self.disconnect([s]))
+            self._action(sub, 'Stop and close', lambda s=serial: self.close_device([s]))
         for view in closed:
             state = (f'switching to {view.moved_to}' if view.moved_to else
                      'disconnected' if view.disconnected else 'closed')
@@ -536,12 +659,18 @@ class Controller(QObject):
                      enabled=any(not v.recording for v in targets))
         self._action(menu, 'Stop recording on all devices', self.stop_all, enabled=any(v.recording for v in sessions))
         self._action(menu, 'Connect Wi-Fi device...', self.show_connect_dialog)
+        self._action(menu, 'Refresh devices', self.refresh_devices, enabled=snapshot.refresh_enabled)
+        self._action(menu, 'Arrange device windows', self.arrange_windows,
+                     enabled=any(v.window_shown for v in sessions))
         menu.addSeparator()
         self._action(menu, 'Open recordings folder', self.open_record_folder)
         self._action(menu, 'Change recordings folder...', self.select_record_folder)
         self._action(menu, 'Open log', self.open_log)
         if self.version.enabled:
             self._action(menu, 'Check for updates', lambda: self.start_update_check(True))
+            auto_update = self._action(menu, 'Check for updates automatically', self.toggle_auto_update_check)
+            auto_update.setCheckable(True)
+            auto_update.setChecked(self.auto_update_check)
         self._action(menu, 'About', self.show_about)
         menu.addSeparator()
         self._action(menu, 'Exit', self.request_exit)
@@ -556,6 +685,8 @@ class Controller(QObject):
             status = f'Joining {snapshot.merges} recording(s)...  {status}'
         if snapshot.combines:
             status = f'Combining {snapshot.combines} recording(s)...  {status}'
+        if snapshot.labels:
+            status = f'Adding device name header to {snapshot.labels} recording(s)...  {status}'
         if self.update_status:
             status = f'{self.update_status}  |  {status}'
         return status
@@ -582,8 +713,29 @@ class Controller(QObject):
         if serials:
             self.post(self.engine.switch_connection, list(serials))
 
-    def scan_now(self):
-        self.post(self.engine.start_scan)
+    def close_device(self, serials):
+        if serials:
+            self.post(self.engine.close_device, list(serials))
+
+    def arrange_windows(self):
+        self.engine.arrange_area = self.arrange_area()
+        self.post(self.engine.arrange_windows, True)
+
+    def refresh_devices(self):
+        self.post(self.engine.refresh)
+
+    def toggle_auto_update_check(self):
+        self.set_auto_update_check(not self.auto_update_check)
+
+    def set_auto_update_check(self, enabled):
+        self.auto_update_check = enabled
+        auto_update = self.panel.auto_update if self.panel else None
+        if auto_update is not None and auto_update.isChecked() != enabled:
+            auto_update.setChecked(enabled)
+        set_setting(self.paths.settings, 'AutoUpdateCheck', enabled)
+        log(f'Automatic update check turned {"on" if enabled else "off"}.')
+        if enabled:
+            self.start_update_check(False)
 
     def start_all(self):
         self.post(self.engine.start_all)
@@ -610,7 +762,7 @@ class Controller(QObject):
         if not folder:
             return
         folder = str(Path(folder))
-        write_json(self.paths.settings, {'RecordDir': folder})
+        set_setting(self.paths.settings, 'RecordDir', folder)
         self.post(self.engine.set_record_dir, folder)
 
     def show_connect_dialog(self, address='', port='5555'):
@@ -656,6 +808,23 @@ class Controller(QObject):
         self.about.show()
         self.about.raise_()
         self.about.activateWindow()
+
+    def show_guide(self):
+        if self.guide is not None:
+            self.guide.showNormal()
+            self.guide.raise_()
+            self.guide.activateWindow()
+            return
+        path = guide_path()
+        if path is None:
+            self.show_message(f'The user guide ({GUIDE_NAME}) was not found.', icon='warning')
+            return
+        self.guide = GuideDialog(path)
+        self.guide.setWindowIcon(self.icon)
+        self.guide.destroyed.connect(lambda *_: setattr(self, 'guide', None))
+        self.guide.show()
+        self.guide.raise_()
+        self.guide.activateWindow()
 
     def handle_request(self, command, serials):
         if command == 'start-recording':

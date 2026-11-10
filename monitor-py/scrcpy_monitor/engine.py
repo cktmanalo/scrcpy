@@ -11,11 +11,14 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import logic
+from . import logic, windowing
 from .logic import connection_type, safe_name
 from .system import (IS_WINDOWS, BackgroundCommand, ScrcpyProcess, hidden_kwargs, kill_process, kill_tree,
                      list_processes, log, pid_alive, read_json, run_hidden, send_interrupt, stop_gracefully,
                      write_json)
+
+POWER_WATCH_COMMAND = ('while [ -z $(getprop sys.shutdown.requested)$(getprop sys.powerctl) ]; do sleep 1; done; '
+                       'echo $(getprop sys.shutdown.requested)/$(getprop sys.powerctl)')
 
 
 def _seconds(delta):
@@ -38,6 +41,11 @@ class Session:
         self.user_closed = False
         self.disconnected = False
         self.missing_since = None
+        self.gone_since = None
+        self.power_watch = None
+        self.next_power_watch = now
+        self.restarting_at = None
+        self.powering_off = False
         self.pending_action = None
         self.moved_to = None
         self.move_address = None
@@ -45,6 +53,7 @@ class Session:
         self.display = None
         self.display_started_at = None
         self.window_shown = False
+        self.natural_size = 0
         self.next_wake = now
         self.display_failures = 0
         self.next_display_attempt = now
@@ -69,7 +78,7 @@ class Session:
 
 class SessionView:
     __slots__ = ('serial', 'title', 'connection', 'status', 'recording_text', 'recording', 'user_closed',
-                 'disconnected', 'standby', 'last_state', 'moved_to', 'stopping')
+                 'disconnected', 'standby', 'last_state', 'moved_to', 'stopping', 'window_shown')
 
     def __init__(self, **values):
         for key, value in values.items():
@@ -81,9 +90,11 @@ class Snapshot:
         self.sessions = list(sessions)
         self.discovery_status = values.get('discovery_status', 'Wi-Fi scan: waiting')
         self.scan_enabled = values.get('scan_enabled', False)
+        self.refresh_enabled = values.get('refresh_enabled', False)
         self.record_dir = values.get('record_dir', '')
         self.merges = values.get('merges', 0)
         self.combines = values.get('combines', 0)
+        self.labels = values.get('labels', 0)
         self.combine_active = values.get('combine_active', False)
         self.connecting = values.get('connecting', [])
         self.exiting = values.get('exiting', False)
@@ -195,6 +206,39 @@ def local_networks():
     return networks
 
 
+def new_combine_header(text, width, height, path):
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(QColor(40, 40, 40))
+    font = QFont()
+    font.setBold(True)
+    size = max(8.0, height * 0.55)
+    font.setPixelSize(int(size))
+    while size > 8 and QFontMetricsF(font).horizontalAdvance(text) > width - 8:
+        size = max(8.0, size - 1)
+        font.setPixelSize(int(size))
+    painter = QPainter(image)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        elided = QFontMetricsF(font).elidedText(text, Qt.TextElideMode.ElideRight, width - 8)
+        painter.drawText(QRectF(4, 0, width - 8, height), Qt.AlignmentFlag.AlignCenter, elided)
+    finally:
+        painter.end()
+    if not image.save(path, 'PNG'):
+        raise OSError(f'could not save {path}')
+
+
+def _remove_files(paths):
+    for path in paths:
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+
+
 class Engine:
     def __init__(self, options, paths, tools):
         self.options = options
@@ -212,9 +256,17 @@ class Engine:
         self.panel_visible = False
         self.has_panel = True
         self.panel_pending = False
+        self.arrange_area = None
+        self.arrange_requested_at = None
+        self.arrange_reported = False
+        self.arrange_retries = 0
+        self.auto_arrange = not logic.has_placement_arg(options.scrcpy_args)
+        self.window_mover = None
         self.sessions = {}
         self.merges = []
         self.combines = []
+        self.labels = []
+        self.fps_args = None
         self.combine_handovers = []
         self.combine_encoder = None
         self.stops = []
@@ -232,6 +284,8 @@ class Engine:
         self.delayed_connects = {}
         self.moved_usb = {}
         self.removed_serials = set()
+        self.closed_serials = {}
+        self.closed_by_user = False
         self.standby = {}
         self.wifi_serials = {}
         self.exiting = False
@@ -486,6 +540,7 @@ class Engine:
                     return
                 if session.display.shown:
                     session.window_shown = True
+                    self.request_arrange()
                     return
                 if now >= session.next_wake:
                     session.next_wake = now + timedelta(seconds=10)
@@ -495,10 +550,14 @@ class Engine:
             exit_code = session.display.returncode
             ran = _seconds(now - session.display_started_at)
             session.display = None
+            if session.window_shown:
+                self.request_arrange()
+            session.window_shown = False
+            session.natural_size = 0
             if exit_code == 0:
-                session.user_closed = True
-                log(f'[{session.serial}] scrcpy window closed by user; no longer monitoring.')
-                self.stop_recording(session)
+                log(f'[{session.serial}] scrcpy window closed by user; removed from the list.')
+                self.remove_device(session, user_closed=True)
+                self.closed_by_user = True
                 return
             if ran >= 30:
                 session.display_failures = 0
@@ -519,6 +578,70 @@ class Engine:
             session.display_failures += 1
             session.next_display_attempt = now + timedelta(seconds=min(5 * session.display_failures, 30))
             log(f'[{session.serial}] Failed to start scrcpy: {error}')
+
+    def request_arrange(self):
+        if self.auto_arrange and not self.arrange_requested_at:
+            self.arrange_requested_at = datetime.now()
+
+    def update_arrange(self):
+        if not self.arrange_requested_at:
+            return
+        opening = [s for s in self.sessions.values() if s.display and not s.window_shown and not s.display.exited]
+        if opening and _seconds(datetime.now() - self.arrange_requested_at) < 10:
+            return
+        self.arrange_windows()
+
+    def arrange_windows(self, manual=False):
+        self.arrange_requested_at = None
+        if self.window_mover is None:
+            self.window_mover = windowing.create_mover()
+        mover = self.window_mover
+        if not mover.available():
+            if mover.reason and (manual or not self.arrange_reported):
+                self.arrange_reported = True
+                log(f'Cannot arrange device windows: {mover.reason}')
+                if manual:
+                    mover.request_access()
+                    self.message(f'Cannot arrange device windows: {mover.reason}', 'info')
+            return
+        area = self.arrange_area
+        sessions = sorted((s for s in self.sessions.values() if s.display and s.window_shown and not s.display.exited),
+                          key=lambda s: s.title.casefold())
+        if not area or not sessions:
+            return
+        try:
+            try:
+                windows = mover.find_windows([s.display.pid for s in sessions])
+                missing = [s for s in sessions if s.display.pid not in windows]
+                if missing and not manual and self.arrange_retries < 2:
+                    self.arrange_retries += 1
+                    self.arrange_requested_at = datetime.now()
+                    return
+                self.arrange_retries = 0
+                targets, items = [], []
+                for session in sessions:
+                    window = windows.get(session.display.pid)
+                    if not window:
+                        continue
+                    _, _, outer_width, outer_height = window.outer
+                    client_width, client_height = window.client
+                    if not session.natural_size:
+                        session.natural_size = max(client_width, client_height)
+                    aspect = client_width / client_height
+                    targets.append(window)
+                    items.append({'aspect': aspect, 'frame_width': outer_width - client_width,
+                                  'frame_height': outer_height - client_height,
+                                  'max_height': session.natural_size / max(1, aspect)})
+                rects = logic.window_layout(area, items) if items else None
+                if not rects:
+                    return
+                for window, rect in zip(targets, rects):
+                    mover.move(window, rect)
+            finally:
+                mover.close()
+            log(f'Arranged {len(targets)} device window(s).')
+        except Exception as error:
+            log(f'Failed to arrange device windows: {error}')
 
     def start_recording(self, session):
         if session.recording or session.user_closed or session.serial in self.standby:
@@ -739,7 +862,7 @@ class Engine:
         if len(parts) == 1:
             try:
                 Path(parts[0]).replace(output)
-                self.notify(f'Recording saved: {output}')
+                self.add_recording_header(title, output, member['group'] if member else None)
                 for segment in segments:
                     segment['path'] = output
             except OSError as error:
@@ -765,7 +888,7 @@ class Engine:
         steps.append(['-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', str(list_file),
                       '-c', 'copy', '-movflags', '+faststart', output])
         merge = {'process': None, 'steps': steps, 'parts': parts, 'temps': temps, 'output': output,
-                 'list_file': list_file, 'member': member, 'segments': segments}
+                 'list_file': list_file, 'member': member, 'segments': segments, 'title': title}
         try:
             merge['process'] = self.start_merge_step(merge)
         except OSError as error:
@@ -811,7 +934,8 @@ class Engine:
                             Path(part).unlink()
                         except OSError:
                             pass
-                self.notify(f'Recording saved: {merge["output"]}')
+                self.add_recording_header(merge['title'], merge['output'],
+                                          merge['member']['group'] if merge['member'] else None)
                 if merge['member']:
                     position = 0.0
                     for segment in merge['segments']:
@@ -957,9 +1081,23 @@ class Engine:
             output = folder / f'{stem}_{suffix}.mp4'
             suffix += 1
         temp = str(output)[:-4] + '_combining.mp4'
+        _, _, cell_w, _, header_h = logic.combine_layout(sizes)
+        headers = []
+        stamp = f'{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}'
+        for number, member in enumerate(members):
+            path = str(self.paths.logs / f'combine-{stamp}-header{number + 1}.png')
+            try:
+                new_combine_header(member['title'], cell_w, header_h, path)
+                headers.append(path)
+            except Exception as error:
+                log(f'Could not create the combined recording header for {member["title"]}: {error}')
+                _remove_files(headers)
+                headers = []
+                break
         args, total, count = logic.combine_command([m['segments'] for m in members], sizes, t0,
-                                                   self.get_combine_encoder_args(), temp)
+                                                   self.get_combine_encoder_args(), temp, headers)
         if IS_WINDOWS and len(subprocess.list2cmdline(args)) > 30000:
+            _remove_files(headers)
             self.notify('Combined recording skipped: too many recording parts. Each device recording was saved.',
                         'warning')
             return
@@ -969,15 +1107,20 @@ class Engine:
         kwargs = hidden_kwargs()
         if IS_WINDOWS:
             kwargs['creationflags'] |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
-        process = subprocess.Popen([self.tools.ffmpeg] + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, env=env, **kwargs)
+        try:
+            process = subprocess.Popen([self.tools.ffmpeg] + args, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, **kwargs)
+        except Exception:
+            _remove_files(headers)
+            raise
         if not IS_WINDOWS:
             try:
                 os.setpriority(os.PRIO_PROCESS, process.pid, 10)
             except OSError:
                 pass
+        sources = {s['path'] for m in members for s in m['segments']}
         self.combines.append({'process': process, 'output': str(output), 'temp': temp, 'log': str(log_file),
-                              'size': -1, 'progress_at': time.monotonic()})
+                              'headers': headers, 'sources': sources, 'size': -1, 'progress_at': time.monotonic()})
         log(f'Combining {len(members)} device recordings ({count} part(s), {logic.format_seconds(total)}s) into '
             f'{output} (log: {log_file})')
         self.notify(f'Combining {len(members)} device recordings into one video...')
@@ -1007,6 +1150,7 @@ class Engine:
                     pass
             exit_code = process.returncode if process.returncode is not None else -1
             self.combines.remove(combine)
+            _remove_files(combine['headers'])
             if exit_code == 0 and self.test_video_file(combine['temp']):
                 try:
                     Path(combine['temp']).replace(combine['output'])
@@ -1040,9 +1184,132 @@ class Engine:
                 Path(combine['temp']).unlink()
             except OSError:
                 pass
+            _remove_files(combine['headers'])
             log(f'Combined recording {combine["output"]} cancelled at exit; each device recording was saved.')
             self.notify('The combined recording was not finished before exit and was cancelled. Each device '
                         'recording was saved.', 'warning')
+
+    def add_recording_header(self, title, path, group=None):
+        if not self.tools.ffmpeg or not self.tools.ffprobe:
+            self.notify(f'Recording saved: {path}')
+            return
+        self.labels.append({'title': title, 'path': path, 'group': group, 'process': None,
+                            'temp': re.sub(r'\.mp4$', '_labeling.mp4', path), 'header': None, 'size': -1,
+                            'progress_at': time.monotonic()})
+
+    def label_ready(self, label):
+        if label['group'] and not label['group']['finished']:
+            return False
+        return not any(label['path'] in c.get('sources', ()) for c in self.combines)
+
+    def get_fps_args(self):
+        if not self.fps_args:
+            text = run_hidden([self.tools.ffmpeg, '-version'], 15)
+            args = logic.fps_passthrough_args(text)
+            if not text:
+                return args
+            self.fps_args = args
+        return self.fps_args
+
+    def start_label(self, label):
+        width, height, header_h = logic.label_layout(*self.video_size(label['path']))
+        label['header'] = str(self.paths.logs / f'label-{uuid.uuid4().hex}.png')
+        new_combine_header(label['title'], width, header_h, label['header'])
+        args = logic.label_command(label['path'], label['header'], width, height, header_h,
+                                   self.get_combine_encoder_args(), self.get_fps_args(), label['temp'])
+        kwargs = hidden_kwargs()
+        if IS_WINDOWS:
+            kwargs['creationflags'] |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        label['process'] = subprocess.Popen([self.tools.ffmpeg] + args, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        if not IS_WINDOWS:
+            try:
+                os.setpriority(os.PRIO_PROCESS, label['process'].pid, 10)
+            except OSError:
+                pass
+        label['progress_at'] = time.monotonic()
+        log(f'Adding the device name header to {label["path"]}')
+
+    def complete_label(self, label, exit_code):
+        if label in self.labels:
+            self.labels.remove(label)
+        process = label['process']
+        if process:
+            try:
+                if process.poll() is None:
+                    kill_tree(process.pid)
+                    process.wait(5)
+            except Exception:
+                pass
+            label['process'] = None
+        if label['header']:
+            _remove_files([label['header']])
+        labeled = False
+        if exit_code == 0 and self.test_video_file(label['temp']):
+            try:
+                Path(label['temp']).replace(label['path'])
+                labeled = True
+            except OSError as error:
+                log(f'Could not replace {label["path"]} with the version that has the device name header: {error}')
+        else:
+            log(f'Could not add the device name header to {label["path"]} (ffmpeg exit code {exit_code}); the '
+                f'recording was kept without it.')
+        _remove_files([label['temp']])
+        if labeled:
+            self.notify(f'Recording saved: {label["path"]}')
+        else:
+            self.notify(f'Recording saved without the device name header: {label["path"]}')
+
+    def update_labels(self, timeout=0, force=False):
+        deadline = time.monotonic() + timeout
+        while self.labels:
+            label = next((item for item in self.labels if item['process']), None)
+            if not label:
+                label = next((item for item in self.labels if force or self.label_ready(item)), None)
+                if not label:
+                    return
+                try:
+                    self.start_label(label)
+                except Exception as error:
+                    log(f'Could not start adding the device name header to {label["path"]}: {error}')
+                    self.complete_label(label, -1)
+                    continue
+            process = label['process']
+            try:
+                process.wait(max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try:
+                    size = Path(label['temp']).stat().st_size
+                except OSError:
+                    size = 0
+                if size != label['size']:
+                    label['size'] = size
+                    label['progress_at'] = time.monotonic()
+                    return
+                if time.monotonic() - label['progress_at'] < 300:
+                    return
+                log(f'Adding the device name header to {label["path"]} made no progress for 5 minutes; stopping '
+                    f'ffmpeg.')
+                kill_tree(process.pid)
+                try:
+                    process.wait(5)
+                except subprocess.TimeoutExpired:
+                    pass
+            self.complete_label(label, process.returncode if process.returncode is not None else -1)
+
+    def stop_labels(self):
+        for label in list(self.labels):
+            self.labels.remove(label)
+            process = label['process']
+            try:
+                if process and process.poll() is None:
+                    kill_tree(process.pid)
+                    process.wait(5)
+            except Exception:
+                pass
+            _remove_files([label['temp']] + ([label['header']] if label['header'] else []))
+            log(f'Device name header for {label["path"]} cancelled at exit; the recording was kept without it.')
+            self.notify(f'Recording saved without the device name header: {label["path"]}')
 
     def target_sessions(self, serials=()):
         active = [s for s in self.sessions.values() if not s.user_closed and s.serial not in self.standby]
@@ -1073,7 +1340,8 @@ class Engine:
             if connected and not job.manual and not output.startswith('already'):
                 usb = [s for s, state in devices.items() if state == 'device' and connection_type(s) == 'USB'
                        and s not in self.moved_usb
-                       and not (s in self.sessions and self.sessions[s].user_closed)]
+                       and not (s in self.sessions and self.sessions[s].user_closed)
+                       and s not in self.closed_serials]
                 if usb and self.get_prop(job.address, 'ro.serialno') in usb:
                     log(f'{job.address} is a device already connected over USB; disconnecting the Wi-Fi connection.')
                     self.adb(['disconnect', job.address], 5)
@@ -1156,12 +1424,20 @@ class Engine:
             self.discovery_status = 'Wi-Fi scan: unavailable'
 
     def connect_found(self, address, source, devices, now):
-        if address in devices or address in self.sessions:
+        if address in self.sessions:
+            return
+        state = devices.get(address)
+        if state and state != 'offline':
             return
         if address in self.discovery_retry and now < self.discovery_retry[address]:
             return
         self.discovery_retry[address] = now + timedelta(seconds=60)
-        log(f'Found Wi-Fi device {address} ({source}); connecting.')
+        if state:
+            log(f'Wi-Fi device {address} is offline ({source}); reconnecting.')
+            self.adb(['disconnect', address], 5)
+            devices.pop(address, None)
+        else:
+            log(f'Found Wi-Fi device {address} ({source}); connecting.')
         self.start_connect(address, False)
 
     def scan_ports(self):
@@ -1257,6 +1533,7 @@ class Engine:
             return
         self.update_merges()
         self.update_combines()
+        self.update_labels()
         self.update_combine_handovers()
         now = datetime.now()
         devices = self.get_devices()
@@ -1278,8 +1555,14 @@ class Engine:
                 [s for s, state in devices.items() if state in ('device', 'unauthorized', 'authorizing')]
                 + list(self.sessions)))
         targets = [t for t in targets if not self.test_moved_away(t, devices)]
+        for closed_serial in list(self.closed_serials):
+            if devices.get(closed_serial) == 'device':
+                self.closed_serials[closed_serial] = True
+            elif self.closed_serials[closed_serial] and closed_serial not in devices:
+                del self.closed_serials[closed_serial]
+                log(f'[{closed_serial}] Closed device disconnected; it is shown again when it reconnects.')
         for serial in targets:
-            if serial in self.removed_serials:
+            if serial in self.removed_serials or serial in self.closed_serials:
                 continue
             session = self.sessions.get(serial) or self.new_session(serial)
             if session.pending_action and not session.stopping:
@@ -1291,13 +1574,35 @@ class Engine:
                 log(f'[{serial}] adb state: {state}')
                 if state == 'device':
                     self.wifi_serials.pop(serial, None)
+                    session.restarting_at = None
+                    session.powering_off = False
                 session.last_state = state
             if state == 'device':
                 session.missing_since = None
             elif not session.missing_since:
                 session.missing_since = now
+            if state not in ('missing', 'offline'):
+                session.gone_since = None
+            elif not session.gone_since:
+                session.gone_since = now
             if state != 'device':
                 session.booted_at = None
+            if serial in self.standby:
+                self.stop_power_watch(session)
+            else:
+                self.update_power_watch(session, state, now)
+            if state != 'device' and self.test_device_gone(session, now):
+                if session.powering_off:
+                    reason = 'was turned off'
+                elif session.restarting_at:
+                    reason = 'did not come back after restarting'
+                else:
+                    reason = 'was disconnected'
+                log(f'[{serial}] Device {reason}; removed from the list.')
+                self.remove_device(session)
+                if session.name:
+                    self.notify(f'{session.title} {reason} and was removed from the list.')
+                continue
             if session.connector and session.connector.poll() is not None:
                 session.connector = None
                 session.next_connect = now + timedelta(seconds=5)
@@ -1327,19 +1632,25 @@ class Engine:
             self.update_display(session, devices, ready)
             if not session.user_closed:
                 self.update_recorder(session, devices, ready)
+        self.update_arrange()
         tracked = list(self.sessions.values())
         monitored = [s for s in tracked if not s.disconnected and s.name and s.serial not in self.standby]
         if self.open_windows_requested:
             self.open_windows_requested = False
-            closed = [s.serial for s in tracked if s.user_closed and not s.disconnected]
-            if closed:
-                self.open_window(closed)
+            reopened = len(self.closed_serials)
+            if reopened:
+                self.closed_serials.clear()
+                self.closed_by_user = False
+                self.request_tick()
             if self.has_panel:
                 self.ui_events.put(('show_panel',))
-            elif not closed:
+            elif not reopened:
                 self.notify('scrcpy monitor is already running. Use the tray icon for recording and settings.')
-        if (not self.panel_visible and monitored and all(s.user_closed for s in monitored)
-                and not any(s.moved_to for s in tracked) and not self.combine_active()):
+        opened = [s for s in monitored if not s.user_closed]
+        if opened:
+            self.closed_by_user = False
+        if (not self.panel_visible and self.closed_by_user and not opened
+                and not any(s.moved_to for s in tracked) and not self.combine_active() and not self.labels):
             log('All scrcpy windows were closed.')
             self.stop_monitor()
 
@@ -1355,6 +1666,10 @@ class Engine:
                 session.disconnected = False
                 session.pending_action = None
                 session.moved_to = None
+                session.gone_since = None
+                session.missing_since = None
+                session.restarting_at = None
+                session.powering_off = False
                 session.next_connect = datetime.now()
                 log(f'[{serial}] Reconnecting.')
             else:
@@ -1369,13 +1684,17 @@ class Engine:
             kill_tree(display.pid)
             display.wait(5)
         session.display = None
+        if session.window_shown:
+            self.request_arrange()
         session.window_shown = False
+        session.natural_size = 0
 
     def close_session(self, session, action):
         session.disconnected = True
         session.user_closed = True
         session.pending_action = action
         self.stop_recording(session)
+        self.stop_power_watch(session)
         if session.connector:
             if session.connector.poll() is None:
                 kill_process(session.connector)
@@ -1392,8 +1711,19 @@ class Engine:
         for address in [s for s in known if connection_type(s) == 'Wi-Fi']:
             if address not in self.wifi_serials and devices.get(address) == 'device':
                 self.wifi_serials[address] = self.get_prop(address, 'ro.serialno')
+        hidden = set()
+        for address in [s for s in known if connection_type(s) == 'Wi-Fi']:
+            usb_serial = self.wifi_serials.get(address)
+            if not usb_serial or usb_serial in self.moved_usb:
+                continue
+            if usb_serial in self.closed_serials and address not in self.closed_serials:
+                log(f'[{address}] Same device as the closed {usb_serial}; hiding it too.')
+                self.closed_serials[address] = False
+                if address in self.sessions:
+                    self.remove_session(self.sessions[address])
+                hidden.add(address)
         standby, handovers = logic.usb_priority(devices, self.sessions, self.wifi_serials, self.moved_usb,
-                                                datetime.now())
+                                                datetime.now(), skip=hidden)
         for address, usb_serial in handovers:
             log(f'[{address}] Missing for 30 seconds; continuing the recording over USB ({usb_serial}).')
             wifi = self.sessions[address]
@@ -1420,6 +1750,7 @@ class Engine:
                 return
             self.adb(['disconnect', serial], 5)
             self.remove_known_wifi(serial)
+            self.closed_serials.pop(session.move_address, None)
             usb_session = self.sessions.get(session.move_address)
             if usb_session and usb_session.user_closed:
                 self.open_window([usb_session.serial])
@@ -1437,6 +1768,104 @@ class Engine:
         self.close_session(session, None)
         self.sessions.pop(session.serial, None)
         self.removed_serials.add(session.serial)
+
+    def remove_device(self, session, user_closed=False):
+        serial = session.serial
+        partners = []
+        if user_closed:
+            partners = [s for s, target in self.standby.items() if target == serial]
+            if self.standby.get(serial):
+                partners.append(self.standby[serial])
+            for closed in [serial] + partners:
+                self.closed_serials[closed] = False
+        self.remove_session(session)
+        for partner in partners:
+            if partner in self.sessions:
+                self.remove_session(self.sessions[partner])
+
+    def close_device(self, serials):
+        sessions = [self.sessions[s] for s in serials if s in self.sessions]
+        sessions = [s for s in sessions if not s.moved_to]
+        if not sessions:
+            return
+        affected = list(sessions)
+        for session in sessions:
+            partners = [s for s, target in self.standby.items() if target == session.serial]
+            if self.standby.get(session.serial):
+                partners.append(self.standby[session.serial])
+            affected += [self.sessions[p] for p in partners if p in self.sessions]
+
+        def run():
+            for session in sessions:
+                if session.serial not in self.sessions:
+                    continue
+                log(f'[{session.serial}] Stopped and closed; removed from the list.')
+                self.remove_device(session, user_closed=True)
+            self.request_tick()
+
+        self.confirm_stop_recording(affected, 'Stop and close', run)
+
+    def refresh(self):
+        if self.closed_serials:
+            log(f'Refresh: showing closed devices again ({", ".join(self.closed_serials)}).')
+            self.closed_serials.clear()
+            self.closed_by_user = False
+        self.start_scan()
+        self.request_tick()
+
+    def stop_power_watch(self, session):
+        if not session.power_watch:
+            return
+        try:
+            session.power_watch.kill()
+        except OSError:
+            pass
+        session.power_watch = None
+
+    def update_power_watch(self, session, state, now):
+        if session.power_watch:
+            if session.power_watch.process.poll() is None:
+                return
+            output = session.power_watch.complete() or ''
+            session.power_watch = None
+            session.next_power_watch = now + timedelta(seconds=5)
+            result = logic.parse_power_watch(output)
+            if result == 'restarting':
+                session.restarting_at = now
+                log(f'[{session.serial}] Device is restarting ({output}).')
+            elif result == 'off':
+                session.powering_off = True
+                log(f'[{session.serial}] Device is shutting down ({output}).')
+        if session.restarting_at and state == 'device' and _seconds(now - session.restarting_at) >= 120:
+            session.restarting_at = None
+        if (state != 'device' or session.restarting_at or session.powering_off
+                or now < session.next_power_watch):
+            return
+        try:
+            session.power_watch = BackgroundCommand([self.tools.adb, '-s', session.serial, 'shell',
+                                                     POWER_WATCH_COMMAND])
+        except OSError as error:
+            session.next_power_watch = now + timedelta(seconds=30)
+            log(f'[{session.serial}] Could not watch for restarts: {error}')
+
+    def test_device_gone(self, session, now):
+        if self.serial_filter:
+            return False
+        if session.recording or session.stopping or session.record_pending:
+            return False
+        if session.powering_off:
+            return True
+        if self.options.no_discovery and connection_type(session.serial) == 'Wi-Fi':
+            return False
+        if not session.gone_since:
+            return False
+        restarting = session.restarting_at
+        partner = self.standby.get(session.serial)
+        if partner and partner in self.sessions and self.sessions[partner].restarting_at:
+            restarting = self.sessions[partner].restarting_at
+        if restarting:
+            return _seconds(now - restarting) >= 300
+        return _seconds(now - session.gone_since) >= 30
 
     def update_moves(self, devices):
         for session in [s for s in list(self.sessions.values()) if s.moved_to and not s.pending_action]:
@@ -1561,6 +1990,7 @@ class Engine:
             address += ':5555'
         if self.serial_filter and address not in self.serial_filter:
             self.serial_filter.append(address)
+        self.closed_serials.pop(address, None)
         session = self.sessions.get(address)
         if session and session.user_closed:
             self.open_window([address])
@@ -1598,6 +2028,7 @@ class Engine:
         log('Stopping monitor.')
         self.publish()
         steps = [self.stop_adb_jobs]
+        steps += [lambda s=s: self.stop_power_watch(s) for s in list(self.sessions.values())]
         steps += [lambda s=s: self.stop_recording(s) for s in list(self.sessions.values())]
         steps.append(lambda: self.update_stops(45))
         steps.append(lambda: self.update_combine_handovers(True))
@@ -1606,6 +2037,8 @@ class Engine:
         steps.append(lambda: self.update_merges(600))
         steps.append(lambda: self.update_combines(120))
         steps.append(self.stop_combines)
+        steps.append(lambda: self.update_labels(120, force=True))
+        steps.append(self.stop_labels)
         for step in steps:
             try:
                 step()
@@ -1629,6 +2062,10 @@ class Engine:
             return 'Disconnected'
         if session.user_closed:
             return 'Window closed'
+        if session.powering_off:
+            return 'Shutting down' if session.last_state == 'device' else 'Device turned off'
+        if session.restarting_at:
+            return 'Device restarting'
         if session.serial in self.standby:
             return f'Standby (using {connection_type(self.standby[session.serial])})'
         if session.last_state == 'unauthorized':
@@ -1661,10 +2098,12 @@ class Engine:
                 status=self.session_status(session), recording_text=self.recording_text(session),
                 recording=session.recording, user_closed=session.user_closed, disconnected=session.disconnected,
                 standby=session.serial in self.standby, last_state=session.last_state, moved_to=session.moved_to,
-                stopping=session.stopping))
+                stopping=session.stopping, window_shown=bool(session.display and session.window_shown)))
         self.snapshot = Snapshot(
             views, discovery_status=self.discovery_status, record_dir=str(self.record_dir), merges=len(self.merges),
-            combines=len(self.combines), combine_active=self.combine_active(),
+            combines=len(self.combines), labels=len(self.labels), combine_active=self.combine_active(),
             connecting=[job.address for job in self.connects if job.manual], exiting=self.exiting,
             scan_enabled=not (self.discovery_disabled() or self.discovery or self.probe),
+            refresh_enabled=bool(self.closed_serials) or not (self.discovery_disabled() or self.discovery
+                                                              or self.probe),
             scan_ports=self.scan_ports(), discovery_off=self.discovery_disabled())

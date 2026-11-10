@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import logic
 from .system import (FROZEN, IS_LINUX, IS_MAC, IS_WINDOWS, Paths, bin_dirs, find_icon_dir, find_library_dir,
-                     find_resource, find_server, find_tool, log, read_json, run_hidden, set_log_path)
+                     find_resource, find_server, find_tool, get_setting, log, run_hidden, set_log_path)
 
 COMMANDS = {'exit': 'exit', 'showpanel': 'show-panel', 'startrecording': 'start-recording',
             'stoprecording': 'stop-recording'}
@@ -109,6 +109,9 @@ def restore_library_path():
 def build_env(scrcpy, adb, server, icon_dir):
     env = os.environ.copy()
     env['ADB'] = adb
+    if (IS_LINUX and env.get('WAYLAND_DISPLAY') and env.get('DISPLAY')
+            and not env.get('SDL_VIDEO_DRIVER') and not env.get('SDL_VIDEODRIVER')):
+        env['SDL_VIDEO_DRIVER'] = env['SDL_VIDEODRIVER'] = 'x11'
     if server:
         env['SCRCPY_SERVER_PATH'] = server
     if icon_dir:
@@ -210,8 +213,7 @@ def main(argv=None):
         log('WARNING: ffmpeg not found; recording parts are kept as separate files.')
     record_dir = args.record_dir
     if not record_dir:
-        settings = read_json(paths.settings, {})
-        record_dir = settings.get('RecordDir') if isinstance(settings, dict) else None
+        record_dir = get_setting(paths.settings, 'RecordDir')
     record_dir = str(Path(record_dir or paths.default_record_dir).expanduser())
 
     for item in paths.control.glob('*'):

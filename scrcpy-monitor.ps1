@@ -1,25 +1,36 @@
 <#
 .SYNOPSIS
     Mirrors one or more adb devices with the scrcpy built in this repository, keeps each window open while
-    the device restarts, and records the screen on demand.
+    the device restarts, arranges the windows without overlapping, and records the screen on demand.
 
 .DESCRIPTION
     One scrcpy window is opened per device with --reconnect, so the window stays open while the device
     restarts and mirroring resumes in the same window. Every scrcpy process runs without a console window.
-    Closing a scrcpy window stops monitoring that device; it can be reopened from the control panel, the
-    tray icon or by running the monitor again. Once every window is closed, the monitor exits unless the
-    control panel is open. The control panel opens when the first device window starts; closing it keeps
-    the monitor in the tray.
+    A restarting device stays in the list as "Device restarting"; a device that is turned off, unplugged or
+    closed is removed from the list. Closing a scrcpy window, or "Stop and close", stops that device;
+    "Refresh" in the control panel or tray icon, or running the monitor again, shows it again. Once every
+    window is closed, the monitor exits unless the control panel is open. The control panel opens when the
+    first device window starts; closing it keeps the monitor in the tray. Global actions are in its File,
+    Recording, Window and Help menus, and a column header click sorts the device list.
+
+    Device windows are arranged on the screen of the control panel: one device is centered, several are
+    placed around the center without overlapping, each at 100% when it fits and scaled down only to fit.
+    They are arranged again when a device window opens or closes, and from Window > "Arrange windows" or
+    "Arrange device windows" in the tray icon. Any of --window-x, --window-y, --window-width,
+    --window-height or --fullscreen turns automatic arranging off.
 
     Recording runs in a separate hidden scrcpy process that can be started and stopped at any time with the
     record button in the top-right corner of each scrcpy window (or Alt+E), the control panel, the tray icon
     or -Command. A device restart while recording continues the recording in a new part, and the parts are
-    joined into one MP4 with ffmpeg when the recording stops:
+    joined into one MP4 with ffmpeg when the recording stops. With ffmpeg, the device name is added as a
+    header above the screen in every saved recording:
         <RecordDir>\<Device Name>\Screen_Recording_<Device Name>_<yyyyMMdd_HHmmss>.mp4
     If the device cannot run a second hardware video encoder, the recorder switches to a software encoder.
 
     "Record combined" in the control panel records the selected devices as usual and, once all of them have
-    stopped, also joins their recordings into one grid video (no audio, synchronized to about one second):
+    stopped, also joins their recordings into one grid video with each device name above its screen (no
+    audio, synchronized to about one second). Every screen is scaled by the same factor, so a smaller
+    device keeps its real size and proportions instead of being stretched:
         <RecordDir>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
 
     The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
@@ -31,8 +42,9 @@
     panel or tray icon connects a device by IP address, and "Disconnect" saves any recording, closes the
     window and ends the adb connection of a Wi-Fi device until it is reconnected.
 
-    At startup (unless -NoUpdateCheck) and from "Check for updates" in the control panel or tray icon, the
-    monitor checks its GitHub repository for a newer release. A portable package built with
+    At startup (unless -NoUpdateCheck is given or Help > "Check for updates automatically" is turned off)
+    and from "Check for updates" in the control panel or tray icon, the monitor checks its GitHub
+    repository for a newer release. A portable package built with
     package-portable.ps1 then updates itself and restarts; a git checkout (repository of the origin remote)
     only offers to open the release page.
 
@@ -264,6 +276,13 @@ function New-HiddenStartInfo([string]$FileName, [string]$Arguments, [switch]$Scr
     $psi
 }
 
+function Close-RedirectedProcess([System.Diagnostics.Process]$Process) {
+    if (-not $Process) { return }
+    try { $Process.StandardOutput.Dispose() } catch { }
+    try { $Process.StandardError.Dispose() } catch { }
+    $Process.Dispose()
+}
+
 function Invoke-Hidden([string]$FileName, [string[]]$Arguments, [int]$TimeoutMs = 10000, [switch]$ScrcpyEnvironment, [switch]$IncludeStdErr) {
     $psi = New-HiddenStartInfo $FileName (ConvertTo-ArgumentString $Arguments) -ScrcpyEnvironment:$ScrcpyEnvironment
     $psi.RedirectStandardOutput = $true
@@ -284,7 +303,7 @@ function Invoke-Hidden([string]$FileName, [string[]]$Arguments, [int]$TimeoutMs 
         Write-Log "$FileName $($psi.Arguments) failed: $($_.Exception.Message)"
         return ''
     } finally {
-        if ($process) { $process.Dispose() }
+        Close-RedirectedProcess $process
     }
 }
 
@@ -469,6 +488,11 @@ function New-Session([string]$DeviceSerial, [string]$State) {
         UserClosed         = $false
         Disconnected       = $false
         MissingSince       = $null
+        GoneSince          = $null
+        PowerWatch         = $null
+        NextPowerWatch     = Get-Date
+        RestartingAt       = $null
+        PoweringOff        = $false
         PendingAction      = $null
         MovedTo            = $null
         MoveAddress        = $null
@@ -477,6 +501,7 @@ function New-Session([string]$DeviceSerial, [string]$State) {
         DisplayStartedAt   = $null
         WindowShown        = $false
         ScrcpyPid          = 0
+        NaturalSize        = 0
         NextWake           = Get-Date
         DisplayFailures    = 0
         NextDisplayAttempt = Get-Date
@@ -569,6 +594,162 @@ function Test-WindowShown($Session) {
     } catch { return $false }
 }
 
+function Request-Arrange {
+    if (-not $script:AutoArrange) { return }
+    if (-not $script:ArrangeRequestedAt) { $script:ArrangeRequestedAt = Get-Date }
+}
+
+function Update-Arrange {
+    if (-not $script:ArrangeRequestedAt) { return }
+    $opening = @($script:Sessions.Values | Where-Object { $_.Display -and -not $_.WindowShown -and -not $_.Display.HasExited })
+    if ($opening.Count -and ((Get-Date) - $script:ArrangeRequestedAt).TotalSeconds -lt 10) { return }
+    Invoke-ArrangeWindows
+}
+
+function Initialize-WindowArrange {
+    if ('ScrcpyMonitor.WindowArrange' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+namespace ScrcpyMonitor {
+    using System;
+    using System.Runtime.InteropServices;
+    public static class WindowArrange {
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Monitor; public RECT Work; public uint Flags; }
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+        [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        public static IntPtr EnterPerMonitor() {
+            try { return SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { return IntPtr.Zero; }
+        }
+        public static void Leave(IntPtr previous) {
+            if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+        }
+        public static bool GetMonitor(IntPtr hWnd, out RECT monitor, out RECT work) {
+            var info = new MONITORINFO();
+            info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+            bool found = GetMonitorInfo(MonitorFromWindow(hWnd, hWnd == IntPtr.Zero ? 1u : 2u), ref info);
+            monitor = info.Monitor;
+            work = info.Work;
+            return found;
+        }
+    }
+}
+'@
+}
+
+function Get-ArrangeArea {
+    $anchor = [IntPtr]::Zero
+    if ($script:Panel -and -not $script:Panel.IsDisposed -and $script:Panel.IsHandleCreated) { $anchor = $script:Panel.Handle }
+    $monitor = New-Object ScrcpyMonitor.WindowArrange+RECT
+    $work = New-Object ScrcpyMonitor.WindowArrange+RECT
+    if (-not [ScrcpyMonitor.WindowArrange]::GetMonitor($anchor, [ref]$monitor, [ref]$work)) { return $null }
+    New-Object System.Drawing.Rectangle($work.Left, $work.Top, ($work.Right - $work.Left), ($work.Bottom - $work.Top))
+}
+
+function Get-WindowLayout([System.Drawing.Rectangle]$Area, $Items, [int]$Gap = 8) {
+    $count = @($Items).Count
+    if (-not $count) { return $null }
+    $frameHeight = ($Items | Measure-Object -Property FrameHeight -Maximum).Maximum
+    $best = $null
+    $bestScore = 0
+    for ($rows = 1; $rows -le $count; $rows++) {
+        $columns = [int][Math]::Ceiling($count / $rows)
+        if ([int][Math]::Ceiling($count / $columns) -ne $rows) { continue }
+        $groups = @(for ($start = 0; $start -lt $count; $start += $columns) { , @($Items[$start..([Math]::Min($start + $columns, $count) - 1)]) })
+        $height = ($Area.Height - ($rows + 1) * $Gap) / $rows - $frameHeight
+        foreach ($group in $groups) {
+            $aspect = ($group | Measure-Object -Property Aspect -Sum).Sum
+            $frames = ($group | Measure-Object -Property FrameWidth -Sum).Sum
+            $height = [Math]::Min($height, ($Area.Width - ($group.Count + 1) * $Gap - $frames) / $aspect)
+        }
+        if ($height -lt 50) { continue }
+        $score = 0
+        foreach ($item in $Items) { $h = [Math]::Min($height, $item.MaxHeight); $score += $h * $h * $item.Aspect }
+        if ($score -gt $bestScore * 1.001) { $bestScore = $score; $best = @{ Groups = $groups; Height = $height } }
+    }
+    if (-not $best) { return $null }
+    $rowSizes = @(foreach ($group in $best.Groups) {
+        $sizes = @(foreach ($item in $group) {
+            $clientHeight = [Math]::Min($best.Height, $item.MaxHeight)
+            New-Object System.Drawing.Size([int][Math]::Round($clientHeight * $item.Aspect + $item.FrameWidth), [int][Math]::Round($clientHeight + $item.FrameHeight))
+        })
+        , $sizes
+    })
+    $totalHeight = (@($rowSizes | ForEach-Object { ($_ | Measure-Object -Property Height -Maximum).Maximum }) | Measure-Object -Sum).Sum + ($best.Groups.Count - 1) * $Gap
+    $y = $Area.Y + [int](($Area.Height - $totalHeight) / 2)
+    $rects = New-Object System.Collections.ArrayList
+    foreach ($sizes in $rowSizes) {
+        $rowHeight = ($sizes | Measure-Object -Property Height -Maximum).Maximum
+        $rowWidth = ($sizes | Measure-Object -Property Width -Sum).Sum + ($sizes.Count - 1) * $Gap
+        $x = $Area.X + [int](($Area.Width - $rowWidth) / 2)
+        foreach ($size in $sizes) {
+            [void]$rects.Add((New-Object System.Drawing.Rectangle($x, ($y + [int](($rowHeight - $size.Height) / 2)), $size.Width, $size.Height)))
+            $x += $size.Width + $Gap
+        }
+        $y += $rowHeight + $Gap
+    }
+    , $rects.ToArray()
+}
+
+function Invoke-ArrangeWindows {
+    $script:ArrangeRequestedAt = $null
+    Initialize-WindowArrange
+    $previous = [ScrcpyMonitor.WindowArrange]::EnterPerMonitor()
+    try { Set-WindowArrangement } finally { [ScrcpyMonitor.WindowArrange]::Leave($previous) }
+}
+
+function Set-WindowArrangement {
+    $isFollowUp = $script:ArrangeFollowUp
+    $script:ArrangeFollowUp = $false
+    $items = New-Object System.Collections.ArrayList
+    foreach ($session in @($script:Sessions.Values | Where-Object { $_.Display -and $_.WindowShown -and $_.ScrcpyPid } | Sort-Object Title)) {
+        $handle = [IntPtr]::Zero
+        try {
+            $process = [System.Diagnostics.Process]::GetProcessById($session.ScrcpyPid)
+            try { $handle = $process.MainWindowHandle } finally { $process.Dispose() }
+        } catch { continue }
+        if ($handle -eq [IntPtr]::Zero -or [ScrcpyMonitor.WindowArrange]::IsIconic($handle) -or [ScrcpyMonitor.WindowArrange]::IsZoomed($handle)) { continue }
+        $window = New-Object ScrcpyMonitor.WindowArrange+RECT
+        $client = New-Object ScrcpyMonitor.WindowArrange+RECT
+        if (-not [ScrcpyMonitor.WindowArrange]::GetWindowRect($handle, [ref]$window) -or -not [ScrcpyMonitor.WindowArrange]::GetClientRect($handle, [ref]$client)) { continue }
+        if ($client.Right -le 0 -or $client.Bottom -le 0) { continue }
+        $outer = New-Object System.Drawing.Rectangle($window.Left, $window.Top, ($window.Right - $window.Left), ($window.Bottom - $window.Top))
+        $monitor = New-Object ScrcpyMonitor.WindowArrange+RECT
+        $work = New-Object ScrcpyMonitor.WindowArrange+RECT
+        if ([ScrcpyMonitor.WindowArrange]::GetMonitor($handle, [ref]$monitor, [ref]$work) -and $monitor.Left -eq $window.Left -and $monitor.Top -eq $window.Top -and $monitor.Right -eq $window.Right -and $monitor.Bottom -eq $window.Bottom) { continue }
+        if (-not $session.NaturalSize) { $session.NaturalSize = [Math]::Max($client.Right, $client.Bottom) }
+        $aspect = $client.Right / $client.Bottom
+        [void]$items.Add([pscustomobject]@{
+            Handle      = $handle
+            Aspect      = $aspect
+            FrameWidth  = $outer.Width - $client.Right
+            FrameHeight = $outer.Height - $client.Bottom
+            MaxHeight   = $session.NaturalSize / [Math]::Max(1, $aspect)
+            Work        = New-Object System.Drawing.Rectangle($work.Left, $work.Top, ($work.Right - $work.Left), ($work.Bottom - $work.Top))
+        })
+    }
+    if (-not $items.Count) { return }
+    $area = Get-ArrangeArea
+    if (-not $area) { return }
+    $rects = Get-WindowLayout $area $items.ToArray()
+    if (-not $rects) { return }
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $r = $rects[$i]
+        [void][ScrcpyMonitor.WindowArrange]::SetWindowPos($items[$i].Handle, [IntPtr]::Zero, $r.X, $r.Y, $r.Width, $r.Height, 0x4214)
+    }
+    if (-not $isFollowUp -and @($items | Where-Object { $_.Work -ne $area }).Count) {
+        $script:ArrangeFollowUp = $true
+        $script:ArrangeRequestedAt = Get-Date
+    } else {
+        Write-Log "Arranged $($items.Count) device window(s)."
+    }
+}
+
 function Update-Display($Session, $Devices, [ref]$Ready) {
     $now = Get-Date
     if ($Session.Display) {
@@ -576,6 +757,7 @@ function Update-Display($Session, $Devices, [ref]$Ready) {
             if ($Session.WindowShown) { return }
             if (Test-WindowShown $Session) {
                 $Session.WindowShown = $true
+                Request-Arrange
                 return
             }
             if ($now -ge $Session.NextWake) {
@@ -590,11 +772,14 @@ function Update-Display($Session, $Devices, [ref]$Ready) {
         $ranSeconds = ($now - $Session.DisplayStartedAt).TotalSeconds
         $Session.Display.Dispose()
         $Session.Display = $null
+        if ($Session.WindowShown) { Request-Arrange }
+        $Session.WindowShown = $false
+        $Session.NaturalSize = 0
 
         if ($exitCode -eq 0) {
-            $Session.UserClosed = $true
-            Write-Log "[$($Session.Serial)] scrcpy window closed by user; no longer monitoring."
-            Stop-Recording $Session
+            Write-Log "[$($Session.Serial)] scrcpy window closed by user; removed from the list."
+            Remove-Device $Session -UserClosed
+            $script:ClosedByUser = $true
             return
         }
 
@@ -840,7 +1025,7 @@ function Complete-Recording([string]$Title, [string]$Base, [string[]]$AllParts, 
     if ($parts.Count -eq 1) {
         try {
             Move-Item -LiteralPath $parts[0] -Destination $output
-            Show-Notification "Recording saved: $output"
+            Add-RecordingHeader $Title $output $(if ($Member) { $Member.Group })
             foreach ($segment in $segments) { $segment.Path = $output }
         } finally {
             if ($Member) { Complete-CombineMember $Member $segments }
@@ -864,7 +1049,7 @@ function Complete-Recording([string]$Title, [string]$Base, [string[]]$AllParts, 
     [System.IO.File]::WriteAllLines($listFile, [string[]]$lines)
     [void]$steps.Add(@('-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', $listFile, '-c', 'copy', '-movflags', '+faststart', $output))
 
-    $merge = [pscustomobject]@{ Process = $null; Steps = $steps; Parts = $parts; Temps = @($temps); Output = $output; ListFile = $listFile; Member = $Member; Segments = $segments }
+    $merge = [pscustomobject]@{ Process = $null; Steps = $steps; Parts = $parts; Temps = @($temps); Output = $output; ListFile = $listFile; Member = $Member; Segments = $segments; Title = $Title }
     try {
         $merge.Process = Start-MergeStep $merge
     } catch {
@@ -906,7 +1091,7 @@ function Update-Merges([int]$TimeoutMs = 0) {
             if (-not $KeepParts) {
                 foreach ($part in $merge.Parts) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
             }
-            Show-Notification "Recording saved: $($merge.Output)"
+            Add-RecordingHeader $merge.Title $merge.Output $(if ($merge.Member) { $merge.Member.Group })
             if ($merge.Member) {
                 $position = 0.0
                 foreach ($segment in $merge.Segments) {
@@ -1039,6 +1224,36 @@ function Get-CombineEncoderArgs {
     $script:CombineEncoderArgs
 }
 
+function New-CombineHeader([string]$Text, [int]$Width, [int]$Height, [string]$Path) {
+    $bitmap = New-Object System.Drawing.Bitmap $Width, $Height
+    try {
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $format = New-Object System.Drawing.StringFormat
+        try {
+            $graphics.Clear([System.Drawing.Color]::FromArgb(40, 40, 40))
+            $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+            $format.Alignment = [System.Drawing.StringAlignment]::Center
+            $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $format.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+            $format.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+            $size = [math]::Max(8.0, $Height * 0.55)
+            $font = New-Object System.Drawing.Font('Segoe UI', [single]$size, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+            while ($size -gt 8 -and $graphics.MeasureString($Text, $font).Width -gt $Width - 8) {
+                $font.Dispose()
+                $size = [math]::Max(8.0, $size - 1)
+                $font = New-Object System.Drawing.Font('Segoe UI', [single]$size, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+            }
+            try {
+                $graphics.DrawString($Text, $font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(4, 0, ($Width - 8), $Height)), $format)
+            } finally { $font.Dispose() }
+        } finally {
+            $format.Dispose()
+            $graphics.Dispose()
+        }
+        $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally { $bitmap.Dispose() }
+}
+
 function Start-Combine($Group, $Members) {
     $t0 = $null
     foreach ($member in $Members) {
@@ -1051,21 +1266,38 @@ function Start-Combine($Group, $Members) {
     $cols = if ($count -le 3) { $count } else { [int][math]::Ceiling([math]::Sqrt($count)) }
     $rows = [int][math]::Ceiling($count / $cols)
     $sizes = @(foreach ($member in $Members) { , (Get-VideoSize $member.Segments[0].Path) })
-    $cellH = [double][math]::Min(1280, ($sizes | ForEach-Object { $_[1] } | Measure-Object -Maximum).Maximum)
-    $cellW = [double]($sizes | ForEach-Object { $_[0] * $cellH / $_[1] } | Measure-Object -Maximum).Maximum
-    $scale = [math]::Min(1.0, [math]::Min(3840 / ($cols * $cellW), 2160 / ($rows * $cellH)))
-    $cellW = [int][math]::Max(16, [math]::Floor($cellW * $scale / 2) * 2)
-    $cellH = [int][math]::Max(16, [math]::Floor($cellH * $scale / 2) * 2)
+    $maxW = [double]($sizes | ForEach-Object { $_[0] } | Measure-Object -Maximum).Maximum
+    $maxH = [double]($sizes | ForEach-Object { $_[1] } | Measure-Object -Maximum).Maximum
+    $factor = [math]::Min([math]::Min(1.0, 1280 / $maxH), [math]::Min(3840 / ($cols * $maxW), 2160 / ($rows * $maxH * 1.05)))
+    $cellW = [int][math]::Max(16, [math]::Floor($maxW * $factor / 2) * 2)
+    $cellH = [int][math]::Max(16, [math]::Floor($maxH * $factor / 2) * 2)
+    $headerH = [int][math]::Max(16, [math]::Floor($cellH / 40) * 2)
+    $pitch = $cellH + $headerH
 
-    $chain = "scale=${cellW}:${cellH}:force_original_aspect_ratio=decrease:force_divisible_by=2:eval=frame,pad=${cellW}:${cellH}:(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1"
+    $fit = "min($($factor.ToString('0.000000', [Globalization.CultureInfo]::InvariantCulture)),min($cellW/iw,$cellH/ih))"
+    $chain = "scale=w='max(2,trunc(iw*$fit/2)*2)':h='max(2,trunc(ih*$fit/2)*2)':eval=frame,pad=${cellW}:${cellH}:(ow-iw)/2:0:eval=frame,setsar=1"
     $inputs = New-Object System.Collections.Generic.List[string]
     $filters = New-Object System.Collections.Generic.List[string]
     $overlays = New-Object System.Collections.Generic.List[string]
+    $headers = New-Object System.Collections.Generic.List[string]
+    $stamp = '{0:yyyyMMdd_HHmmss}_{1}' -f (Get-Date), [guid]::NewGuid().ToString('N').Substring(0, 8)
+    for ($m = 0; $m -lt $count; $m++) {
+        $path = Join-Path $script:LogDir "combine-$stamp-header$($m + 1).png"
+        try {
+            New-CombineHeader $Members[$m].Title $cellW $headerH $path
+            $headers.Add($path)
+        } catch {
+            Write-Log "Could not create the combined recording header for $($Members[$m].Title): $($_.Exception.Message)"
+            foreach ($header in $headers) { Remove-Item -LiteralPath $header -Force -ErrorAction SilentlyContinue }
+            $headers.Clear()
+            break
+        }
+    }
     $total = 0.0
     $index = 0
     for ($m = 0; $m -lt $count; $m++) {
         $x = ($m % $cols) * $cellW
-        $y = [int][math]::Floor($m / $cols) * $cellH
+        $y = [int][math]::Floor($m / $cols) * $pitch + $headerH
         foreach ($segment in $Members[$m].Segments) {
             $offset = [math]::Max(0.0, ($segment.Start - $t0).TotalSeconds)
             $total = [math]::Max($total, $offset + $segment.Duration)
@@ -1075,7 +1307,16 @@ function Start-Combine($Group, $Members) {
             $index++
         }
     }
-    $graph = (@("color=c=black:s=$($cols * $cellW)x$($rows * $cellH):r=30:d=$(Format-Seconds $total)[b0]") + $filters + $overlays) -join ';'
+    $base = "color=c=black:s=$($cols * $cellW)x$($rows * $pitch):r=30:d=$(Format-Seconds $total)"
+    $headerFilters = New-Object System.Collections.Generic.List[string]
+    for ($m = 0; $m -lt $headers.Count; $m++) {
+        $inputs.AddRange([string[]]@('-i', $headers[$m]))
+        $source = if ($m) { "[h$m]" } else { "$base[h0];[h0]" }
+        $target = if ($m -eq $headers.Count - 1) { '[b0]' } else { "[h$($m + 1)]" }
+        $headerFilters.Add("$source[$($index + $m):v]overlay=x=$(($m % $cols) * $cellW):y=$([int][math]::Floor($m / $cols) * $pitch)$target")
+    }
+    if (-not $headers.Count) { $headerFilters.Add("$base[b0]") }
+    $graph = (@($headerFilters) + $filters + $overlays) -join ';'
 
     $folder = Join-Path $RecordDir 'Combined'
     [void](New-Item -ItemType Directory -Force -Path $folder)
@@ -1091,6 +1332,7 @@ function Start-Combine($Group, $Members) {
                  (Get-CombineEncoderArgs) + @('-pix_fmt', 'yuv420p', '-r', '30', '-movflags', '+faststart', '-t', (Format-Seconds $total), $temp)
     $argumentString = ConvertTo-ArgumentString $arguments
     if ($argumentString.Length -gt 30000) {
+        foreach ($header in $headers) { Remove-Item -LiteralPath $header -Force -ErrorAction SilentlyContinue }
         Show-Notification 'Combined recording skipped: too many recording parts. Each device recording was saved.' 'Warning'
         return
     }
@@ -1098,9 +1340,15 @@ function Start-Combine($Group, $Members) {
     $log = Join-Path $script:LogDir ('combine-{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
     $psi = New-HiddenStartInfo $script:Ffmpeg $argumentString
     $psi.EnvironmentVariables['FFREPORT'] = 'file=' + (($log -replace '\\', '/') -replace ':', '\:') + ':level=16'
-    $process = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $process = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        foreach ($header in $headers) { Remove-Item -LiteralPath $header -Force -ErrorAction SilentlyContinue }
+        throw
+    }
     try { $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
-    [void]$script:Combines.Add([pscustomobject]@{ Process = $process; Output = $output; Temp = $temp; Log = $log; Size = -1L; ProgressAt = Get-Date })
+    $sources = @($Members | ForEach-Object { $_.Segments } | ForEach-Object { $_.Path } | Select-Object -Unique)
+    [void]$script:Combines.Add([pscustomobject]@{ Process = $process; Output = $output; Temp = $temp; Log = $log; Headers = @($headers); Sources = $sources; Size = -1L; ProgressAt = Get-Date })
     Write-Log "Combining $count device recordings ($index part(s), $(Format-Seconds $total)s) into $output (log: $log)"
     Show-Notification "Combining $count device recordings into one video..."
 }
@@ -1125,6 +1373,7 @@ function Update-Combines([int]$TimeoutMs = 0) {
         $exitCode = if ($combine.Process.HasExited) { $combine.Process.ExitCode } else { -1 }
         $combine.Process.Dispose()
         $script:Combines.Remove($combine)
+        foreach ($header in $combine.Headers) { Remove-Item -LiteralPath $header -Force -ErrorAction SilentlyContinue }
         if ($exitCode -eq 0 -and (Test-VideoFile $combine.Temp)) {
             try {
                 Move-Item -LiteralPath $combine.Temp -Destination $combine.Output -ErrorAction Stop
@@ -1151,8 +1400,138 @@ function Stop-Combines {
         } catch { }
         $script:Combines.Remove($combine)
         Remove-Item -LiteralPath $combine.Temp -Force -ErrorAction SilentlyContinue
+        foreach ($header in $combine.Headers) { Remove-Item -LiteralPath $header -Force -ErrorAction SilentlyContinue }
         Write-Log "Combined recording $($combine.Output) cancelled at exit; each device recording was saved."
         Show-Notification 'The combined recording was not finished before exit and was cancelled. Each device recording was saved.' 'Warning'
+    }
+}
+
+function Add-RecordingHeader([string]$Title, [string]$Path, $Group = $null) {
+    if (-not $script:Ffmpeg -or -not $script:Ffprobe) {
+        Show-Notification "Recording saved: $Path"
+        return
+    }
+    [void]$script:Labels.Add([pscustomobject]@{ Title = $Title; Path = $Path; Group = $Group; Process = $null; Temp = ($Path -replace '\.mp4$', '_labeling.mp4'); Header = $null; Size = -1L; ProgressAt = Get-Date })
+}
+
+function Test-LabelReady($Label) {
+    if ($Label.Group -and -not $Label.Group.Finished) { return $false }
+    -not @($script:Combines | Where-Object { $_.Sources -contains $Label.Path }).Count
+}
+
+function Get-FpsPassthroughArgs {
+    if (-not $script:FpsPassthroughArgs) {
+        $text = Invoke-Hidden $script:Ffmpeg @('-version') 15000
+        $major = if ($text -match 'ffmpeg version n?(\d+)\.(\d+)') { [int]$Matches[1] } else { -1 }
+        $old = $major -ge 0 -and ($major -lt 5 -or ($major -eq 5 -and [int]$Matches[2] -lt 1))
+        $fpsArgs = if ($old) { @('-vsync', 'passthrough') } else { @('-fps_mode', 'passthrough') }
+        if ($major -lt 0 -or $major -ge 4) { $fpsArgs += @('-enc_time_base', '1:60000') }
+        if (-not $text) { return $fpsArgs }
+        $script:FpsPassthroughArgs = $fpsArgs
+    }
+    $script:FpsPassthroughArgs
+}
+
+function Start-Label($Label) {
+    $size = Get-VideoSize $Label.Path
+    $width = [int][math]::Max(16, [math]::Ceiling($size[0] / 2) * 2)
+    $height = [int][math]::Max(16, [math]::Ceiling($size[1] / 2) * 2)
+    $headerH = [int][math]::Max(16, [math]::Floor($height / 40) * 2)
+    $Label.Header = Join-Path $script:LogDir ('label-{0}.png' -f [guid]::NewGuid().ToString('N'))
+    New-CombineHeader $Label.Title $width $headerH $Label.Header
+    $fit = "min($width/iw,$height/ih)"
+    $graph = "[0:v]scale=w='max(2,trunc(iw*$fit/2)*2)':h='max(2,trunc(ih*$fit/2)*2)':eval=frame,pad=${width}:$($height + $headerH):(ow-iw)/2:$headerH+($height-ih)/2:eval=frame,setsar=1[v];[v][1:v]overlay=x=0:y=0[out]"
+    $arguments = @('-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-reinit_filter', '0', '-i', $Label.Path, '-i', $Label.Header,
+                   '-filter_complex', $graph, '-map', '[out]', '-map', '0:a?', '-c:a', 'copy') +
+                 (Get-CombineEncoderArgs) + @('-bf', '0', '-pix_fmt', 'yuv420p') + (Get-FpsPassthroughArgs) + @('-movflags', '+faststart', $Label.Temp)
+    $Label.Process = [System.Diagnostics.Process]::Start((New-HiddenStartInfo $script:Ffmpeg (ConvertTo-ArgumentString $arguments)))
+    try { $Label.Process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
+    $Label.ProgressAt = Get-Date
+    Write-Log "Adding the device name header to $($Label.Path)"
+}
+
+function Complete-Label($Label, [int]$ExitCode) {
+    $script:Labels.Remove($Label)
+    if ($Label.Process) {
+        try {
+            if (-not $Label.Process.HasExited) {
+                Stop-ProcessTree $Label.Process.Id
+                [void]$Label.Process.WaitForExit(5000)
+            }
+            $Label.Process.Dispose()
+        } catch { }
+        $Label.Process = $null
+    }
+    if ($Label.Header) { Remove-Item -LiteralPath $Label.Header -Force -ErrorAction SilentlyContinue }
+    $labeled = $false
+    if ($ExitCode -eq 0 -and (Test-VideoFile $Label.Temp)) {
+        try {
+            [System.IO.File]::Replace($Label.Temp, $Label.Path, [NullString]::Value)
+            $labeled = $true
+        } catch {
+            Write-Log "Could not replace $($Label.Path) with the version that has the device name header: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log "Could not add the device name header to $($Label.Path) (ffmpeg exit code $ExitCode); the recording was kept without it."
+    }
+    Remove-Item -LiteralPath $Label.Temp -Force -ErrorAction SilentlyContinue
+    if ($labeled) {
+        Show-Notification "Recording saved: $($Label.Path)"
+    } else {
+        Show-Notification "Recording saved without the device name header: $($Label.Path)"
+    }
+}
+
+function Update-Labels([int]$TimeoutMs = 0, [switch]$Force) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ($script:Labels.Count) {
+        $label = @($script:Labels | Where-Object { $_.Process })[0]
+        if (-not $label) {
+            $label = @($script:Labels | Where-Object { $Force -or (Test-LabelReady $_) })[0]
+            if (-not $label) { return }
+            try {
+                Start-Label $label
+            } catch {
+                Write-Log "Could not start adding the device name header to $($label.Path): $($_.Exception.Message)"
+                Complete-Label $label -1
+                continue
+            }
+        }
+        $wait = [int][math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+        if (-not $label.Process.WaitForExit($wait)) {
+            $size = 0L
+            try { $file = New-Object System.IO.FileInfo $label.Temp; if ($file.Exists) { $size = $file.Length } } catch { }
+            if ($size -ne $label.Size) {
+                $label.Size = $size
+                $label.ProgressAt = Get-Date
+                return
+            }
+            if (((Get-Date) - $label.ProgressAt).TotalMinutes -lt 5) { return }
+            Write-Log "Adding the device name header to $($label.Path) made no progress for 5 minutes; stopping ffmpeg."
+            Stop-ProcessTree $label.Process.Id
+            [void]$label.Process.WaitForExit(5000)
+        }
+        $exitCode = if ($label.Process.HasExited) { $label.Process.ExitCode } else { -1 }
+        Complete-Label $label $exitCode
+    }
+}
+
+function Stop-Labels {
+    foreach ($label in @($script:Labels)) {
+        $script:Labels.Remove($label)
+        try {
+            if ($label.Process) {
+                if (-not $label.Process.HasExited) {
+                    Stop-ProcessTree $label.Process.Id
+                    [void]$label.Process.WaitForExit(5000)
+                }
+                $label.Process.Dispose()
+            }
+        } catch { }
+        Remove-Item -LiteralPath $label.Temp -Force -ErrorAction SilentlyContinue
+        if ($label.Header) { Remove-Item -LiteralPath $label.Header -Force -ErrorAction SilentlyContinue }
+        Write-Log "Device name header for $($label.Path) cancelled at exit; the recording was kept without it."
+        Show-Notification "Recording saved without the device name header: $($label.Path)"
     }
 }
 
@@ -1198,14 +1577,14 @@ function Complete-AdbJob($Job, [int]$TimeoutSeconds = 20) {
     $text = ''
     if ($Job.Output.Wait(1000)) { $text += $Job.Output.Result }
     if ($Job.Error.Wait(1000)) { $text += $Job.Error.Result }
-    $Job.Process.Dispose()
+    Close-RedirectedProcess $Job.Process
     $text.Trim()
 }
 
 function Stop-AdbJobs {
     foreach ($job in @(@($script:Connects) + @($script:Discovery) | Where-Object { $_ })) {
         try { if (-not $job.Process.HasExited) { $job.Process.Kill() } } catch { }
-        $job.Process.Dispose()
+        Close-RedirectedProcess $job.Process
     }
     $script:Connects.Clear()
     $script:Discovery = $null
@@ -1233,7 +1612,7 @@ function Update-Connects($Devices) {
         Write-Log "adb connect $($job.Address): $output"
         $connected = $output -match '^(already )?connected to '
         if ($connected -and -not $job.Manual -and $output -notmatch '^already') {
-            $usb = @($Devices.Keys | Where-Object { $Devices[$_] -eq 'device' -and (Get-ConnectionType $_) -eq 'USB' -and -not $script:MovedUsb.ContainsKey($_) -and -not ($script:Sessions.ContainsKey($_) -and $script:Sessions[$_].UserClosed) })
+            $usb = @($Devices.Keys | Where-Object { $Devices[$_] -eq 'device' -and (Get-ConnectionType $_) -eq 'USB' -and -not $script:MovedUsb.ContainsKey($_) -and -not ($script:Sessions.ContainsKey($_) -and $script:Sessions[$_].UserClosed) -and -not $script:ClosedSerials.ContainsKey($_) })
             if ($usb.Count -and $usb -contains (Get-DeviceProp $job.Address 'ro.serialno')) {
                 Write-Log "$($job.Address) is a device already connected over USB; disconnecting the Wi-Fi connection."
                 [void](Invoke-Adb @('disconnect', $job.Address) 5000)
@@ -1341,10 +1720,18 @@ function Update-Discovery($Devices) {
 }
 
 function Connect-Found([string]$Address, [string]$Source, $Devices, [datetime]$Now) {
-    if ($Devices.ContainsKey($Address) -or $script:Sessions.ContainsKey($Address)) { return }
+    if ($script:Sessions.ContainsKey($Address)) { return }
+    $state = $Devices[$Address]
+    if ($state -and $state -ne 'offline') { return }
     if ($script:DiscoveryRetry.ContainsKey($Address) -and $Now -lt $script:DiscoveryRetry[$Address]) { return }
     $script:DiscoveryRetry[$Address] = $Now.AddSeconds(60)
-    Write-Log "Found Wi-Fi device $Address ($Source); connecting."
+    if ($state) {
+        Write-Log "Wi-Fi device $Address is offline ($Source); reconnecting."
+        [void](Invoke-Adb @('disconnect', $Address) 5000)
+        $Devices.Remove($Address)
+    } else {
+        Write-Log "Found Wi-Fi device $Address ($Source); connecting."
+    }
     Start-Connect $Address $false
 }
 
@@ -1481,6 +1868,7 @@ function Invoke-Tick {
     if ($script:Exiting) { return }
     Update-Merges
     Update-Combines
+    Update-Labels
     Update-CombineHandovers
 
     $now = Get-Date
@@ -1498,9 +1886,16 @@ function Invoke-Tick {
     }
     $targets = if ($Serial.Count) { $Serial } else { @($devices.Keys | Where-Object { $devices[$_] -match '^(device|unauthorized|authorizing)$' }) + @($script:Sessions.Keys) | Select-Object -Unique }
     $targets = @($targets | Where-Object { -not (Test-MovedAway $_ $devices) })
+    foreach ($closedSerial in @($script:ClosedSerials.Keys)) {
+        if ($devices[$closedSerial] -eq 'device') { $script:ClosedSerials[$closedSerial] = $true }
+        elseif ($script:ClosedSerials[$closedSerial] -and -not $devices.ContainsKey($closedSerial)) {
+            $script:ClosedSerials.Remove($closedSerial)
+            Write-Log "[$closedSerial] Closed device disconnected; it is shown again when it reconnects."
+        }
+    }
 
     foreach ($deviceSerial in $targets) {
-        if ($script:RemovedSerials.Contains($deviceSerial)) { continue }
+        if ($script:RemovedSerials.Contains($deviceSerial) -or $script:ClosedSerials.ContainsKey($deviceSerial)) { continue }
         $session = if ($script:Sessions.ContainsKey($deviceSerial)) { $script:Sessions[$deviceSerial] } else { New-Session $deviceSerial $devices[$deviceSerial] }
         if ($session.PendingAction -and -not $session.Stopping) { Invoke-PendingAction $session }
         if ($session.UserClosed) { continue }
@@ -1508,11 +1903,24 @@ function Invoke-Tick {
         $state = if ($devices.ContainsKey($deviceSerial)) { $devices[$deviceSerial] } else { 'missing' }
         if ($state -ne $session.LastState) {
             Write-Log "[$deviceSerial] adb state: $state"
-            if ($state -eq 'device') { $script:WifiSerials.Remove($deviceSerial) }
+            if ($state -eq 'device') {
+                $script:WifiSerials.Remove($deviceSerial)
+                $session.RestartingAt = $null
+                $session.PoweringOff = $false
+            }
             $session.LastState = $state
         }
         if ($state -eq 'device') { $session.MissingSince = $null } elseif (-not $session.MissingSince) { $session.MissingSince = $now }
+        if ($state -notin @('missing', 'offline')) { $session.GoneSince = $null } elseif (-not $session.GoneSince) { $session.GoneSince = $now }
         if ($state -ne 'device') { $session.BootedAt = $null }
+        if ($script:Standby.ContainsKey($deviceSerial)) { Stop-PowerWatch $session } else { Update-PowerWatch $session $state $now }
+        if ($state -ne 'device' -and (Test-DeviceGone $session $now)) {
+            $reason = if ($session.PoweringOff) { 'was turned off' } elseif ($session.RestartingAt) { 'did not come back after restarting' } else { 'was disconnected' }
+            Write-Log "[$deviceSerial] Device $reason; removed from the list."
+            Remove-Device $session
+            if ($session.Name) { Show-Notification "$($session.Title) $reason and was removed from the list." }
+            continue
+        }
         if ($session.Connector -and $session.Connector.HasExited) {
             $session.Connector.Dispose()
             $session.Connector = $null
@@ -1550,16 +1958,23 @@ function Invoke-Tick {
     $monitored = @($tracked | Where-Object { -not $_.Disconnected -and $_.Name -and -not $script:Standby.ContainsKey($_.Serial) })
     if ($script:OpenWindowsRequested) {
         $script:OpenWindowsRequested = $false
-        $closed = @($tracked | Where-Object { $_.UserClosed -and -not $_.Disconnected } | ForEach-Object { $_.Serial })
-        if ($closed.Count) { Open-Window $closed }
+        $reopened = $script:ClosedSerials.Count
+        if ($reopened) {
+            $script:ClosedSerials.Clear()
+            $script:ClosedByUser = $false
+            Request-Tick
+        }
         if ($script:Panel) { Show-Panel }
-        elseif (-not $closed.Count) { Show-Notification 'scrcpy monitor is already running. Right-click the tray icon for recording and settings.' }
+        elseif (-not $reopened) { Show-Notification 'scrcpy monitor is already running. Right-click the tray icon for recording and settings.' }
     }
-    if (-not ($script:Panel -and $script:Panel.Visible) -and $monitored.Count -gt 0 -and -not ($monitored | Where-Object { -not $_.UserClosed }) -and -not ($tracked | Where-Object { $_.MovedTo }) -and -not (Test-CombineActive)) {
+    $opened = @($monitored | Where-Object { -not $_.UserClosed })
+    if ($opened.Count) { $script:ClosedByUser = $false }
+    if (-not ($script:Panel -and $script:Panel.Visible) -and $script:ClosedByUser -and -not $opened.Count -and -not ($tracked | Where-Object { $_.MovedTo }) -and -not (Test-CombineActive) -and -not $script:Labels.Count) {
         Write-Log 'All scrcpy windows were closed.'
         Stop-Monitor
         return
     }
+    Update-Arrange
     Update-TrayText
 }
 
@@ -1628,6 +2043,10 @@ function Update-TrayMenu {
             $disconnect.add_Click({ param($sender, $e) Invoke-Safely { Disconnect-Device @($sender.Tag) } })
             [void]$item.DropDownItems.Add($disconnect)
         }
+        $close = New-Object System.Windows.Forms.ToolStripMenuItem 'Stop and close'
+        $close.Tag = $session.Serial
+        $close.add_Click({ param($sender, $e) Invoke-Safely { Close-Device @($sender.Tag); Update-TrayText } })
+        [void]$item.DropDownItems.Add($close)
         [void]$menu.Items.Add($item)
     }
     foreach ($session in $closed) {
@@ -1649,6 +2068,12 @@ function Update-TrayMenu {
     $stopAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s }; Update-TrayText } })
     $connectWifi = $menu.Items.Add('Connect Wi-Fi device...')
     $connectWifi.add_Click({ Invoke-Safely { Show-ConnectDialog } })
+    $refresh = $menu.Items.Add('Refresh devices')
+    $refresh.Enabled = $script:ClosedSerials.Count -gt 0 -or -not ($NoDiscovery -or $Serial.Count -or $script:Discovery -or $script:Probe)
+    $refresh.add_Click({ Invoke-Safely { Invoke-Refresh } })
+    $arrange = $menu.Items.Add('Arrange device windows')
+    $arrange.Enabled = @($sessions | Where-Object { $_.WindowShown }).Count -gt 0
+    $arrange.add_Click({ Invoke-Safely { Invoke-ArrangeWindows } })
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $openFolder = $menu.Items.Add('Open recordings folder')
     $openFolder.add_Click({ Invoke-Safely { Open-RecordFolder } })
@@ -1659,6 +2084,10 @@ function Update-TrayMenu {
     if ($script:UpdateConfig) {
         $checkUpdate = $menu.Items.Add('Check for updates')
         $checkUpdate.add_Click({ Invoke-Safely { Start-UpdateCheck $true } })
+        $autoUpdate = New-Object System.Windows.Forms.ToolStripMenuItem 'Check for updates automatically'
+        $autoUpdate.Checked = $script:AutoUpdateCheck
+        $autoUpdate.add_Click({ Invoke-Safely { Set-AutoUpdateCheck (-not $script:AutoUpdateCheck) } })
+        [void]$menu.Items.Add($autoUpdate)
     }
     $about = $menu.Items.Add('About')
     $about.add_Click({ Invoke-Safely { Show-About } })
@@ -1715,15 +2144,18 @@ function Show-About {
     $details.MaximumSize = New-Object System.Drawing.Size(480, 0)
     $details.Margin = New-Object System.Windows.Forms.Padding(3, 6, 3, 6)
     $details.Text = "Version: $version`nMirroring engine: $engine`nAuthor: $script:Author`n`n" +
-        "Mirrors one or more Android devices in separate windows and keeps each window open while its device restarts or reconnects.`n`n" +
+        "Mirrors one or more Android devices in separate windows arranged without overlapping, keeps each window open while its device restarts or reconnects, and records the screens.`n`n" +
         "- Detects devices connected over USB or Wi-Fi and shows the connection type of each.`n" +
-        "- Scan now finds devices on the local Wi-Fi network (ports 5555, 5037 and any port you connected with) and connects them automatically.`n" +
+        "- A restarting device stays in the list as Device restarting; a device that is turned off or unplugged is removed.`n" +
+        "- Closing a window or Stop and close removes the device from the list; Refresh shows it again and finds devices on the local Wi-Fi network (ports 5555, 5037 and any port you connected with).`n" +
         "- Connect a Wi-Fi device by IP address and port, disconnect it or reconnect it later; Wi-Fi devices are remembered.`n" +
         "- A device connected over both USB and Wi-Fi is mirrored over USB; the Wi-Fi connection is kept on standby.`n" +
         "- Switch a device between USB and Wi-Fi; the old entry is removed, and if the switch fails the previous connection is restored.`n" +
-        "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device.`n" +
-                "- Record combined also joins the recordings of the selected devices into one side-by-side video.`n" +
-                "- Checks for updates; the portable version updates itself.`n`n" +
+        "- Device windows open centered without overlapping, at 100% when they fit, and are arranged again when a window opens or closes (Window > Arrange windows).`n" +
+        "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device with the device name as a header above the screen.`n" +
+        "- Record combined also joins the recordings of the selected devices into one side-by-side video, with each device name above its screen; each device keeps its real size and proportions.`n" +
+        "- Click a column header to sort the list; global actions are in the File, Recording, Window and Help menus.`n" +
+        "- Checks for updates at startup (Help > Check for updates automatically) or on request; the portable version updates itself.`n`n" +
         'Built on scrcpy by Genymobile (Apache License 2.0).'
     $layout.Controls.Add($details)
 
@@ -1771,6 +2203,50 @@ function Show-About {
     $form.Activate()
 }
 
+function Show-Guide {
+    if ($script:Guide -and -not $script:Guide.IsDisposed) {
+        $script:Guide.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        $script:Guide.Activate()
+        return
+    }
+    $name = 'scrcpy-monitor-guide.html'
+    $path = Join-Path $RepoRoot $name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        [void](Show-Message "The user guide ($name) was not found in $RepoRoot." 'OK' 'Warning')
+        return
+    }
+    $area = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Scrcpy Monitor user guide'
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.Size = New-Object System.Drawing.Size([Math]::Min(1000, [int]($area.Width * 0.8)), [Math]::Min(800, [int]($area.Height * 0.85)))
+    $form.MinimumSize = New-Object System.Drawing.Size(480, 360)
+    $form.ShowInTaskbar = -not ($script:Panel -and $script:Panel.Visible)
+    if ($script:Icon) { $form.Icon = $script:Icon }
+
+    $browser = New-Object System.Windows.Forms.WebBrowser
+    $browser.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $browser.AllowWebBrowserDrop = $false
+    $browser.ScriptErrorsSuppressed = $true
+    $browser.IsWebBrowserContextMenuEnabled = $false
+    $browser.add_Navigating({
+        param($sender, $e)
+        if ($e.Url.Scheme -in @('http', 'https', 'mailto')) {
+            $e.Cancel = $true
+            $target = $e.Url.AbsoluteUri
+            Invoke-Safely { Start-Process $target }
+        }
+    })
+    $browser.add_NewWindow({ param($sender, $e) $e.Cancel = $true })
+    $form.Controls.Add($browser)
+
+    $form.add_FormClosed({ param($sender, $e) $sender.Dispose(); $script:Guide = $null })
+    $script:Guide = $form
+    $browser.Navigate((New-Object System.Uri $path))
+    $form.Show()
+    $form.Activate()
+}
+
 function Open-RecordFolder {
     [void](New-Item -ItemType Directory -Force -Path $RecordDir)
     Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$RecordDir`""
@@ -1794,6 +2270,7 @@ function Stop-Monitor {
     }
     try {
         Invoke-Safely { Stop-AdbJobs }
+        foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-PowerWatch $session } }
         foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-Recording $session } }
         Invoke-Safely { Update-Stops 45000 }
         Invoke-Safely { Update-CombineHandovers -All }
@@ -1817,6 +2294,8 @@ function Stop-Monitor {
         Invoke-Safely { Update-Merges 600000 }
         Invoke-Safely { Update-Combines 120000 }
         Invoke-Safely { Stop-Combines }
+        Invoke-Safely { Update-Labels 120000 -Force }
+        Invoke-Safely { Stop-Labels }
     } finally {
         if ($script:Tray) {
             $script:Tray.Visible = $false
@@ -1844,6 +2323,10 @@ function Open-Window([string[]]$Serials) {
             $session.Disconnected = $false
             $session.PendingAction = $null
             $session.MovedTo = $null
+            $session.GoneSince = $null
+            $session.MissingSince = $null
+            $session.RestartingAt = $null
+            $session.PoweringOff = $false
             $session.NextConnect = Get-Date
             Write-Log "[$serial] Reconnecting."
         } else {
@@ -1871,7 +2354,9 @@ function Stop-Display($Session) {
     try { if (-not $Session.Display.HasExited) { $Session.Display.Kill() } } catch { }
     $Session.Display.Dispose()
     $Session.Display = $null
+    if ($Session.WindowShown) { Request-Arrange }
     $Session.WindowShown = $false
+    $Session.NaturalSize = 0
     $Session.ScrcpyPid = 0
 }
 
@@ -1880,6 +2365,7 @@ function Close-Session($Session, [string]$Action) {
     $Session.UserClosed = $true
     $Session.PendingAction = $Action
     Stop-Recording $Session
+    Stop-PowerWatch $Session
     if ($Session.Connector) {
         if (-not $Session.Connector.HasExited) { $Session.Connector.Kill() }
         $Session.Connector.Dispose()
@@ -1900,6 +2386,12 @@ function Update-UsbPriority($Devices) {
         }
         $usbSerial = $script:WifiSerials[$address]
         if (-not $usbSerial -or $script:MovedUsb.ContainsKey($usbSerial)) { continue }
+        if ($script:ClosedSerials.ContainsKey($usbSerial) -and -not $script:ClosedSerials.ContainsKey($address)) {
+            Write-Log "[$address] Same device as the closed $usbSerial; hiding it too."
+            $script:ClosedSerials[$address] = $false
+            if ($script:Sessions.ContainsKey($address)) { Remove-Session $script:Sessions[$address] }
+            continue
+        }
         $usbSession = $script:Sessions[$usbSerial]
         $wifi = $script:Sessions[$address]
         $usbOnline = $Devices[$usbSerial] -eq 'device'
@@ -1936,6 +2428,7 @@ function Invoke-PendingAction($Session) {
             if ($output -notmatch 'restarting in USB mode') { Undo-Move $Session "adb usb failed ($output)"; return }
             [void](Invoke-Adb @('disconnect', $serial) 5000)
             Remove-KnownWifi $serial
+            $script:ClosedSerials.Remove($Session.MoveAddress)
             $usbSession = $script:Sessions[$Session.MoveAddress]
             if ($usbSession -and $usbSession.UserClosed) { Open-Window @($usbSession.Serial) }
             $Session.MoveDeadline = (Get-Date).AddSeconds(30)
@@ -1955,6 +2448,97 @@ function Remove-Session($Session) {
     $script:Sessions.Remove($Session.Serial)
     [void]$script:RemovedSerials.Add($Session.Serial)
     if ($script:PanelList -and -not $script:PanelList.IsDisposed) { $script:PanelList.Items.RemoveByKey($Session.Serial) }
+}
+
+function Remove-Device($Session, [switch]$UserClosed) {
+    $serial = $Session.Serial
+    $partners = @()
+    if ($UserClosed) {
+        $partners = @($script:Standby.Keys | Where-Object { $script:Standby[$_] -eq $serial }) + @($script:Standby[$serial] | Where-Object { $_ })
+        foreach ($closed in @($serial) + $partners) { $script:ClosedSerials[$closed] = $false }
+    }
+    Remove-Session $Session
+    foreach ($partner in $partners) {
+        if ($script:Sessions.ContainsKey($partner)) { Remove-Session $script:Sessions[$partner] }
+    }
+}
+
+function Close-Device([string[]]$Serials) {
+    $sessions = @($Serials | ForEach-Object { $script:Sessions[$_] } | Where-Object { $_ -and -not $_.MovedTo })
+    if (-not $sessions.Count) { return }
+    $affected = @($sessions) + @(foreach ($session in $sessions) {
+        $id = $session.Serial
+        foreach ($partner in @($script:Standby.Keys | Where-Object { $script:Standby[$_] -eq $id }) + @($script:Standby[$id] | Where-Object { $_ })) {
+            if ($script:Sessions.ContainsKey($partner)) { $script:Sessions[$partner] }
+        }
+    })
+    if (-not (Confirm-StopRecording $affected 'Stop and close')) { return }
+    foreach ($session in $sessions) {
+        if (-not $script:Sessions.ContainsKey($session.Serial)) { continue }
+        Write-Log "[$($session.Serial)] Stopped and closed; removed from the list."
+        Remove-Device $session -UserClosed
+    }
+    Request-Tick
+}
+
+function Invoke-Refresh {
+    if ($script:ClosedSerials.Count) {
+        Write-Log "Refresh: showing closed devices again ($(@($script:ClosedSerials.Keys) -join ', '))."
+        $script:ClosedSerials.Clear()
+        $script:ClosedByUser = $false
+    }
+    Start-Scan
+    Request-Tick
+}
+
+function Stop-PowerWatch($Session) {
+    if (-not $Session.PowerWatch) { return }
+    try { if (-not $Session.PowerWatch.Process.HasExited) { $Session.PowerWatch.Process.Kill() } } catch { }
+    Close-RedirectedProcess $Session.PowerWatch.Process
+    $Session.PowerWatch = $null
+}
+
+function Update-PowerWatch($Session, [string]$State, [datetime]$Now) {
+    if ($Session.PowerWatch) {
+        if (-not $Session.PowerWatch.Process.HasExited) { return }
+        $output = ''
+        if ($Session.PowerWatch.Output.Wait(1000)) { $output = $Session.PowerWatch.Output.Result.Trim() }
+        Close-RedirectedProcess $Session.PowerWatch.Process
+        $Session.PowerWatch = $null
+        $Session.NextPowerWatch = $Now.AddSeconds(5)
+        if ($output -match '^(.*)/([^/]*)$') {
+            $requested = $Matches[1]
+            $powerctl = $Matches[2]
+            if ($requested -like '1*' -or $powerctl -like 'reboot*') {
+                $Session.RestartingAt = $Now
+                Write-Log "[$($Session.Serial)] Device is restarting ($output)."
+            } elseif ($requested -like '0*' -or $powerctl -like 'shutdown*') {
+                $Session.PoweringOff = $true
+                Write-Log "[$($Session.Serial)] Device is shutting down ($output)."
+            }
+        }
+    }
+    if ($Session.RestartingAt -and $State -eq 'device' -and ($Now - $Session.RestartingAt).TotalSeconds -ge 120) { $Session.RestartingAt = $null }
+    if ($State -ne 'device' -or $Session.RestartingAt -or $Session.PoweringOff -or $Now -lt $Session.NextPowerWatch) { return }
+    try {
+        $Session.PowerWatch = Start-AdbJob @('-s', $Session.Serial, 'shell', $script:PowerWatchCommand)
+    } catch {
+        $Session.NextPowerWatch = $Now.AddSeconds(30)
+        Write-Log "[$($Session.Serial)] Could not watch for restarts: $($_.Exception.Message)"
+    }
+}
+
+function Test-DeviceGone($Session, [datetime]$Now) {
+    if ($Serial.Count) { return $false }
+    if ($Session.Recording -or $Session.Stopping -or $Session.RecordPending) { return $false }
+    if ($Session.PoweringOff) { return $true }
+    if ($NoDiscovery -and (Get-ConnectionType $Session.Serial) -eq 'Wi-Fi') { return $false }
+    if (-not $Session.GoneSince) { return $false }
+    $restarting = $Session.RestartingAt
+    $partner = $script:Standby[$Session.Serial]
+    if ($partner -and $script:Sessions.ContainsKey($partner) -and $script:Sessions[$partner].RestartingAt) { $restarting = $script:Sessions[$partner].RestartingAt }
+    if ($restarting) { return ($Now - $restarting).TotalMinutes -ge 5 }
+    ($Now - $Session.GoneSince).TotalSeconds -ge 30
 }
 
 function Update-Moves($Devices) {
@@ -2079,6 +2663,7 @@ function Disconnect-Device([string[]]$Serials) {
 function Connect-WifiDevice([string]$Address) {
     if ($Address -notmatch ':\d+$') { $Address += ':5555' }
     if ($Serial.Count -and $Serial -notcontains $Address) { $script:Serial = @($Serial) + $Address }
+    $script:ClosedSerials.Remove($Address)
     $session = $script:Sessions[$Address]
     if ($session -and $session.UserClosed) { Open-Window @($Address); return }
     Write-Log "Connecting to $Address."
@@ -2164,12 +2749,37 @@ function Show-ConnectDialog([string]$InitialAddress = '', [string]$InitialPort =
     Connect-WifiDevice "${address}:$port"
 }
 
-function Get-SettingsRecordDir {
+function Get-Setting([string]$Name) {
     try {
         $settings = Get-Content -LiteralPath $script:SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json
-        if ($settings.RecordDir) { return [string]$settings.RecordDir }
+        if ($settings.PSObject.Properties[$Name]) { return $settings.$Name }
     } catch { }
     return $null
+}
+
+function Set-Setting([string]$Name, $Value) {
+    $settings = @{}
+    try {
+        $saved = Get-Content -LiteralPath $script:SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        foreach ($property in $saved.PSObject.Properties) { $settings[$property.Name] = $property.Value }
+    } catch { }
+    $settings[$Name] = $Value
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:SettingsPath))
+    $settings | ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+}
+
+function Get-SettingsRecordDir {
+    $value = Get-Setting 'RecordDir'
+    if ($value) { return [string]$value }
+    return $null
+}
+
+function Set-AutoUpdateCheck([bool]$Enabled) {
+    $script:AutoUpdateCheck = $Enabled
+    if ($script:PanelAutoUpdate -and $script:PanelAutoUpdate.Checked -ne $Enabled) { $script:PanelAutoUpdate.Checked = $Enabled }
+    Set-Setting 'AutoUpdateCheck' $Enabled
+    Write-Log "Automatic update check turned $(if ($Enabled) { 'on' } else { 'off' })."
+    if ($Enabled) { Start-UpdateCheck $false }
 }
 
 function Select-RecordFolder {
@@ -2183,8 +2793,7 @@ function Select-RecordFolder {
     } finally {
         $dialog.Dispose()
     }
-    [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:SettingsPath))
-    @{ RecordDir = $RecordDir } | ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+    Set-Setting 'RecordDir' $RecordDir
     Write-Log "Recordings folder changed to $RecordDir"
     Update-Panel
 }
@@ -2196,7 +2805,7 @@ function Get-RepoUpdateConfig {
     $url = (Invoke-Hidden $git @('-C', $RepoRoot, 'remote', 'get-url', 'origin') 5000).Trim()
     if ($url -notmatch '[:/]([^/:\s]+)/([^/\s]+?)(\.git)?/?$') { return $null }
     $repo = "$($Matches[1])/$($Matches[2])"
-    $version = (Invoke-Hidden $git @('-C', $RepoRoot, 'describe', '--tags', '--match', 'v[0-9]*', '--always', '--dirty') 5000).Trim()
+    $version = (Invoke-Hidden $git @('-C', $RepoRoot, 'describe', '--tags', '--first-parent', '--match', 'v[0-9]*', '--always', '--dirty') 5000).Trim()
     if (-not $version) { return $null }
     @{ Repo = $repo; Version = $version; Display = $version; Built = $null; Portable = $false; Git = $git }
 }
@@ -2221,9 +2830,16 @@ function Get-DisplayVersion([string]$Tag) {
     $Tag -replace '^qa-', ''
 }
 
+function Test-NewerVersion([string]$Tag, [string]$Current) {
+    $latest = $null
+    $installed = $null
+    if (-not [version]::TryParse((Get-DisplayVersion $Tag), [ref]$latest) -or -not [version]::TryParse((Get-DisplayVersion $Current), [ref]$installed)) { return $true }
+    $latest -gt $installed
+}
+
 function Complete-RepoUpdateCheck($Release, [bool]$Manual) {
     $current = $script:UpdateConfig.Display
-    if (-not $Release -or -not $Release.PSObject.Properties['tag_name'] -or (Test-ReleaseInRepo $Release)) {
+    if (-not $Release -or -not $Release.PSObject.Properties['tag_name'] -or -not (Test-NewerVersion ([string]$Release.tag_name) $current) -or (Test-ReleaseInRepo $Release)) {
         Write-Log "Update check: $current is up to date."
         if ($Manual) { [void](Show-Message "You have the latest version ($current).") }
         return
@@ -2390,6 +3006,8 @@ function Get-SessionStatus($Session) {
     if ($Session.MovedTo) { return "Switching to $($Session.MovedTo)..." }
     if ($Session.Disconnected) { return 'Disconnected' }
     if ($Session.UserClosed) { return 'Window closed' }
+    if ($Session.PoweringOff) { return $(if ($Session.LastState -eq 'device') { 'Shutting down' } else { 'Device turned off' }) }
+    if ($Session.RestartingAt) { return 'Device restarting' }
     if ($script:Standby.ContainsKey($Session.Serial)) { return "Standby (using $(Get-ConnectionType $script:Standby[$Session.Serial]))" }
     if ($Session.LastState -eq 'unauthorized') { return 'Allow USB debugging on device' }
     if ($Session.LastState -ne 'device') {
@@ -2427,20 +3045,32 @@ function Update-PanelButtons {
     $openText = if ($closed.Count -and -not @($closed | Where-Object { -not $_.Disconnected }).Count) { 'Reconnect' } else { 'Open window' }
     if ($script:PanelOpen.Text -ne $openText) { $script:PanelOpen.Text = $openText }
     $script:PanelOpen.Enabled = $closed.Count -gt 0
+    $script:PanelClose.Enabled = @($selected | Where-Object { -not $_.MovedTo }).Count -gt 0
     $script:PanelDisconnect.Enabled = @($selected | Where-Object { $_.Connection -eq 'Wi-Fi' -and -not $_.Disconnected }).Count -gt 0
     $kinds = @($selected | ForEach-Object { $_.Connection } | Select-Object -Unique)
     $switchText = if ($kinds.Count -eq 1 -and $kinds[0] -eq 'USB') { 'Switch to Wi-Fi' } else { 'Switch to USB' }
     if ($script:PanelSwitch.Text -ne $switchText) { $script:PanelSwitch.Text = $switchText }
     $script:PanelSwitch.Enabled = -not $standby.Count -and $kinds.Count -eq 1 -and $kinds[0] -in @('Wi-Fi', 'USB') -and @($selected | Where-Object { -not $_.Disconnected -and $_.LastState -eq 'device' }).Count -gt 0
-    $script:PanelScanNow.Enabled = -not ($NoDiscovery -or $Serial.Count -or $script:Discovery -or $script:Probe)
+    $script:PanelScanNow.Enabled = $script:ClosedSerials.Count -gt 0 -or -not ($NoDiscovery -or $Serial.Count -or $script:Discovery -or $script:Probe)
     $active = @(Get-TargetSessions @())
     $script:PanelStartAll.Enabled = @($active | Where-Object { -not $_.Recording }).Count -gt 0
     $script:PanelStopAll.Enabled = @($active | Where-Object { $_.Recording }).Count -gt 0
 }
 
+function Update-SortHeaders($List) {
+    $sorter = $List.ListViewItemSorter
+    foreach ($column in $List.Columns) {
+        $text = [string]$column.Tag
+        if ($column.Index -eq $sorter.Column) { $text += ' ' + [char]$(if ($sorter.Descending) { 0x25BC } else { 0x25B2 }) }
+        if ($column.Text -ne $text) { $column.Text = $text }
+    }
+}
+
 function Update-Panel {
     if (-not $script:Panel -or $script:Panel.IsDisposed -or -not $script:Panel.Visible) { return }
     $list = $script:PanelList
+    $sortColumn = $list.ListViewItemSorter.Column
+    $resort = $false
     $list.BeginUpdate()
     try {
         foreach ($session in @($script:Sessions.Values)) {
@@ -2455,11 +3085,15 @@ function Update-Panel {
             }
             $texts = @($session.Title, $session.Connection, (Get-SessionStatus $session), (Get-SessionRecordingText $session))
             for ($i = 0; $i -lt $texts.Count; $i++) {
-                if ($item.SubItems[$i].Text -ne $texts[$i]) { $item.SubItems[$i].Text = $texts[$i] }
+                if ($item.SubItems[$i].Text -ne $texts[$i]) {
+                    $item.SubItems[$i].Text = $texts[$i]
+                    if ($i -eq $sortColumn -or $i -eq 0) { $resort = $true }
+                }
             }
             $color = if ($session.Recording) { [System.Drawing.Color]::Firebrick } elseif ($session.UserClosed -or $script:Standby.ContainsKey($session.Serial)) { [System.Drawing.SystemColors]::GrayText } else { [System.Drawing.SystemColors]::WindowText }
             if ($item.ForeColor -ne $color) { $item.ForeColor = $color }
         }
+        if ($resort) { $list.Sort() }
     } finally {
         $list.EndUpdate()
     }
@@ -2468,6 +3102,7 @@ function Update-Panel {
     if ($connecting.Count) { $status = "Connecting to $($connecting -join ', ')...  $status" }
     if ($script:Merges.Count -gt 0) { $status = "Joining $($script:Merges.Count) recording(s)...  $status" }
     if ($script:Combines.Count -gt 0) { $status = "Combining $($script:Combines.Count) recording(s)...  $status" }
+    if ($script:Labels.Count -gt 0) { $status = "Adding device name header to $($script:Labels.Count) recording(s)...  $status" }
     if ($script:UpdateStatus) { $status = "$($script:UpdateStatus)  |  $status" }
     if ($script:PanelStatus.Text -ne $status) { $script:PanelStatus.Text = $status }
     $scan = if ($NoDiscovery -or $Serial.Count) { 'Wi-Fi scan: off' } else { $script:DiscoveryStatus }
@@ -2500,6 +3135,17 @@ function New-PanelButton([System.Windows.Forms.Control]$Parent, [string]$Text, [
     $button
 }
 
+function New-PanelMenuItem([System.Windows.Forms.ToolStripMenuItem]$Parent, [string]$Text, [scriptblock]$OnClick) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem $Text
+    $item.Tag = $OnClick
+    $item.add_Click({
+        param($sender, $e)
+        Invoke-Safely { & $sender.Tag; Update-TrayText; Update-Panel }
+    })
+    [void]$Parent.DropDownItems.Add($item)
+    $item
+}
+
 function New-Panel {
     Add-Type -Namespace ScrcpyMonitor -Name Window -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
     $form = New-Object System.Windows.Forms.Form
@@ -2514,26 +3160,57 @@ function New-Panel {
     $list.FullRowSelect = $true
     $list.HideSelection = $false
     $list.Sorting = [System.Windows.Forms.SortOrder]::Ascending
+    if (-not ('ScrcpyMonitor.ListSorter' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+namespace ScrcpyMonitor {
+    public class ListSorter : System.Collections.IComparer {
+        public int Column;
+        public bool Descending;
+        static string Text(System.Windows.Forms.ListViewItem item, int column) {
+            return column < item.SubItems.Count ? item.SubItems[column].Text : "";
+        }
+        public int Compare(object x, object y) {
+            var a = (System.Windows.Forms.ListViewItem)x;
+            var b = (System.Windows.Forms.ListViewItem)y;
+            int result = string.Compare(Text(a, Column), Text(b, Column), System.StringComparison.CurrentCultureIgnoreCase);
+            if (result == 0 && Column != 0) result = string.Compare(Text(a, 0), Text(b, 0), System.StringComparison.CurrentCultureIgnoreCase);
+            return Descending ? -result : result;
+        }
+    }
+}
+'@
+    }
+    $list.ListViewItemSorter = New-Object ScrcpyMonitor.ListSorter
+    $list.add_ColumnClick({
+        param($sender, $e)
+        Invoke-Safely {
+            $sorter = $sender.ListViewItemSorter
+            if ($sorter.Column -eq $e.Column) { $sorter.Descending = -not $sorter.Descending } else { $sorter.Column = $e.Column; $sorter.Descending = $false }
+            Update-SortHeaders $sender
+            $sender.Sort()
+        }
+    })
     $list.Dock = [System.Windows.Forms.DockStyle]::Fill
     [void]$list.Columns.Add('Device', 250)
     [void]$list.Columns.Add('Connection', 85)
     [void]$list.Columns.Add('Status', 170)
     [void]$list.Columns.Add('Recording', 165)
+    foreach ($column in $list.Columns) { $column.Tag = $column.Text }
+    Update-SortHeaders $list
     $list.add_SelectedIndexChanged({ Invoke-Safely { Update-PanelButtons } })
     $form.Controls.Add($list)
 
     $deviceButtons = New-Object System.Windows.Forms.FlowLayoutPanel
     $deviceButtons.Dock = [System.Windows.Forms.DockStyle]::Bottom
     $deviceButtons.AutoSize = $true
+    $deviceButtons.WrapContents = $false
     $deviceButtons.Padding = New-Object System.Windows.Forms.Padding(4)
     $form.Controls.Add($deviceButtons)
 
-    $globalButtons = New-Object System.Windows.Forms.FlowLayoutPanel
-    $globalButtons.Dock = [System.Windows.Forms.DockStyle]::Bottom
-    $globalButtons.AutoSize = $true
-    $globalButtons.WrapContents = $false
-    $globalButtons.Padding = New-Object System.Windows.Forms.Padding(4)
-    $form.Controls.Add($globalButtons)
+    $menuBar = New-Object System.Windows.Forms.MenuStrip
+    $menuBar.Dock = [System.Windows.Forms.DockStyle]::Top
+    $form.Controls.Add($menuBar)
+    $form.MainMenuStrip = $menuBar
 
     $statusStrip = New-Object System.Windows.Forms.StatusStrip
     $statusStrip.SizingGrip = $false
@@ -2559,36 +3236,44 @@ function New-Panel {
         Start-CombinedRecording @(Get-SelectedSessions | Where-Object { -not $_.UserClosed -and -not $script:Standby.ContainsKey($_.Serial) })
     }
     $script:PanelOpen = New-PanelButton $deviceButtons 'Open window' { Open-Window @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
+    $script:PanelClose = New-PanelButton $deviceButtons 'Stop and close' { Close-Device @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
     $script:PanelDisconnect = New-PanelButton $deviceButtons 'Disconnect' { Disconnect-Device @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
     $script:PanelSwitch = New-PanelButton $deviceButtons 'Switch to USB' { Switch-Connection @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
     [void](New-PanelButton $deviceButtons 'Connect Wi-Fi device...' { Show-ConnectDialog })
-    $script:PanelScanNow = New-PanelButton $deviceButtons 'Scan now' { Start-Scan }
+    $script:PanelScanNow = New-PanelButton $deviceButtons 'Refresh' { Invoke-Refresh }
     $list.add_DoubleClick({ Invoke-Safely { $script:PanelToggle.PerformClick() } })
 
-    $script:PanelStartAll = New-PanelButton $globalButtons 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } }
-    $script:PanelStopAll = New-PanelButton $globalButtons 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } }
-    [void](New-PanelButton $globalButtons 'Open recordings folder' { Open-RecordFolder })
-    [void](New-PanelButton $globalButtons 'Change folder...' { Select-RecordFolder })
-    [void](New-PanelButton $globalButtons 'Open log' { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" })
-    if ($script:UpdateConfig) { [void](New-PanelButton $globalButtons 'Check for updates' { Start-UpdateCheck $true }) }
-    [void](New-PanelButton $globalButtons 'About' { Show-About })
-    [void](New-PanelButton $globalButtons 'Exit' { $script:ExitRequested = $true })
-    $minWidth = [Math]::Max(560, $globalButtons.PreferredSize.Width + $form.Width - $form.ClientSize.Width)
+    $fileMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&File'
+    $recordingMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Recording'
+    $helpMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Help'
+    $windowMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Window'
+    [void]$menuBar.Items.AddRange([System.Windows.Forms.ToolStripItem[]]@($fileMenu, $recordingMenu, $windowMenu, $helpMenu))
+    [void](New-PanelMenuItem $windowMenu 'Arrange windows' { Invoke-ArrangeWindows })
+    [void](New-PanelMenuItem $fileMenu 'Open recordings folder' { Open-RecordFolder })
+    [void](New-PanelMenuItem $fileMenu 'Change recordings folder...' { Select-RecordFolder })
+    [void](New-PanelMenuItem $fileMenu 'Open log' { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" })
+    [void]$fileMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void](New-PanelMenuItem $fileMenu 'Exit' { $script:ExitRequested = $true })
+    $script:PanelStartAll = New-PanelMenuItem $recordingMenu 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } }
+    $script:PanelStopAll = New-PanelMenuItem $recordingMenu 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } }
+    [void](New-PanelMenuItem $helpMenu 'User guide' { Show-Guide })
+    [void]$helpMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    if ($script:UpdateConfig) {
+        [void](New-PanelMenuItem $helpMenu 'Check for updates' { Start-UpdateCheck $true })
+        $script:PanelAutoUpdate = New-PanelMenuItem $helpMenu 'Check for updates automatically' { Set-AutoUpdateCheck (-not $script:AutoUpdateCheck) }
+        $script:PanelAutoUpdate.Checked = $script:AutoUpdateCheck
+        [void]$helpMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    }
+    [void](New-PanelMenuItem $helpMenu 'About' { Show-About })
+    $minWidth = [Math]::Max(560, $deviceButtons.PreferredSize.Width + $form.Width - $form.ClientSize.Width)
     $form.MinimumSize = New-Object System.Drawing.Size($minWidth, 260)
+    if ($form.Width -lt $minWidth) { $form.Width = $minWidth }
 
     $form.add_FormClosing({
         param($sender, $e)
         if ($script:Exiting) { return }
         $e.Cancel = $true
-        if ($e.CloseReason -ne [System.Windows.Forms.CloseReason]::WindowsShutDown -and $script:Tray) {
-            $sender.Hide()
-            if (-not $script:PanelHiddenOnce) {
-                $script:PanelHiddenOnce = $true
-                Show-Notification 'scrcpy monitor keeps running in the tray. Double-click the tray icon to show the control panel.'
-            }
-        } else {
-            $script:ExitRequested = $true
-        }
+        $script:ExitRequested = $true
     })
     $form.add_Shown({ Invoke-Safely { Update-Panel } })
     $form
@@ -2679,8 +3364,10 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $script:Sessions = @{}
 $script:Merges = New-Object System.Collections.ArrayList
 $script:Combines = New-Object System.Collections.ArrayList
+$script:Labels = New-Object System.Collections.ArrayList
 $script:CombineHandovers = New-Object System.Collections.ArrayList
 $script:CombineEncoderArgs = $null
+$script:FpsPassthroughArgs = $null
 $script:Stops = New-Object System.Collections.ArrayList
 $script:Connects = New-Object System.Collections.ArrayList
 $script:ConnectFailures = New-Object System.Collections.ArrayList
@@ -2700,17 +3387,24 @@ $script:ScanPorts = Read-ScanPorts
 $script:DelayedConnects = @{}
 $script:MovedUsb = @{}
 $script:RemovedSerials = New-Object System.Collections.Generic.HashSet[string]
+$script:ClosedSerials = @{}
+$script:ClosedByUser = $false
+$script:PowerWatchCommand = 'while [ -z $(getprop sys.shutdown.requested)$(getprop sys.powerctl) ]; do sleep 1; done; echo $(getprop sys.shutdown.requested)/$(getprop sys.powerctl)'
 $script:Standby = @{}
 $script:WifiSerials = @{}
 $script:Exiting = $false
 $script:ExitRequested = $false
+$script:ArrangeRequestedAt = $null
+$script:ArrangeFollowUp = $false
+$script:AutoArrange = -not @($ScrcpyArgs | Where-Object { $_ -match '^(--window-(x|y|width|height)|--fullscreen|-f)(=|$)' }).Count
 $script:OpenWindowsRequested = $false
 $script:RecordOnStart = [bool]$Record
 $script:Tray = $null
 $script:Panel = $null
-$script:PanelHiddenOnce = $false
+$script:PanelList = $null
 $script:PanelPending = $false
 $script:About = $null
+$script:Guide = $null
 $script:ScrcpyVersion = $null
 $script:Author = 'Charles Manalo'
 $script:DefaultRepo = 'cktmanalo/scrcpy'
@@ -2720,6 +3414,8 @@ $script:UpdateStatus = ''
 $script:AvailableUpdate = $null
 $script:Updating = $false
 $script:Updater = $null
+$script:AutoUpdateCheck = (Get-Setting 'AutoUpdateCheck') -ne $false
+$script:PanelAutoUpdate = $null
 $iconPath = Join-Path $script:IconDir 'icon.ico'
 $script:Icon = if (Test-Path -LiteralPath $iconPath) { New-Object System.Drawing.Icon $iconPath } else { $null }
 
@@ -2769,7 +3465,7 @@ $script:FastTimer.Start()
 
 $script:PanelPending = [bool]$script:Panel
 Invoke-Safely { Show-UpdateInstalled }
-if (-not $NoUpdateCheck) { Invoke-Safely { Start-UpdateCheck $false } }
+if (-not $NoUpdateCheck -and $script:AutoUpdateCheck) { Invoke-Safely { Start-UpdateCheck $false } }
 
 try {
     [System.Windows.Forms.Application]::Run($script:AppContext)

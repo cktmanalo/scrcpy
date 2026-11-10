@@ -80,6 +80,40 @@ def display_version(tag):
     return re.sub(r'^qa-', '', tag)
 
 
+def parse_version(text):
+    if not re.match(r'^\s*\d+(\.\d+){1,3}\s*$', text or ''):
+        return None
+    parts = [int(p) for p in text.strip().split('.')]
+    if any(p > 2147483647 for p in parts):
+        return None
+    return tuple(parts)
+
+
+def is_newer_version(tag, current):
+    latest = parse_version(display_version(tag))
+    installed = parse_version(display_version(current))
+    if latest is None or installed is None:
+        return True
+    return latest > installed
+
+
+def parse_power_watch(output):
+    match = re.match(r'^(.*)/([^/]*)$', (output or '').strip())
+    if not match:
+        return None
+    requested, powerctl = match.group(1), match.group(2)
+    if requested.startswith('1') or powerctl.lower().startswith('reboot'):
+        return 'restarting'
+    if requested.startswith('0') or powerctl.lower().startswith('shutdown'):
+        return 'off'
+    return None
+
+
+def sort_key(texts, column):
+    text = texts[column] if column < len(texts) else ''
+    return text.casefold(), (texts[0].casefold() if column and texts else '')
+
+
 def free_port_block(used, base=PORT_BASE, span=PORT_RANGE, step=PORT_STEP):
     used = set(used)
     for port in range(base, base + span, step):
@@ -90,6 +124,52 @@ def free_port_block(used, base=PORT_BASE, span=PORT_RANGE, step=PORT_STEP):
 
 def has_port_arg(arguments):
     return any(re.match(r'^(--port|-p)', arg) for arg in arguments)
+
+
+def has_placement_arg(arguments):
+    return any(re.match(r'^(--window-(x|y|width|height)|--fullscreen|-f)(=|$)', arg) for arg in arguments)
+
+
+def window_layout(area, items, gap=8):
+    left, top, area_width, area_height = area
+    count = len(items)
+    if not count:
+        return None
+    frame_height = max(item['frame_height'] for item in items)
+    best, best_score = None, 0
+    for rows in range(1, count + 1):
+        columns = math.ceil(count / rows)
+        if math.ceil(count / columns) != rows:
+            continue
+        groups = [items[start:start + columns] for start in range(0, count, columns)]
+        height = (area_height - (rows + 1) * gap) / rows - frame_height
+        for group in groups:
+            aspect = sum(item['aspect'] for item in group)
+            frames = sum(item['frame_width'] for item in group)
+            height = min(height, (area_width - (len(group) + 1) * gap - frames) / aspect)
+        if height < 50:
+            continue
+        score = sum(min(height, item['max_height']) ** 2 * item['aspect'] for item in items)
+        if score > best_score * 1.001:
+            best, best_score = (groups, height), score
+    if not best:
+        return None
+    groups, height = best
+    row_sizes = [[(round(min(height, item['max_height']) * item['aspect'] + item['frame_width']),
+                   round(min(height, item['max_height']) + item['frame_height'])) for item in group]
+                 for group in groups]
+    total_height = sum(max(h for _, h in sizes) for sizes in row_sizes) + (len(groups) - 1) * gap
+    y = top + (area_height - total_height) // 2
+    rects = []
+    for sizes in row_sizes:
+        row_height = max(h for _, h in sizes)
+        row_width = sum(w for w, _ in sizes) + (len(sizes) - 1) * gap
+        x = left + (area_width - row_width) // 2
+        for width, height in sizes:
+            rects.append((x, y + (row_height - height) // 2, width, height))
+            x += width + gap
+        y += row_height + gap
+    return rects
 
 
 def is_connected_output(output):
@@ -157,7 +237,7 @@ def _seconds_since(moment, now):
     return (now - moment).total_seconds() if moment else 0
 
 
-def usb_priority(devices, sessions, wifi_serials, moved_usb, now, serial_filter=()):
+def usb_priority(devices, sessions, wifi_serials, moved_usb, now, serial_filter=(), skip=()):
     standby = {}
     handovers = []
     if serial_filter:
@@ -167,7 +247,7 @@ def usb_priority(devices, sessions, wifi_serials, moved_usb, now, serial_filter=
         return standby, handovers
     for address in [s for s in known if connection_type(s) == 'Wi-Fi']:
         usb_serial = wifi_serials.get(address)
-        if not usb_serial or usb_serial in moved_usb:
+        if not usb_serial or usb_serial in moved_usb or address in skip:
             continue
         usb_session = sessions.get(usb_serial)
         wifi = sessions.get(address)
@@ -237,7 +317,7 @@ def find_update(release, current_version, built, system, machine):
     if not release or not release.get('tag_name'):
         return None
     tag = str(release['tag_name'])
-    if tag == current_version:
+    if tag == current_version or not is_newer_version(tag, current_version):
         return None
     asset = None
     expected = update_asset_name(system, machine, tag)
@@ -267,24 +347,46 @@ def combine_grid(count):
     return cols, math.ceil(count / cols)
 
 
+def combine_scale(sizes, cols, rows):
+    max_w = float(max(w for w, _ in sizes))
+    max_h = float(max(h for _, h in sizes))
+    factor = min(1.0, 1280 / max_h, 3840 / (cols * max_w), 2160 / (rows * max_h * 1.05))
+    return factor, max(16, int(max_w * factor / 2) * 2), max(16, int(max_h * factor / 2) * 2)
+
+
 def combine_cell(sizes, cols, rows):
-    cell_h = min(1280.0, float(max(h for _, h in sizes)))
-    cell_w = max(w * cell_h / h for w, h in sizes)
-    scale = min(1.0, 3840 / (cols * cell_w), 2160 / (rows * cell_h))
-    return max(16, int(cell_w * scale / 2) * 2), max(16, int(cell_h * scale / 2) * 2)
+    _, cell_w, cell_h = combine_scale(sizes, cols, rows)
+    return cell_w, cell_h
 
 
-def combine_command(members, sizes, t0, encoder_args, output):
-    cols, rows = combine_grid(len(members))
+def combine_chain(factor, cell_w, cell_h):
+    fit = f'min({factor:.6f},min({cell_w}/iw,{cell_h}/ih))'
+    return (f"scale=w='max(2,trunc(iw*{fit}/2)*2)':h='max(2,trunc(ih*{fit}/2)*2)':eval=frame,"
+            f'pad={cell_w}:{cell_h}:(ow-iw)/2:0:eval=frame,setsar=1')
+
+
+def combine_header_height(cell_h):
+    return max(16, cell_h // 40 * 2)
+
+
+def combine_layout(sizes):
+    cols, rows = combine_grid(len(sizes))
     cell_w, cell_h = combine_cell(sizes, cols, rows)
-    chain = (f'scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease:force_divisible_by=2:eval=frame,'
-             f'pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1')
+    return cols, rows, cell_w, cell_h, combine_header_height(cell_h)
+
+
+def combine_command(members, sizes, t0, encoder_args, output, headers=()):
+    cols, rows = combine_grid(len(sizes))
+    factor, cell_w, cell_h = combine_scale(sizes, cols, rows)
+    header_h = combine_header_height(cell_h)
+    pitch = cell_h + header_h
+    chain = combine_chain(factor, cell_w, cell_h)
     inputs, filters, overlays = [], [], []
     total = 0.0
     index = 0
     for number, segments in enumerate(members):
         x = number % cols * cell_w
-        y = number // cols * cell_h
+        y = number // cols * pitch + header_h
         for segment in segments:
             offset = max(0.0, (segment['start'] - t0).total_seconds())
             total = max(total, offset + segment['duration'])
@@ -293,8 +395,17 @@ def combine_command(members, sizes, t0, encoder_args, output):
             filters.append(f'[{index}:v]setpts=PTS-STARTPTS+{format_seconds(offset)}/TB,{chain}[v{index}]')
             overlays.append(f'[b{index}][v{index}]overlay=x={x}:y={y}:eof_action=pass[b{index + 1}]')
             index += 1
-    graph = ';'.join([f'color=c=black:s={cols * cell_w}x{rows * cell_h}:r=30:d={format_seconds(total)}[b0]']
-                     + filters + overlays)
+    base = f'color=c=black:s={cols * cell_w}x{rows * pitch}:r=30:d={format_seconds(total)}'
+    header_filters = []
+    for number, header in enumerate(headers):
+        inputs += ['-i', header]
+        source = f'[h{number}]' if number else f'{base}[h0];[h0]'
+        target = '[b0]' if number == len(headers) - 1 else f'[h{number + 1}]'
+        header_filters.append(f'{source}[{index + number}:v]overlay=x={number % cols * cell_w}:'
+                              f'y={number // cols * pitch}{target}')
+    if not headers:
+        header_filters.append(f'{base}[b0]')
+    graph = ';'.join(header_filters + filters + overlays)
     args = (['-hide_banner', '-nostdin', '-loglevel', 'error', '-y'] + inputs
             + ['-filter_complex', graph, '-map', f'[b{index}]', '-an'] + list(encoder_args)
             + ['-pix_fmt', 'yuv420p', '-r', '30', '-movflags', '+faststart', '-t', format_seconds(total), output])
@@ -307,3 +418,30 @@ def combine_encoder_args(encoders):
     if re.search(r'\slibopenh264\s', encoders or ''):
         return ['-c:v', 'libopenh264', '-b:v', '8M']
     return ['-c:v', 'mpeg4', '-q:v', '4']
+
+
+def fps_passthrough_args(version_text):
+    match = re.search(r'ffmpeg version n?(\d+)\.(\d+)', version_text or '')
+    version = (int(match.group(1)), int(match.group(2))) if match else None
+    if version and version < (4, 0):
+        return ['-vsync', 'passthrough']
+    time_base = ['-enc_time_base', '1:60000']
+    if version and version < (5, 1):
+        return ['-vsync', 'passthrough'] + time_base
+    return ['-fps_mode', 'passthrough'] + time_base
+
+
+def label_layout(width, height):
+    width = max(16, (width + 1) // 2 * 2)
+    height = max(16, (height + 1) // 2 * 2)
+    return width, height, combine_header_height(height)
+
+
+def label_command(source, header, width, height, header_h, encoder_args, fps_args, output):
+    fit = f'min({width}/iw,{height}/ih)'
+    graph = (f"[0:v]scale=w='max(2,trunc(iw*{fit}/2)*2)':h='max(2,trunc(ih*{fit}/2)*2)':eval=frame,"
+             f'pad={width}:{height + header_h}:(ow-iw)/2:{header_h}+({height}-ih)/2:eval=frame,setsar=1[v];'
+             f'[v][1:v]overlay=x=0:y=0[out]')
+    return (['-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-reinit_filter', '0', '-i', source, '-i', header,
+             '-filter_complex', graph, '-map', '[out]', '-map', '0:a?', '-c:a', 'copy'] + list(encoder_args)
+            + ['-bf', '0', '-pix_fmt', 'yuv420p'] + list(fps_args) + ['-movflags', '+faststart', output])

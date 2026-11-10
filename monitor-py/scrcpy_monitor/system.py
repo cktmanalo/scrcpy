@@ -125,6 +125,19 @@ def write_json(path, value):
     os.replace(temp, path)
 
 
+def get_setting(path, name):
+    settings = read_json(path, {})
+    return settings.get(name) if isinstance(settings, dict) else None
+
+
+def set_setting(path, name, value):
+    settings = read_json(path, {})
+    if not isinstance(settings, dict):
+        settings = {}
+    settings[name] = value
+    write_json(path, settings)
+
+
 def exe_name(name):
     return name + '.exe' if IS_WINDOWS else name
 

@@ -31,6 +31,7 @@ if bin_dir.is_dir() and any(bin_dir.iterdir()):
 else:
     print(f'WARNING: {bin_dir} is empty or missing; the app will look for scrcpy and adb at run time.')
 datas += optional(ROOT / 'update.json', '.')
+datas += optional(REPO / ('scrcpy-monitor-guide.html' if IS_WINDOWS else 'scrcpy-monitor-guide-macos-linux.html'), '.')
 for icon in ('scrcpy.png', 'disconnected.png'):
     datas += optional(REPO / 'app' / 'data' / icon, 'icons')
 if sys.platform.startswith('linux'):
