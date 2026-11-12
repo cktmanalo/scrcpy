@@ -257,6 +257,7 @@ class Engine:
         self.has_panel = True
         self.panel_pending = False
         self.arrange_area = None
+        self.last_arrange_area = None
         self.arrange_requested_at = None
         self.arrange_reported = False
         self.arrange_retries = 0
@@ -632,7 +633,10 @@ class Engine:
                     items.append({'aspect': aspect, 'frame_width': outer_width - client_width,
                                   'frame_height': outer_height - client_height,
                                   'max_height': session.natural_size / max(1, aspect)})
-                rects = logic.window_layout(area, items) if items else None
+                if not items:
+                    return
+                self.last_arrange_area = area
+                rects = logic.window_layout(area, items)
                 if not rects:
                     return
                 for window, rect in zip(targets, rects):
@@ -976,7 +980,7 @@ class Engine:
                  'start': (part_starts or {}).get(part)} for part in parts]
 
     def start_combined_recording(self, serials):
-        group = {'requested_at': datetime.now(), 'members': [], 'finished': False}
+        group = {'requested_at': datetime.now(), 'members': [], 'finished': False, 'area': self.last_arrange_area}
         started = []
         candidates = [self.sessions[s] for s in serials if s in self.sessions]
         for session in sorted(candidates, key=lambda s: s.title.lower()):
@@ -985,7 +989,8 @@ class Engine:
             self.start_recording(session)
             if not session.recording:
                 continue
-            member = {'group': group, 'title': session.title, 'segments': [], 'open': 1, 'done': False}
+            member = {'group': group, 'title': session.title, 'segments': [], 'open': 1, 'done': False,
+                      'natural': session.natural_size}
             group['members'].append(member)
             session.combine_member = member
             session.part_starts = {}
@@ -1081,20 +1086,21 @@ class Engine:
             output = folder / f'{stem}_{suffix}.mp4'
             suffix += 1
         temp = str(output)[:-4] + '_combining.mp4'
-        _, _, cell_w, _, header_h = logic.combine_layout(sizes)
+        layout = logic.combine_layout(sizes, [m.get('natural', 0) for m in members], group.get('area'))
+        _, _, header_h, tiles = layout
         headers = []
         stamp = f'{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}'
         for number, member in enumerate(members):
             path = str(self.paths.logs / f'combine-{stamp}-header{number + 1}.png')
             try:
-                new_combine_header(member['title'], cell_w, header_h, path)
+                new_combine_header(member['title'], tiles[number][2], header_h, path)
                 headers.append(path)
             except Exception as error:
                 log(f'Could not create the combined recording header for {member["title"]}: {error}')
                 _remove_files(headers)
                 headers = []
                 break
-        args, total, count = logic.combine_command([m['segments'] for m in members], sizes, t0,
+        args, total, count = logic.combine_command([m['segments'] for m in members], layout, t0,
                                                    self.get_combine_encoder_args(), temp, headers)
         if IS_WINDOWS and len(subprocess.list2cmdline(args)) > 30000:
             _remove_files(headers)

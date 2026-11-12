@@ -144,12 +144,16 @@ def window_layout(area, items, gap=8):
         groups = [items[start:start + columns] for start in range(0, count, columns)]
         height = (area_height - (rows + 1) * gap) / rows - frame_height
         for group in groups:
-            aspect = sum(item['aspect'] for item in group)
-            frames = sum(item['frame_width'] for item in group)
+            aspect = frames = 0
+            for item in group:
+                aspect += item['aspect']
+                frames += item['frame_width']
             height = min(height, (area_width - (len(group) + 1) * gap - frames) / aspect)
         if height < 50:
             continue
-        score = sum(min(height, item['max_height']) ** 2 * item['aspect'] for item in items)
+        score = 0
+        for item in items:
+            score += min(height, item['max_height']) ** 2 * item['aspect']
         if score > best_score * 1.001:
             best, best_score = (groups, height), score
     if not best:
@@ -342,51 +346,69 @@ def format_seconds(value):
     return text if text not in ('', '-0') else '0'
 
 
-def combine_grid(count):
-    cols = count if count <= 3 else math.ceil(math.sqrt(count))
-    return cols, math.ceil(count / cols)
-
-
-def combine_scale(sizes, cols, rows):
-    max_w = float(max(w for w, _ in sizes))
-    max_h = float(max(h for _, h in sizes))
-    factor = min(1.0, 1280 / max_h, 3840 / (cols * max_w), 2160 / (rows * max_h * 1.05))
-    return factor, max(16, int(max_w * factor / 2) * 2), max(16, int(max_h * factor / 2) * 2)
-
-
-def combine_cell(sizes, cols, rows):
-    _, cell_w, cell_h = combine_scale(sizes, cols, rows)
-    return cell_w, cell_h
-
-
-def combine_chain(factor, cell_w, cell_h):
-    fit = f'min({factor:.6f},min({cell_w}/iw,{cell_h}/ih))'
-    return (f"scale=w='max(2,trunc(iw*{fit}/2)*2)':h='max(2,trunc(ih*{fit}/2)*2)':eval=frame,"
-            f'pad={cell_w}:{cell_h}:(ow-iw)/2:0:eval=frame,setsar=1')
-
-
 def combine_header_height(cell_h):
     return max(16, cell_h // 40 * 2)
 
 
-def combine_layout(sizes):
-    cols, rows = combine_grid(len(sizes))
-    cell_w, cell_h = combine_cell(sizes, cols, rows)
-    return cols, rows, cell_w, cell_h, combine_header_height(cell_h)
+def _even(value):
+    return max(2, int(round(value / 2)) * 2)
 
 
-def combine_command(members, sizes, t0, encoder_args, output, headers=()):
-    cols, rows = combine_grid(len(sizes))
-    factor, cell_w, cell_h = combine_scale(sizes, cols, rows)
-    header_h = combine_header_height(cell_h)
-    pitch = cell_h + header_h
-    chain = combine_chain(factor, cell_w, cell_h)
+def combine_layout(sizes, naturals=None, area=None, gap=8):
+    area_w, area_h = (area[2], area[3]) if area and area[2] > 0 and area[3] > 0 else (1920, 1080)
+    title = max(16, area_h // 36)
+    items = []
+    for number, (width, height) in enumerate(sizes):
+        aspect = width / height
+        natural = naturals[number] if naturals and number < len(naturals) and naturals[number] else 0
+        if natural > 0:
+            max_height = natural / max(1, aspect)
+        else:
+            max_height = height * min(1.0, max(1, area_w - 96) / width, max(1, area_h - 96) / height)
+        items.append({'aspect': aspect, 'frame_width': 0, 'frame_height': title, 'max_height': max_height})
+    rects = None
+    for grow in (1, 2, 4, 8, 16):
+        rects = window_layout((0, 0, area_w * grow, area_h * grow), items, gap)
+        if rects:
+            break
+    if not rects:
+        rects = [(n * 66, 0, 58, 50 + title) for n in range(len(sizes))]
+    left = min(x for x, _, _, _ in rects)
+    top = min(y for _, y, _, _ in rects)
+    width = max(x + w for x, _, w, _ in rects) - left + 2 * gap
+    height = max(y + h for _, y, _, h in rects) - top + 2 * gap
+    ratio = max(h / max(1, rect[3] - title) for (_, h), rect in zip(sizes, rects))
+    scale = min(max(1.0, ratio), 2560 / width, 1440 / height)
+    for _ in range(8):
+        header_h = _even(title * scale)
+        tiles = []
+        for x, y, w, h in rects:
+            tile_x = _even((x - left + gap) * scale)
+            tile_y = _even((y - top + gap) * scale) + header_h
+            tiles.append((tile_x, tile_y, _even(w * scale), _even((h - title) * scale)))
+        margin = _even(gap * scale)
+        canvas_w = max(x + w for x, _, w, _ in tiles) + margin
+        canvas_h = max(y + h for _, y, _, h in tiles) + margin
+        if canvas_w <= 2560 and canvas_h <= 1440:
+            break
+        scale *= min(1.0, 2558 / canvas_w, 1438 / canvas_h)
+    return canvas_w, canvas_h, header_h, tiles
+
+
+def combine_chain(tile_w, tile_h):
+    fit = f'min({tile_w}/iw,{tile_h}/ih)'
+    return (f"scale=w='max(2,trunc(iw*{fit}/2)*2)':h='max(2,trunc(ih*{fit}/2)*2)':eval=frame,"
+            f'pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1')
+
+
+def combine_command(members, layout, t0, encoder_args, output, headers=()):
+    canvas_w, canvas_h, header_h, tiles = layout
     inputs, filters, overlays = [], [], []
     total = 0.0
     index = 0
     for number, segments in enumerate(members):
-        x = number % cols * cell_w
-        y = number // cols * pitch + header_h
+        x, y, tile_w, tile_h = tiles[number]
+        chain = combine_chain(tile_w, tile_h)
         for segment in segments:
             offset = max(0.0, (segment['start'] - t0).total_seconds())
             total = max(total, offset + segment['duration'])
@@ -395,14 +417,14 @@ def combine_command(members, sizes, t0, encoder_args, output, headers=()):
             filters.append(f'[{index}:v]setpts=PTS-STARTPTS+{format_seconds(offset)}/TB,{chain}[v{index}]')
             overlays.append(f'[b{index}][v{index}]overlay=x={x}:y={y}:eof_action=pass[b{index + 1}]')
             index += 1
-    base = f'color=c=black:s={cols * cell_w}x{rows * pitch}:r=30:d={format_seconds(total)}'
+    base = f'color=c=0x505050:s={canvas_w}x{canvas_h}:r=30:d={format_seconds(total)}'
     header_filters = []
     for number, header in enumerate(headers):
         inputs += ['-i', header]
         source = f'[h{number}]' if number else f'{base}[h0];[h0]'
         target = '[b0]' if number == len(headers) - 1 else f'[h{number + 1}]'
-        header_filters.append(f'{source}[{index + number}:v]overlay=x={number % cols * cell_w}:'
-                              f'y={number // cols * pitch}{target}')
+        x, y, _, _ = tiles[number]
+        header_filters.append(f'{source}[{index + number}:v]overlay=x={x}:y={y - header_h}{target}')
     if not headers:
         header_filters.append(f'{base}[b0]')
     graph = ';'.join(header_filters + filters + overlays)
