@@ -28,9 +28,9 @@
     If the device cannot run a second hardware video encoder, the recorder switches to a software encoder.
 
     "Record combined" in the control panel records the selected devices as usual and, once all of them have
-    stopped, also joins their recordings into one grid video with each device name above its screen (no
-    audio, synchronized to about one second). Every screen is scaled by the same factor, so a smaller
-    device keeps its real size and proportions instead of being stretched:
+    stopped, also joins their recordings into one video laid out like the arranged device windows, with
+    each device name above its screen (no audio, synchronized to about one second, at most 2560x1440).
+    Every screen is scaled by the same factor, so a smaller device keeps its real size and proportions:
         <RecordDir>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
 
     The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
@@ -681,14 +681,14 @@ function Get-WindowLayout([System.Drawing.Rectangle]$Area, $Items, [int]$Gap = 8
         , $sizes
     })
     $totalHeight = (@($rowSizes | ForEach-Object { ($_ | Measure-Object -Property Height -Maximum).Maximum }) | Measure-Object -Sum).Sum + ($best.Groups.Count - 1) * $Gap
-    $y = $Area.Y + [int](($Area.Height - $totalHeight) / 2)
+    $y = $Area.Y + [int][Math]::Floor(($Area.Height - $totalHeight) / 2)
     $rects = New-Object System.Collections.ArrayList
     foreach ($sizes in $rowSizes) {
         $rowHeight = ($sizes | Measure-Object -Property Height -Maximum).Maximum
         $rowWidth = ($sizes | Measure-Object -Property Width -Sum).Sum + ($sizes.Count - 1) * $Gap
-        $x = $Area.X + [int](($Area.Width - $rowWidth) / 2)
+        $x = $Area.X + [int][Math]::Floor(($Area.Width - $rowWidth) / 2)
         foreach ($size in $sizes) {
-            [void]$rects.Add((New-Object System.Drawing.Rectangle($x, ($y + [int](($rowHeight - $size.Height) / 2)), $size.Width, $size.Height)))
+            [void]$rects.Add((New-Object System.Drawing.Rectangle($x, ($y + [int][Math]::Floor(($rowHeight - $size.Height) / 2)), $size.Width, $size.Height)))
             $x += $size.Width + $Gap
         }
         $y += $rowHeight + $Gap
@@ -729,13 +729,14 @@ function Set-WindowArrangement {
             Aspect      = $aspect
             FrameWidth  = $outer.Width - $client.Right
             FrameHeight = $outer.Height - $client.Bottom
-            MaxHeight   = $session.NaturalSize / [Math]::Max(1, $aspect)
+            MaxHeight   = $session.NaturalSize / [Math]::Max(1.0, $aspect)
             Work        = New-Object System.Drawing.Rectangle($work.Left, $work.Top, ($work.Right - $work.Left), ($work.Bottom - $work.Top))
         })
     }
     if (-not $items.Count) { return }
     $area = Get-ArrangeArea
     if (-not $area) { return }
+    $script:ArrangeArea = $area
     $rects = Get-WindowLayout $area $items.ToArray()
     if (-not $rects) { return }
     for ($i = 0; $i -lt $items.Count; $i++) {
@@ -1135,13 +1136,13 @@ function Get-CombineSegments([string[]]$Parts, [hashtable]$PartStarts) {
 }
 
 function Start-CombinedRecording($Sessions) {
-    $group = [pscustomobject]@{ RequestedAt = Get-Date; Members = New-Object System.Collections.ArrayList; Finished = $false }
+    $group = [pscustomobject]@{ RequestedAt = Get-Date; Members = New-Object System.Collections.ArrayList; Finished = $false; Area = $script:ArrangeArea }
     $started = New-Object System.Collections.ArrayList
     foreach ($session in @($Sessions | Sort-Object Title)) {
         if ($session.Recording -or $session.Stopping) { continue }
         Start-Recording $session
         if (-not $session.Recording) { continue }
-        $member = [pscustomobject]@{ Group = $group; Title = $session.Title; Segments = @(); Open = 1; Done = $false }
+        $member = [pscustomobject]@{ Group = $group; Title = $session.Title; Segments = @(); Open = 1; Done = $false; Natural = $session.NaturalSize }
         [void]$group.Members.Add($member)
         $session.CombineMember = $member
         $session.PartStarts = @{}
@@ -1254,6 +1255,57 @@ function New-CombineHeader([string]$Text, [int]$Width, [int]$Height, [string]$Pa
     } finally { $bitmap.Dispose() }
 }
 
+function ConvertTo-Even([double]$Value) {
+    [int][math]::Max(2, [math]::Round($Value / 2) * 2)
+}
+
+function Get-CombineLayout($Sizes, $Naturals, $Area, [int]$Gap = 8) {
+    $areaW = 1920
+    $areaH = 1080
+    if ($Area -and $Area.Width -gt 0 -and $Area.Height -gt 0) { $areaW = $Area.Width; $areaH = $Area.Height }
+    $title = [int][math]::Max(16, [math]::Floor($areaH / 36))
+    $items = @(for ($n = 0; $n -lt $Sizes.Count; $n++) {
+        $width = [double]$Sizes[$n][0]
+        $height = [double]$Sizes[$n][1]
+        $aspect = $width / $height
+        $natural = if ($Naturals -and $n -lt $Naturals.Count -and $Naturals[$n]) { [double]$Naturals[$n] } else { 0 }
+        $maxHeight = if ($natural -gt 0) { $natural / [math]::Max(1.0, $aspect) }
+                     else { $height * [math]::Min(1.0, [math]::Min([math]::Max(1, $areaW - 96) / $width, [math]::Max(1, $areaH - 96) / $height)) }
+        [pscustomobject]@{ Aspect = $aspect; FrameWidth = 0; FrameHeight = $title; MaxHeight = $maxHeight }
+    })
+    $rects = $null
+    foreach ($grow in 1, 2, 4, 8, 16) {
+        $rects = Get-WindowLayout (New-Object System.Drawing.Rectangle(0, 0, ($areaW * $grow), ($areaH * $grow))) $items $Gap
+        if ($rects) { break }
+    }
+    if (-not $rects) { $rects = @(for ($n = 0; $n -lt $Sizes.Count; $n++) { New-Object System.Drawing.Rectangle(($n * 66), 0, 58, (50 + $title)) }) }
+    $left = ($rects | Measure-Object -Property X -Minimum).Minimum
+    $top = ($rects | Measure-Object -Property Y -Minimum).Minimum
+    $width = ($rects | ForEach-Object { $_.Right } | Measure-Object -Maximum).Maximum - $left + 2 * $Gap
+    $height = ($rects | ForEach-Object { $_.Bottom } | Measure-Object -Maximum).Maximum - $top + 2 * $Gap
+    $ratio = 0.0
+    for ($n = 0; $n -lt $rects.Count; $n++) { $ratio = [math]::Max($ratio, $Sizes[$n][1] / [math]::Max(1, $rects[$n].Height - $title)) }
+    $scale = [math]::Min([math]::Max(1.0, $ratio), [math]::Min(2560.0 / $width, 1440.0 / $height))
+    for ($round = 0; $round -lt 8; $round++) {
+        $headerH = ConvertTo-Even ($title * $scale)
+        $tiles = @(foreach ($r in $rects) {
+            New-Object System.Drawing.Rectangle((ConvertTo-Even (($r.X - $left + $Gap) * $scale)), ((ConvertTo-Even (($r.Y - $top + $Gap) * $scale)) + $headerH),
+                (ConvertTo-Even ($r.Width * $scale)), (ConvertTo-Even (($r.Height - $title) * $scale)))
+        })
+        $margin = ConvertTo-Even ($Gap * $scale)
+        $canvasW = [int](($tiles | ForEach-Object { $_.Right } | Measure-Object -Maximum).Maximum + $margin)
+        $canvasH = [int](($tiles | ForEach-Object { $_.Bottom } | Measure-Object -Maximum).Maximum + $margin)
+        if ($canvasW -le 2560 -and $canvasH -le 1440) { break }
+        $scale = $scale * [math]::Min(1.0, [math]::Min(2558.0 / $canvasW, 1438.0 / $canvasH))
+    }
+    [pscustomobject]@{
+        Width        = $canvasW
+        Height       = $canvasH
+        HeaderHeight = $headerH
+        Tiles        = $tiles
+    }
+}
+
 function Start-Combine($Group, $Members) {
     $t0 = $null
     foreach ($member in $Members) {
@@ -1263,19 +1315,11 @@ function Start-Combine($Group, $Members) {
         }
     }
     $count = $Members.Count
-    $cols = if ($count -le 3) { $count } else { [int][math]::Ceiling([math]::Sqrt($count)) }
-    $rows = [int][math]::Ceiling($count / $cols)
     $sizes = @(foreach ($member in $Members) { , (Get-VideoSize $member.Segments[0].Path) })
-    $maxW = [double]($sizes | ForEach-Object { $_[0] } | Measure-Object -Maximum).Maximum
-    $maxH = [double]($sizes | ForEach-Object { $_[1] } | Measure-Object -Maximum).Maximum
-    $factor = [math]::Min([math]::Min(1.0, 1280 / $maxH), [math]::Min(3840 / ($cols * $maxW), 2160 / ($rows * $maxH * 1.05)))
-    $cellW = [int][math]::Max(16, [math]::Floor($maxW * $factor / 2) * 2)
-    $cellH = [int][math]::Max(16, [math]::Floor($maxH * $factor / 2) * 2)
-    $headerH = [int][math]::Max(16, [math]::Floor($cellH / 40) * 2)
-    $pitch = $cellH + $headerH
+    $layout = Get-CombineLayout $sizes @($Members | ForEach-Object { $_.Natural }) $Group.Area
+    $headerH = $layout.HeaderHeight
+    $tiles = $layout.Tiles
 
-    $fit = "min($($factor.ToString('0.000000', [Globalization.CultureInfo]::InvariantCulture)),min($cellW/iw,$cellH/ih))"
-    $chain = "scale=w='max(2,trunc(iw*$fit/2)*2)':h='max(2,trunc(ih*$fit/2)*2)':eval=frame,pad=${cellW}:${cellH}:(ow-iw)/2:0:eval=frame,setsar=1"
     $inputs = New-Object System.Collections.Generic.List[string]
     $filters = New-Object System.Collections.Generic.List[string]
     $overlays = New-Object System.Collections.Generic.List[string]
@@ -1284,7 +1328,7 @@ function Start-Combine($Group, $Members) {
     for ($m = 0; $m -lt $count; $m++) {
         $path = Join-Path $script:LogDir "combine-$stamp-header$($m + 1).png"
         try {
-            New-CombineHeader $Members[$m].Title $cellW $headerH $path
+            New-CombineHeader $Members[$m].Title $tiles[$m].Width $headerH $path
             $headers.Add($path)
         } catch {
             Write-Log "Could not create the combined recording header for $($Members[$m].Title): $($_.Exception.Message)"
@@ -1296,24 +1340,25 @@ function Start-Combine($Group, $Members) {
     $total = 0.0
     $index = 0
     for ($m = 0; $m -lt $count; $m++) {
-        $x = ($m % $cols) * $cellW
-        $y = [int][math]::Floor($m / $cols) * $pitch + $headerH
+        $tile = $tiles[$m]
+        $fit = "min($($tile.Width)/iw,$($tile.Height)/ih)"
+        $chain = "scale=w='max(2,trunc(iw*$fit/2)*2)':h='max(2,trunc(ih*$fit/2)*2)':eval=frame,pad=$($tile.Width):$($tile.Height):(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1"
         foreach ($segment in $Members[$m].Segments) {
             $offset = [math]::Max(0.0, ($segment.Start - $t0).TotalSeconds)
             $total = [math]::Max($total, $offset + $segment.Duration)
             $inputs.AddRange([string[]]@('-reinit_filter', '0', '-ss', (Format-Seconds $segment.Position), '-t', (Format-Seconds $segment.Duration), '-i', $segment.Path))
             $filters.Add("[${index}:v]setpts=PTS-STARTPTS+$(Format-Seconds $offset)/TB,$chain[v$index]")
-            $overlays.Add("[b$index][v$index]overlay=x=${x}:y=${y}:eof_action=pass[b$($index + 1)]")
+            $overlays.Add("[b$index][v$index]overlay=x=$($tile.X):y=$($tile.Y):eof_action=pass[b$($index + 1)]")
             $index++
         }
     }
-    $base = "color=c=black:s=$($cols * $cellW)x$($rows * $pitch):r=30:d=$(Format-Seconds $total)"
+    $base = "color=c=0x505050:s=$($layout.Width)x$($layout.Height):r=30:d=$(Format-Seconds $total)"
     $headerFilters = New-Object System.Collections.Generic.List[string]
     for ($m = 0; $m -lt $headers.Count; $m++) {
         $inputs.AddRange([string[]]@('-i', $headers[$m]))
         $source = if ($m) { "[h$m]" } else { "$base[h0];[h0]" }
         $target = if ($m -eq $headers.Count - 1) { '[b0]' } else { "[h$($m + 1)]" }
-        $headerFilters.Add("$source[$($index + $m):v]overlay=x=$(($m % $cols) * $cellW):y=$([int][math]::Floor($m / $cols) * $pitch)$target")
+        $headerFilters.Add("$source[$($index + $m):v]overlay=x=$($tiles[$m].X):y=$($tiles[$m].Y - $headerH)$target")
     }
     if (-not $headers.Count) { $headerFilters.Add("$base[b0]") }
     $graph = (@($headerFilters) + $filters + $overlays) -join ';'
@@ -2153,7 +2198,7 @@ function Show-About {
         "- Switch a device between USB and Wi-Fi; the old entry is removed, and if the switch fails the previous connection is restored.`n" +
         "- Device windows open centered without overlapping, at 100% when they fit, and are arranged again when a window opens or closes (Window > Arrange windows).`n" +
         "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device with the device name as a header above the screen.`n" +
-        "- Record combined also joins the recordings of the selected devices into one side-by-side video, with each device name above its screen; each device keeps its real size and proportions.`n" +
+        "- Record combined also joins the recordings of the selected devices into one video laid out like the arranged device windows, with each device name above its screen; each device keeps its real size and proportions.`n" +
         "- Click a column header to sort the list; global actions are in the File, Recording, Window and Help menus.`n" +
         "- Checks for updates at startup (Help > Check for updates automatically) or on request; the portable version updates itself.`n`n" +
         'Built on scrcpy by Genymobile (Apache License 2.0).'
@@ -3396,6 +3441,7 @@ $script:Exiting = $false
 $script:ExitRequested = $false
 $script:ArrangeRequestedAt = $null
 $script:ArrangeFollowUp = $false
+$script:ArrangeArea = $null
 $script:AutoArrange = -not @($ScrcpyArgs | Where-Object { $_ -match '^(--window-(x|y|width|height)|--fullscreen|-f)(=|$)' }).Count
 $script:OpenWindowsRequested = $false
 $script:RecordOnStart = [bool]$Record

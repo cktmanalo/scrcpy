@@ -208,11 +208,11 @@ RECORD
 RECORD COMBINED
   Select two or more devices in the control panel and click "Record combined". Each device is recorded
   and saved as above; when all of them have stopped (stop them together or one by one), their recordings
-  are also joined side by side into one video:
+  are also joined into one video laid out like the arranged device windows (at most 2560x1440):
     <Recordings folder>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
   Each screen has a header with its device name. Every device keeps its own proportions and relative size:
-  a smaller screen (for example P630) is not stretched to match the others. A device that stops early or restarts shows black in
-  its place until the others stop. The combined video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
+  a smaller screen (for example P630) is not stretched to match the others. A device that stops early or   restarts shows the gray background
+    under its header until the others stop. The combined video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
   the combined video; if it is not finished by then, it is cancelled.
 
 DEVICE LIST
