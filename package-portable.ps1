@@ -7,7 +7,7 @@
     ffmpeg/ffprobe (to join recordings), adb, the monitor scripts and a README into
     dist\scrcpy-monitor-portable-<version>\ and zips it.
 
-    The package checks -UpdateRepo for new releases. -Publish uploads the ZIP as the latest GitHub release of
+    The package checks -UpdateRepo for new releases. -Publish uploads the ZIP and both user guides as the latest GitHub release of
     -UpdateRepo (tag qa-<version>), so every installed package offers to update itself. Publishing needs a
     clean working tree, HEAD pushed to origin and the GitHub CLI (gh) signed in.
 
@@ -208,11 +208,11 @@ RECORD
 RECORD COMBINED
   Select two or more devices in the control panel and click "Record combined". Each device is recorded
   and saved as above; when all of them have stopped (stop them together or one by one), their recordings
-  are also joined side by side into one video:
+  are also joined into one video laid out like the arranged device windows (at most 2560x1440):
     <Recordings folder>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
   Each screen has a header with its device name. Every device keeps its own proportions and relative size:
-  a smaller screen (for example P630) is not stretched to match the others. A device that stops early or restarts shows black in
-  its place until the others stop. The combined video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
+  a smaller screen (for example P630) is not stretched to match the others. A device that stops early or   restarts shows the gray background
+    under its header until the others stop. The combined video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
   the combined video; if it is not finished by then, it is cancelled.
 
 DEVICE LIST
@@ -268,7 +268,7 @@ if ($Publish) {
     Set-Content -LiteralPath $notesFile -Value $text -Encoding UTF8
     try {
         Write-Host "Publishing $tag to $UpdateRepo..."
-        & gh release create $tag $zip (Join-Path $root 'scrcpy-monitor-guide.docx') --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
+        & gh release create $tag $zip (Join-Path $root 'scrcpy-monitor-guide.docx') (Join-Path $root 'scrcpy-monitor-guide-macos-linux.docx') --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
         if ($LASTEXITCODE) { throw "gh release create failed ($LASTEXITCODE)." }
     } finally {
         Remove-Item -LiteralPath $notesFile -Force -ErrorAction SilentlyContinue

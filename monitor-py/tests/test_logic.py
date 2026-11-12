@@ -364,40 +364,51 @@ class CombineTest(unittest.TestCase):
         self.assertEqual(logic.format_seconds(2.0001), '2')
         self.assertEqual(logic.format_seconds(30.048), '30.048')
 
-    def test_grid(self):
-        self.assertEqual(logic.combine_grid(2), (2, 1))
-        self.assertEqual(logic.combine_grid(3), (3, 1))
-        self.assertEqual(logic.combine_grid(4), (2, 2))
-        self.assertEqual(logic.combine_grid(5), (3, 2))
-        self.assertEqual(logic.combine_grid(10), (4, 3))
+    def test_layout_matches_arranged_windows(self):
+        sizes = [(320, 480), (720, 1280), (720, 1440), (720, 1440)]
+        canvas_w, canvas_h, header_h, tiles = logic.combine_layout(sizes, [480, 811, 812, 812], (0, 0, 1920, 1032))
+        self.assertEqual((canvas_w, canvas_h, header_h), (2558, 1344, 44))
+        self.assertEqual([y for _, y, _, _ in tiles[1:]], [56, 56, 56])
+        self.assertEqual([x for x, _, _, _ in tiles], sorted(x for x, _, _, _ in tiles))
+        small, large = tiles[0], tiles[1]
+        self.assertAlmostEqual(small[1] - header_h + (small[3] + header_h) / 2,
+                               large[1] - header_h + (large[3] + header_h) / 2, delta=2)
+        self.assertAlmostEqual(small[3] / large[3], 480 / 811, delta=0.01)
+        for x, y, w, h in tiles:
+            self.assertEqual((x % 2, y % 2, w % 2, h % 2), (0, 0, 0, 0))
+            self.assertLessEqual(x + w, canvas_w)
+            self.assertLessEqual(y + h, canvas_h)
 
-    def test_cell_matches_windows_output(self):
-        self.assertEqual(logic.combine_cell([(320, 480), (720, 1280), (720, 1440)], 3, 1), (640, 1280))
-        self.assertEqual(logic.combine_cell([(720, 1280)] * 4, 2, 2), (578, 1028))
+    def test_layout_without_window_sizes(self):
+        canvas_w, canvas_h, _, tiles = logic.combine_layout([(720, 1280)] * 2, [0, 0], None)
+        self.assertEqual((canvas_w, canvas_h), (1472, 1340))
+        self.assertEqual([t[2:] for t in tiles], [(720, 1280), (720, 1280)])
 
-    def test_scale_keeps_device_proportions(self):
-        factor, cell_w, cell_h = logic.combine_scale([(320, 480), (720, 1280), (720, 1440)], 3, 1)
-        self.assertAlmostEqual(factor, 1280 / 1440)
-        self.assertEqual(logic.combine_scale([(320, 480), (720, 1280)], 2, 1), (1.0, 720, 1280))
-        chain = logic.combine_chain(factor, cell_w, cell_h)
-        self.assertEqual(chain, "scale=w='max(2,trunc(iw*min(0.888889,min(640/iw,1280/ih))/2)*2)':"
-                                "h='max(2,trunc(ih*min(0.888889,min(640/iw,1280/ih))/2)*2)':eval=frame,"
-                                'pad=640:1280:(ow-iw)/2:0:eval=frame,setsar=1')
+    def test_layout_limits_size_and_uses_rows(self):
+        canvas_w, canvas_h, _, tiles = logic.combine_layout([(1080, 2400)] * 9, None, None)
+        self.assertLessEqual(canvas_w, 2560)
+        self.assertLessEqual(canvas_h, 1440)
+        self.assertEqual(len({y for _, y, _, _ in tiles}), 2)
 
-    def test_cell_limits_to_4k(self):
-        self.assertEqual(logic.combine_cell([(1080, 2400)] * 9, 3, 3), (308, 684))
+    def test_layout_rounding_stays_within_limit(self):
+        canvas_w, canvas_h, _, tiles = logic.combine_layout(
+            [(758, 990), (2208, 2200), (1200, 1920)], [0, 836, 365], (0, 0, 2560, 1400))
+        self.assertEqual((canvas_w, canvas_h), (2552, 1438))
+        for x, y, w, h in tiles:
+            self.assertLessEqual(x + w, canvas_w)
+            self.assertLessEqual(y + h, canvas_h)
+
+    def test_chain_centers_device_in_tile(self):
+        self.assertEqual(logic.combine_chain(640, 1280),
+                         "scale=w='max(2,trunc(iw*min(640/iw,1280/ih)/2)*2)':"
+                         "h='max(2,trunc(ih*min(640/iw,1280/ih)/2)*2)':eval=frame,"
+                         'pad=640:1280:(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1')
 
     def test_header_height(self):
         self.assertEqual(logic.combine_header_height(1080), 54)
         self.assertEqual(logic.combine_header_height(1028), 50)
         self.assertEqual(logic.combine_header_height(684), 34)
         self.assertEqual(logic.combine_header_height(300), 16)
-
-    def test_layout(self):
-        self.assertEqual(logic.combine_layout([(720, 1280)] * 4), (2, 2, 578, 1028, 50))
-        self.assertEqual(logic.combine_layout([(1080, 2400)] * 9), (3, 3, 308, 684, 34))
-        cols, rows, _, cell_h, header_h = logic.combine_layout([(1080, 2400)] * 9)
-        self.assertLessEqual(rows * (cell_h + header_h), 2160)
 
     def members(self):
         t0 = NOW
@@ -407,45 +418,35 @@ class CombineTest(unittest.TestCase):
              {'path': 'c.mp4', 'position': 2.0, 'duration': 1.5, 'start': t0 + timedelta(seconds=4)}],
         ]
 
+    LAYOUT = (1500, 900, 40, [(10, 50, 480, 840), (500, 300, 990, 556)])
+
     def test_command(self):
-        args, total, count = logic.combine_command(self.members(), [(720, 1280), (1280, 720)], NOW,
-                                                   ['-c:v', 'mpeg4'], 'out.mp4')
+        args, total, count = logic.combine_command(self.members(), self.LAYOUT, NOW, ['-c:v', 'mpeg4'], 'out.mp4')
         self.assertEqual((total, count), (6.5, 3))
         self.assertEqual(args[-1], 'out.mp4')
         self.assertEqual(args[-3:-1], ['-t', '6.5'])
         self.assertEqual(args.count('-reinit_filter'), 3)
         graph = args[args.index('-filter_complex') + 1]
-        self.assertTrue(graph.startswith('color=c=black:s=2560x1344:r=30:d=6.5[b0];'))
-        self.assertIn("[0:v]setpts=PTS-STARTPTS+0.5/TB,scale=w='max(2,trunc(iw*min(1.000000,min(1280/iw,1280/ih))/2)*2)'", graph)
-        self.assertIn('[2:v]setpts=PTS-STARTPTS+4/TB,', graph)
-        self.assertIn('[b0][v0]overlay=x=0:y=64:eof_action=pass[b1]', graph)
-        self.assertIn('[b2][v2]overlay=x=1280:y=64:eof_action=pass[b3]', graph)
+        self.assertTrue(graph.startswith('color=c=0x505050:s=1500x900:r=30:d=6.5[b0];'))
+        self.assertIn("[0:v]setpts=PTS-STARTPTS+0.5/TB,scale=w='max(2,trunc(iw*min(480/iw,840/ih)/2)*2)'", graph)
+        self.assertIn("[2:v]setpts=PTS-STARTPTS+4/TB,scale=w='max(2,trunc(iw*min(990/iw,556/ih)/2)*2)'", graph)
+        self.assertIn('[b0][v0]overlay=x=10:y=50:eof_action=pass[b1]', graph)
+        self.assertIn('[b2][v2]overlay=x=500:y=300:eof_action=pass[b3]', graph)
         self.assertEqual(args[args.index('-map') + 1], '[b3]')
         second = args.index('-i', args.index('-i') + 1)
         self.assertEqual(args[second - 4:second + 2], ['-ss', '0', '-t', '2', '-i', 'c.mp4'])
 
     def test_command_with_headers(self):
-        args, _, count = logic.combine_command(self.members(), [(720, 1280), (1280, 720)], NOW,
-                                               ['-c:v', 'mpeg4'], 'out.mp4', ['h1.png', 'h2.png'])
+        args, _, count = logic.combine_command(self.members(), self.LAYOUT, NOW, ['-c:v', 'mpeg4'], 'out.mp4',
+                                               ['h1.png', 'h2.png'])
         self.assertEqual(count, 3)
         graph = args[args.index('-filter_complex') + 1]
-        self.assertTrue(graph.startswith('color=c=black:s=2560x1344:r=30:d=6.5[h0];[h0][3:v]overlay=x=0:y=0[h1];'
-                                         '[h1][4:v]overlay=x=1280:y=0[b0];[0:v]'))
-        self.assertIn('[b2][v2]overlay=x=1280:y=64:eof_action=pass[b3]', graph)
+        self.assertTrue(graph.startswith('color=c=0x505050:s=1500x900:r=30:d=6.5[h0];[h0][3:v]overlay=x=10:y=10[h1];'
+                                         '[h1][4:v]overlay=x=500:y=260[b0];[0:v]'))
         self.assertEqual(args[args.index('-map') + 1], '[b3]')
         inputs = args[:args.index('-filter_complex')]
         self.assertEqual(inputs[-4:], ['-i', 'h1.png', '-i', 'h2.png'])
         self.assertEqual(inputs.count('-i'), 5)
-
-    def test_command_header_rows(self):
-        members = [[{'path': f'{n}.mp4', 'position': 0.0, 'duration': 1.0, 'start': NOW}] for n in range(4)]
-        args, _, _ = logic.combine_command(members, [(720, 1280)] * 4, NOW, [], 'out.mp4',
-                                           [f'h{n}.png' for n in range(4)])
-        graph = args[args.index('-filter_complex') + 1]
-        self.assertTrue(graph.startswith('color=c=black:s=1156x2156:r=30:d=1[h0];'))
-        self.assertIn('[h2][6:v]overlay=x=0:y=1078[h3]', graph)
-        self.assertIn('[h3][7:v]overlay=x=578:y=1078[b0]', graph)
-        self.assertIn('[b3][v3]overlay=x=578:y=1128:eof_action=pass[b4]', graph)
 
     def test_encoder_choice(self):
         self.assertEqual(logic.combine_encoder_args(' V....D libx264   H.264 ')[1], 'libx264')
