@@ -7,7 +7,7 @@
     ffmpeg/ffprobe (to join recordings), adb, the monitor scripts and a README into
     dist\scrcpy-monitor-portable-<version>\ and zips it.
 
-    The package checks -UpdateRepo for new releases. -Publish uploads the ZIP as the latest GitHub release of
+    The package checks -UpdateRepo for new releases. -Publish uploads the ZIP and both user guides as the latest GitHub release of
     -UpdateRepo (tag qa-<version>), so every installed package offers to update itself. Publishing needs a
     clean working tree, HEAD pushed to origin and the GitHub CLI (gh) signed in.
 
@@ -268,7 +268,7 @@ if ($Publish) {
     Set-Content -LiteralPath $notesFile -Value $text -Encoding UTF8
     try {
         Write-Host "Publishing $tag to $UpdateRepo..."
-        & gh release create $tag $zip (Join-Path $root 'scrcpy-monitor-guide.docx') --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
+        & gh release create $tag $zip (Join-Path $root 'scrcpy-monitor-guide.docx') (Join-Path $root 'scrcpy-monitor-guide-macos-linux.docx') --repo $UpdateRepo --target $head --title "scrcpy monitor $displayVersion" --notes-file $notesFile --latest
         if ($LASTEXITCODE) { throw "gh release create failed ($LASTEXITCODE)." }
     } finally {
         Remove-Item -LiteralPath $notesFile -Force -ErrorAction SilentlyContinue
