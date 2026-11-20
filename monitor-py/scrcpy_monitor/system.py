@@ -59,18 +59,21 @@ class Paths:
             self.logs = self.state / 'logs'
             self.log_file = self.state / 'scrcpy-monitor.log'
             self.default_record_dir = home / 'Videos' / 'scrcpy Recordings'
+            self.default_log_dir = home / 'Documents' / 'scrcpy Logs'
         elif IS_MAC:
             self.data = home / 'Library' / 'Application Support' / APP_NAME
             self.state = self.data / 'state'
             self.logs = home / 'Library' / 'Logs' / APP_NAME
             self.log_file = self.logs / 'scrcpy-monitor.log'
             self.default_record_dir = home / 'Movies' / 'Scrcpy Recordings'
+            self.default_log_dir = home / 'Documents' / 'Scrcpy Logs'
         else:
             self.data = _xdg('XDG_DATA_HOME', '.local/share') / 'scrcpy-monitor'
             self.state = _xdg('XDG_STATE_HOME', '.local/state') / 'scrcpy-monitor'
             self.logs = self.state / 'logs'
             self.log_file = self.logs / 'scrcpy-monitor.log'
             self.default_record_dir = _linux_videos_dir() / 'Scrcpy Recordings'
+            self.default_log_dir = home / 'Documents' / 'Scrcpy Logs'
         self.control = self.state / 'control'
         self.settings = self.data / 'settings.json'
         self.known_wifi = self.data / 'wifi-devices.json'
@@ -553,3 +556,32 @@ def open_path(path):
     from PySide6.QtCore import QUrl
     from PySide6.QtGui import QDesktopServices
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+MAC_LOGOUT_REASONS = {int.from_bytes(code.encode('ascii'), 'big') for code in ('logo', 'rlgo', 'rrst', 'rsdn', 'rest', 'shut')}
+
+
+def mac_session_ending():
+    try:
+        import ctypes
+        import ctypes.util
+        objc = ctypes.CDLL(ctypes.util.find_library('objc') or '/usr/lib/libobjc.A.dylib')
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        address = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+        send = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(address)
+        send_keyword = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32)(address)
+        send_code = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p)(address)
+        manager = send(objc.objc_getClass(b'NSAppleEventManager'), objc.sel_registerName(b'sharedAppleEventManager'))
+        event = send(manager, objc.sel_registerName(b'currentAppleEvent')) if manager else None
+        if not event:
+            return False
+        reason = send_keyword(event, objc.sel_registerName(b'attributeDescriptorForKeyword:'),
+                              int.from_bytes(b'why?', 'big'))
+        if not reason:
+            return False
+        return send_code(reason, objc.sel_registerName(b'enumCodeValue')) in MAC_LOGOUT_REASONS
+    except Exception as error:
+        log(f'Could not read the macOS quit reason: {error}')
+        return True

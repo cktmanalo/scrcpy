@@ -74,6 +74,13 @@ class XEvent(ctypes.Union):
 
 
 X_ERROR_HANDLER = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p)
+IGNORE_X_ERRORS = X_ERROR_HANDLER(lambda display, event: 0)
+
+
+def ignore_x_errors(lib, handler=IGNORE_X_ERRORS):
+    lib.XSetErrorHandler.argtypes = [c_void_p]
+    lib.XSetErrorHandler.restype = c_void_p
+    lib.XSetErrorHandler(ctypes.cast(handler, c_void_p))
 
 
 class X11Mover:
@@ -83,7 +90,6 @@ class X11Mover:
         self.display = None
         self.root = 0
         self.shadow = 0
-        self.previous_handler = None
         if not os.environ.get('DISPLAY'):
             self.reason = 'no X11 display; windows can only be arranged on X11 or XWayland'
             return
@@ -107,10 +113,7 @@ class X11Mover:
         lib.XMoveResizeWindow.argtypes = [c_void_p, c_ulong, c_int, c_int, c_uint, c_uint]
         lib.XSendEvent.argtypes = [c_void_p, c_ulong, c_int, c_long, POINTER(XEvent)]
         lib.XSync.argtypes = [c_void_p, c_int]
-        lib.XSetErrorHandler.argtypes = [c_void_p]
-        lib.XSetErrorHandler.restype = c_void_p
         self.lib = lib
-        self.ignore_errors = X_ERROR_HANDLER(lambda display, event: 0)
         self.atoms = {}
 
     def available(self):
@@ -127,7 +130,7 @@ class X11Mover:
             raise OSError('cannot open the X11 display')
         self.display = display
         self.atoms = {}
-        self.previous_handler = self.lib.XSetErrorHandler(ctypes.cast(self.ignore_errors, c_void_p))
+        ignore_x_errors(self.lib)
         self.root = self.lib.XDefaultRootWindow(display)
         check = self._cardinals(self.root, '_NET_SUPPORTING_WM_CHECK')
         self.shadow = WESTON_SHADOW_MARGIN if check and self._text(check[0], '_NET_WM_NAME') == 'Weston WM' else 0
@@ -137,7 +140,6 @@ class X11Mover:
             return
         display, self.display = self.display, None
         self.lib.XSync(display, 0)
-        self.lib.XSetErrorHandler(self.previous_handler)
         self.lib.XCloseDisplay(display)
 
     def _atom(self, name):
@@ -256,6 +258,40 @@ class X11Mover:
             self.lib.XSendEvent(self.display, self.root, 0, (1 << 19) | (1 << 20), byref(event))
         else:
             self.lib.XMoveResizeWindow(self.display, window.handle, x, y, client_width, client_height)
+
+    def window_rect(self, window):
+        self._open()
+        attributes = XWindowAttributes()
+        if not self.lib.XGetWindowAttributes(self.display, window, byref(attributes)) or attributes.map_state != 2:
+            return None
+        if self._atom('_NET_WM_STATE_HIDDEN') in self._cardinals(window, '_NET_WM_STATE'):
+            return None
+        x, y, child = c_int(), c_int(), c_ulong()
+        if not self.lib.XTranslateCoordinates(self.display, window, self.root, 0, 0, byref(x), byref(y), byref(child)):
+            return None
+        return (x.value, y.value, attributes.width, attributes.height)
+
+    def _client_windows(self):
+        found = []
+        top, _ = self._children(self.root)
+        for window in top:
+            if self._property(window, 'WM_STATE', 32) is not None:
+                found.append(window)
+                continue
+            children, _ = self._children(window)
+            found += [child for child in children if self._property(child, 'WM_STATE', 32) is not None]
+        return found
+
+    def list_windows(self):
+        self._open()
+        found = []
+        for window in self._cardinals(self.root, '_NET_CLIENT_LIST') or self._client_windows():
+            if not self.window_rect(window):
+                continue
+            title = self._text(window, '_NET_WM_NAME') or self._text(window, 'WM_NAME')
+            pid = self._cardinals(window, '_NET_WM_PID')
+            found.append((window, title, pid[0] if pid else 0))
+        return found
 
 
 class CGPoint(ctypes.Structure):
@@ -423,3 +459,92 @@ class MacMover:
         for element in retained:
             if element:
                 self.cf.CFRelease(element)
+
+
+class CGRect(ctypes.Structure):
+    _fields_ = [('origin', CGPoint), ('size', CGSize)]
+
+
+class MacWindowList:
+    KEYS = ('kCGWindowNumber', 'kCGWindowOwnerPID', 'kCGWindowOwnerName', 'kCGWindowName', 'kCGWindowBounds',
+            'kCGWindowLayer', 'kCGWindowIsOnscreen')
+
+    def __init__(self):
+        cg = ctypes.CDLL('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+        cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        cg.CGWindowListCopyWindowInfo.argtypes = [c_uint32, c_uint32]
+        cg.CGWindowListCopyWindowInfo.restype = c_void_p
+        cg.CGRectMakeWithDictionaryRepresentation.argtypes = [c_void_p, POINTER(CGRect)]
+        cg.CGRectMakeWithDictionaryRepresentation.restype = c_bool
+        cf.CFRelease.argtypes = [c_void_p]
+        cf.CFArrayGetCount.argtypes = [c_void_p]
+        cf.CFArrayGetCount.restype = c_long
+        cf.CFArrayGetValueAtIndex.argtypes = [c_void_p, c_long]
+        cf.CFArrayGetValueAtIndex.restype = c_void_p
+        cf.CFDictionaryGetValue.argtypes = [c_void_p, c_void_p]
+        cf.CFDictionaryGetValue.restype = c_void_p
+        cf.CFNumberGetValue.argtypes = [c_void_p, c_long, c_void_p]
+        cf.CFNumberGetValue.restype = c_bool
+        cf.CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
+        cf.CFStringGetCString.restype = c_bool
+        cf.CFBooleanGetValue.argtypes = [c_void_p]
+        cf.CFBooleanGetValue.restype = c_bool
+        self.cg, self.cf = cg, cf
+        self.keys = {name: c_void_p.in_dll(cg, name).value for name in self.KEYS}
+
+    def _number(self, value):
+        number = ctypes.c_int64()
+        return number.value if value and self.cf.CFNumberGetValue(value, 4, byref(number)) else 0
+
+    def _string(self, value):
+        if not value:
+            return ''
+        buffer = ctypes.create_string_buffer(1024)
+        return buffer.value.decode('utf-8', 'replace') if self.cf.CFStringGetCString(value, buffer, 1024,
+                                                                                      0x08000100) else ''
+
+    def _windows(self, option, window=0):
+        array = self.cg.CGWindowListCopyWindowInfo(option, window)
+        if not array:
+            return []
+        try:
+            found = []
+            for index in range(self.cf.CFArrayGetCount(array)):
+                info = self.cf.CFArrayGetValueAtIndex(array, index)
+                if not info:
+                    continue
+
+                def value(name):
+                    return self.cf.CFDictionaryGetValue(info, self.keys[name])
+
+                onscreen = value('kCGWindowIsOnscreen')
+                bounds = value('kCGWindowBounds')
+                rect = CGRect()
+                has_rect = bool(bounds) and self.cg.CGRectMakeWithDictionaryRepresentation(bounds, byref(rect))
+                found.append({'id': self._number(value('kCGWindowNumber')),
+                              'pid': self._number(value('kCGWindowOwnerPID')),
+                              'layer': self._number(value('kCGWindowLayer')),
+                              'onscreen': bool(onscreen) and self.cf.CFBooleanGetValue(onscreen),
+                              'rect': (round(rect.origin.x), round(rect.origin.y), round(rect.size.width),
+                                       round(rect.size.height)) if has_rect else None,
+                              'title': self._string(value('kCGWindowName')),
+                              'owner': self._string(value('kCGWindowOwnerName'))})
+            return found
+        finally:
+            self.cf.CFRelease(array)
+
+    def window_rect(self, window):
+        for info in self._windows(8, window):
+            if info['id'] == window and info['onscreen'] and info['rect'] and info['rect'][2] > 1:
+                return info['rect']
+        return None
+
+    def list_windows(self):
+        found = []
+        for info in self._windows(1 | 16):
+            if info['layer'] != 0 or not info['onscreen'] or not info['rect'] or info['rect'][2] < 32:
+                continue
+            title = f'{info["owner"]} - {info["title"]}' if info['title'] and info['owner'] else (
+                info['title'] or info['owner'])
+            found.append((info['id'], title, info['pid']))
+        return found

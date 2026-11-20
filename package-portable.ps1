@@ -215,6 +215,45 @@ RECORD COMBINED
     under its header until the others stop. The combined video has no audio, and devices are synchronized to about one second. Exit waits up to 2 minutes for
   the combined video; if it is not finished by then, it is cancelled.
 
+SCREEN RECORDING
+  Recording > "Screen recording" in the control panel (or "Screen recording" in the tray menu) records
+  the desktop. Choose "Rectangle on screen" (a frame you move and resize), "Select area...", a full
+  screen or all screens (listed from the screens connected to this computer: Screen 1 is the main
+  screen, the others are numbered left to right), "Lock to window" (a device window or any other window;
+  the recording follows it) or "Around mouse". Only the first two show a frame; the others show only the
+  toolbar. The toolbar records, pauses, takes screenshots and opens the folder.
+  Hotkeys from any application: F12 start/stop, Shift+F12 pause/resume, F11 screenshot.
+  The frame and toolbar are not recorded. Files are saved as:
+    <Recordings folder>\Screen Recordings\Screen_Capture_<yyyyMMdd_HHmmss>.mp4
+    <Recordings folder>\Screen Recordings\Screenshot_<yyyyMMdd_HHmmss_fff>.png
+
+DISK SPACE
+  Recordings have no time limit; they run until you stop them or the disk is almost full. The control
+  panel status bar shows the free space of the recordings folder, and turns red below 2 GB. Click it to
+  change the recordings folder. Below 2 GB, starting a recording asks whether to change the folder,
+  record anyway or cancel, and a warning is shown once while recording. Below 500 MB, recording cannot
+  start, and every device and screen recording is stopped and saved automatically.
+
+DEVICE LOGS
+  "Start device logs" in the control panel, the Logs menu or the tray menu captures the logcat of the
+  selected (or every) device and saves it automatically to a text file in the Android Studio Logcat
+  format:
+    <Device logs folder>\<Device Name>\logs_<Device Name>_<Device Serial>_<yyyyMMdd_HHmmss>.txt
+  The lines of the apps checked in Logs > "Choose apps for per-app logs..." (a list of PA and PIA first,
+  then every app open, running or installed on the connected devices, none checked by default,
+  remembered for all devices) are also saved to a file with the same name in a subfolder named after the
+  app package:
+    <Device logs folder>\<Device Name>\<App Package>\logs_<Device Name>_<Device Serial>_<yyyyMMdd_HHmmss>.txt
+  With no app checked, only the full device log is saved.
+  The default folder is "Documents\scrcpy Logs" (Logs > "Change device logs folder..." changes it).
+  Logging continues in the same file while the device restarts or reconnects, with DEVICE DISCONNECTED,
+  DEVICE RESTARTED and DEVICE RECONNECTED lines. The file can be opened while logging (Logs > "Open
+  device log of selected device"). Logging stops when you stop it, close the device or exit.
+  The Device logs column shows the elapsed time and log size.
+  APP STATUS lines record whether PA, PIA and the checked apps are running (with the pid) when logging
+  starts and after every restart or reconnection; APP STARTED, APP STOPPED, APP CRASHED and APP NOT
+  RESPONDING lines record those events as they happen.
+
 DEVICE LIST
   A restarting device stays in the list as "Device restarting" and reconnects in the same window.
   A device that is turned off is removed; one that is unplugged or drops off Wi-Fi is removed after

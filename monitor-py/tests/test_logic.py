@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -545,6 +546,430 @@ class WindowLayoutTest(unittest.TestCase):
         self.assertTrue(logic.has_placement_arg(['-f']))
         self.assertTrue(logic.has_placement_arg(['--fullscreen']))
         self.assertFalse(logic.has_placement_arg(['--window-title=x', '-m1024', '--force-adb-forward']))
+
+
+class ScreenRecordTest(unittest.TestCase):
+    def test_area_from_setting(self):
+        virtual, primary = (0, 0, 3840, 1080), (0, 0, 1920, 1080)
+        self.assertEqual(logic.screen_area_from_setting('100,50,640,480', virtual, primary), (100, 50, 640, 480))
+        self.assertEqual(logic.screen_area_from_setting('3800,0,640,480', virtual, primary), (320, 180, 1280, 720))
+        self.assertEqual(logic.screen_area_from_setting('bad', virtual, (0, 0, 1024, 768)), (40, 80, 944, 608))
+        self.assertIsNone(logic.normalize_screen_area((0, 0, 10, 100)))
+        self.assertEqual(logic.normalize_screen_area((5, 6, 101.0, 77)), (5, 6, 100, 76))
+
+    def test_follow(self):
+        self.assertEqual(logic.parse_follow_size('854x480'), (854, 480))
+        self.assertEqual(logic.parse_follow_size('10x10'), (1280, 720))
+        bounds = (0, 0, 1920, 1080)
+        self.assertEqual(logic.follow_area((10, 10), bounds, (1280, 720)), (0, 0, 1280, 720))
+        self.assertEqual(logic.follow_area((1900, 1070), bounds, (1280, 720)), (640, 360, 1280, 720))
+        self.assertEqual(logic.follow_area((960, 540), (0, 0, 800, 600), (1280, 720)), (0, 0, 800, 600))
+
+    def test_capture_command_rect(self):
+        args, follow = logic.screen_capture_command('x11grab', [('', (0, 0, 1920, 1080))], (100, 200, 641, 480),
+                                                    None, ['-c:v', 'libx264'], 'out.mkv', ':1')
+        self.assertIsNone(follow)
+        self.assertIn(':1+100,200', args)
+        self.assertEqual(args[args.index('-video_size') + 1], '640x480')
+        self.assertEqual(args[args.index('-filter_complex') + 1], '[0:v]null,format=yuv420p[v]')
+        self.assertEqual(args[-1], 'out.mkv')
+
+    def test_capture_command_follow_and_shot(self):
+        sources = [('', (-1920, 0, 1920, 1080)), ('', (0, 0, 1920, 1080))]
+        args, follow = logic.screen_capture_command('gdigrab', sources, (-100, 10, 1280, 720), True, [], 'o.mkv')
+        self.assertEqual(follow, {'box': (-1920, 0, 3840, 1080), 'width': 1280, 'height': 720, 'x': 1820, 'y': 10})
+        self.assertIn('crop=w=1280:h=720:x=1820:y=10:exact=1', args[args.index('-filter_complex') + 1])
+        args, follow = logic.screen_capture_command('gdigrab', sources, (0, 0, 100, 100), None, [], 's.png', shot=True)
+        self.assertIsNone(follow)
+        self.assertIn('-frames:v', args)
+
+    def test_capture_command_avfoundation(self):
+        sources = [('1', (0, 0, 2880, 1800)), ('2', (2880, 0, 1920, 1080))]
+        args, _ = logic.screen_capture_command('avfoundation', sources, (0, 0, 4800, 1800), None, [], 'o.mkv')
+        graph = args[args.index('-filter_complex') + 1]
+        self.assertIn('xstack=inputs=2:layout=0_0|2880_0', graph)
+        self.assertIn('1:none', args)
+        self.assertNotIn('crop', graph)
+
+    def test_merge_steps(self):
+        steps, lines = logic.screen_merge_steps(["a'b.mkv", 'c.mkv'], [(640, 480)] * 2, 'l.txt', 'o.mp4', [])
+        self.assertEqual(lines, ["file 'a'\\''b.mkv'", "file 'c.mkv'"])
+        self.assertIn('copy', steps[0])
+        steps, lines = logic.screen_merge_steps(['a', 'b'], [(640, 480), (1280, 720)], 'l.txt', 'o.mp4', ['-c:v', 'x'])
+        self.assertIsNone(lines)
+        self.assertIn('concat=n=2:v=1:a=0[v]', steps[0][steps[0].index('-filter_complex') + 1])
+
+    def test_avfoundation_and_base(self):
+        text = '[AVFoundation indev @ 0x1] [3] Capture screen 0\n[AVFoundation indev @ 0x1] [4] Capture screen 1'
+        self.assertEqual(logic.parse_avfoundation_screens(text), {0: 3, 1: 4})
+        moment = datetime(2026, 1, 2, 3, 4, 5)
+        taken = {os.path.join('d', 'Screen_Capture_20260102_030405.mp4')}
+        self.assertEqual(logic.screen_capture_base('d', moment, taken.__contains__),
+                         os.path.join('d', 'Screen_Capture_20260102_030405_2'))
+        self.assertEqual(logic.format_bytes(3 << 20), '3.0 MB')
+
+
+class DiskSpaceTest(unittest.TestCase):
+    def test_disk_level(self):
+        self.assertEqual(logic.disk_level(-1), 'unknown')
+        self.assertEqual(logic.disk_level(logic.DISK_CRITICAL - 1), 'critical')
+        self.assertEqual(logic.disk_level(logic.DISK_CRITICAL), 'low')
+        self.assertEqual(logic.disk_level(logic.DISK_LOW - 1), 'low')
+        self.assertEqual(logic.disk_level(logic.DISK_LOW), 'ok')
+
+    def test_missing_folder_uses_existing_parent(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = os.path.join(root, 'a', 'b')
+            self.assertEqual(logic.existing_folder(missing), os.path.abspath(root))
+            self.assertGreaterEqual(logic.disk_free(missing), 0)
+
+
+class DeviceLogTest(unittest.TestCase):
+    def test_parse_header(self):
+        header = logic.parse_logcat_header('[ 10-09 11:22:33.4567  1234: 5678 I/ActivityManager ]', NOW)
+        self.assertEqual(header, (datetime(2026, 10, 9, 11, 22, 33, 456000), 1234, 5678, 'I', 'ActivityManager'))
+        header = logic.parse_logcat_header('[ 12-31 23:59:59.1 u0_a12:  42:   43 E/my tag  ]', NOW)
+        self.assertEqual(header, (datetime(2025, 12, 31, 23, 59, 59, 100000), 42, 43, 'E', 'my tag'))
+        self.assertEqual(logic.parse_logcat_header('[ 02-30 01:00:00.000  1:  1 D/x ]', NOW)[0], NOW)
+        self.assertIsNone(logic.parse_logcat_header('--------- beginning of main', NOW))
+
+    def test_prefix_and_marker(self):
+        prefix = logic.logcat_prefix(datetime(2026, 1, 2, 3, 4, 5, 6000), 12, 34, 'Tag', 'com.app', 'W')
+        self.assertEqual(prefix, '2026-01-02 03:04:05.006     12-34     Tag' + ' ' * 22 + 'com.app'
+                         + ' ' * 30 + 'W  ')
+        self.assertEqual(logic.log_marker('LOGGING STARTED: x', NOW),
+                         '-' * 28 + ' LOGGING STARTED: x (2026-10-09 12:00:00) ' + '-' * 28)
+
+    def test_process_names_and_boot_id(self):
+        text = ('PID NAME\n1 init\n500 system_server\n600 zygote64\n700 com.example.app\n'
+                '800 <pre-initialized>\n')
+        self.assertEqual(logic.parse_process_names(text), {1: 'init', 500: 'system_process', 700: 'com.example.app'})
+        legacy = 'USER PID PPID VSIZE RSS WCHAN PC NAME\nroot 1 0 100 10 0 0 S /init\n'
+        self.assertEqual(logic.parse_process_names(legacy), {1: '/init'})
+        self.assertEqual(logic.boot_id(' 0123abcd-4567-89ef-0123-456789abcdef\n'),
+                         '0123abcd-4567-89ef-0123-456789abcdef')
+        self.assertEqual(logic.boot_id('cat: permission denied'), '')
+
+    def test_device_log_path(self):
+        taken = {os.path.join('L', 'logs_T650_450_20261009_120000.txt')}
+        self.assertEqual(logic.device_log_path('L', 'T650', '450', NOW, taken.__contains__),
+                         os.path.join('L', 'logs_T650_450_20261009_120000_2.txt'))
+
+    def test_capture_formats_entries(self):
+        from scrcpy_monitor.logcat import LogcatCapture
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'd', 'log.txt')
+            capture = LogcatCapture('adb', 'serial', path, 'label', apps={'com.app'})
+            capture._pids_at = float('inf')
+            capture._pids = {10: 'com.app'}
+            capture._marker('LOGGING STARTED: label')
+            year = datetime.now().year
+            for line in ['--------- beginning of main', '[ 01-02 03:04:05.006    10:   11 I/Tag ]', 'first',
+                         'second', '', '--------- beginning of system', '[ 01-02 03:04:05.007    99:   99 D/T ]',
+                         '', '']:
+                capture._handle_line(line)
+            capture._end_entry()
+            capture.stop()
+            with open(path, encoding='utf-8') as handle:
+                lines = handle.read().splitlines()
+            with open(os.path.join(root, 'd', 'com.app', 'log.txt'), encoding='utf-8') as handle:
+                app_lines = handle.read().splitlines()
+            self.assertEqual(sorted(os.listdir(os.path.join(root, 'd'))), ['com.app', 'log.txt'])
+        prefix = logic.logcat_prefix(datetime(year, 1, 2, 3, 4, 5, 6000), 10, 11, 'Tag', 'com.app', 'I')
+        self.assertEqual(lines[1:4], [prefix + 'first', ' ' * len(prefix) + 'second',
+                                      logic.logcat_prefix(datetime(year, 1, 2, 3, 4, 5, 7000), 99, 99, 'T', '',
+                                                          'D').rstrip()])
+        self.assertIn('LOGGING STARTED: label', lines[0])
+        self.assertIn('LOGGING STOPPED', lines[-1])
+        self.assertEqual(capture.entries, 2)
+        self.assertIn('LOGGING STARTED: label', app_lines[0])
+        self.assertEqual(app_lines[1:3], [prefix + 'first', ' ' * len(prefix) + 'second'])
+        self.assertIn('LOGGING STOPPED', app_lines[3])
+        self.assertEqual(len(app_lines), 4)
+
+    def test_capture_writes_only_chosen_apps(self):
+        from scrcpy_monitor.logcat import LogcatCapture
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'd', 'log.txt')
+            capture = LogcatCapture('adb', 'serial', path, 'label')
+            capture._pids_at = float('inf')
+            capture._pids = {10: 'com.app', 11: 'com.other:remote'}
+            for line in ['[ 01-02 03:04:05.006    10:   10 I/Tag ]', 'one', '']:
+                capture._handle_line(line)
+            capture._end_entry()
+            capture.set_apps({'com.other'})
+            for line in ['[ 01-02 03:04:06.006    10:   10 I/Tag ]', 'two', '',
+                         '[ 01-02 03:04:07.006    11:   11 I/Tag ]', 'three', '']:
+                capture._handle_line(line)
+            capture._end_entry()
+            capture.stop()
+            names = sorted(os.listdir(os.path.join(root, 'd')))
+            with open(os.path.join(root, 'd', 'com.other', 'log.txt'), encoding='utf-8') as handle:
+                other = handle.read()
+        self.assertEqual(names, ['com.other', 'log.txt'])
+        self.assertIn('three', other)
+        self.assertNotIn('two', other)
+
+    def test_capture_reopens_evicted_app_files(self):
+        from unittest import mock
+        from scrcpy_monitor import logcat
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(logcat, 'APP_FILES_OPEN', 1):
+            path = os.path.join(root, 'd', 'log.txt')
+            capture = logcat.LogcatCapture('adb', 'serial', path, 'label')
+            capture._marker('LOGGING STARTED: label')
+            capture._write('a1', 'com.a')
+            capture._write('b1', 'com.b')
+            capture._marker('DEVICE RESTARTED')
+            capture._write('a2', 'com.a')
+            self.assertEqual(len(capture._app_files), 1)
+            capture.stop()
+            files = {}
+            for app in ('com.a', 'com.b'):
+                with open(os.path.join(root, 'd', app, 'log.txt'), encoding='utf-8') as handle:
+                    files[app] = handle.read().splitlines()
+        self.assertEqual(files['com.a'][1:2] + files['com.a'][3:4], ['a1', 'a2'])
+        self.assertEqual(files['com.b'][1], 'b1')
+        for lines in files.values():
+            self.assertIn('LOGGING STARTED: label', lines[0])
+            self.assertIn('DEVICE RESTARTED', lines[2])
+            self.assertIn('LOGGING STOPPED', lines[-1])
+            self.assertEqual(sum('LOGGING STARTED' in line for line in lines), 1)
+
+    def test_capture_notes_versions(self):
+        from scrcpy_monitor.logcat import LogcatCapture
+        pa, pia = logic.PA_PACKAGE, logic.PIA_PACKAGE
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'd', 'log.txt')
+            capture = LogcatCapture('adb', 'serial', path, 'label')
+            capture.note_versions(None, True)
+            capture.note_versions({pa: '1', pia: ''}, False)
+            capture.note_versions({pa: '1', pia: ''}, False)
+            capture.note_versions({pa: '1', pia: ''}, True)
+            capture.note_versions({pa: '2', pia: '3'}, False)
+            capture.stop()
+            self.assertEqual(capture.size, os.path.getsize(path))
+            with open(path, encoding='utf-8') as handle:
+                lines = [line for line in handle.read().splitlines() if 'APP VERSIONS' in line]
+        self.assertEqual(len(lines), 3)
+        self.assertIn(f'APP VERSIONS: PA ({pa}) 1, PIA ({pia}) Not installed', lines[0])
+        self.assertIn(f'APP VERSIONS: PA ({pa}) 2, PIA ({pia}) 3', lines[2])
+        self.assertEqual(capture.size, 0)
+
+    def test_capture_notes_app_events(self):
+        from scrcpy_monitor.logcat import LogcatCapture
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'd', 'log.txt')
+            capture = LogcatCapture('adb', 'serial', path, 'label')
+            capture._pids_at = float('inf')
+            capture._pids = {500: 'system_server'}
+            capture.note_versions({logic.PA_PACKAGE: '1', logic.PIA_PACKAGE: '2'}, False)
+            capture.note_versions(None, True)
+            capture.note_versions({logic.PA_PACKAGE: '1', logic.PIA_PACKAGE: '2'}, False)
+            events = [(500, 'ActivityManager', 'Start proc 300:com.global.wwca/u0a87 for top-activity {x}'),
+                      (500, 'ActivityManager', 'Start proc 301:com.x/u0a88 for service {y}'),
+                      (300, 'AndroidRuntime', 'FATAL EXCEPTION: main'),
+                      (500, 'ActivityManager', 'Killing 300:com.global.wwca/u0a87 (adj 100): crash'),
+                      (500, 'ActivityManager', 'Process com.global.wwca (pid 300) has died: fg TOP'),
+                      (500, 'ActivityManager', 'Start proc 302:com.global.wwca:svc/u0a87 for service {z}')]
+            for second, (pid, tag, message) in enumerate(events):
+                for line in [f'[ 01-02 03:04:0{second}.006   {pid}:  {pid} I/{tag} ]', message, '']:
+                    capture._handle_line(line)
+            capture._end_entry()
+            self.assertEqual(capture._pids[301], 'com.x')
+            capture._status_time = datetime.max
+            for line in ['[ 01-02 03:04:09.006   500:  500 E/ActivityManager ]', 'ANR in com.global.wwca', '']:
+                capture._handle_line(line)
+            capture._end_entry()
+            capture.stop()
+            with open(path, encoding='utf-8') as handle:
+                lines = [line for line in handle.read().splitlines() if 'APP ' in line]
+        pa = f'PA ({logic.PA_PACKAGE})'
+        self.assertEqual(sum('APP VERSIONS' in line for line in lines), 2)
+        found = [line.split('APP ', 1)[1].rsplit(' (', 1)[0] for line in lines if 'APP VERSIONS' not in line]
+        self.assertEqual(found, [f'STARTED: {pa}, pid 300', f'CRASHED: {pa}, pid 300 - FATAL EXCEPTION: main',
+                                 f'STOPPED: {pa}, pid 300 - crash'])
+
+    def test_app_package(self):
+        packages = logic.parse_packages('package:com.verifone.app\r\npackage:android\nerror\n')
+        self.assertEqual(packages, {'com.verifone.app', 'android'})
+        self.assertEqual(logic.app_package('com.verifone.app:remote', packages), 'com.verifone.app')
+        self.assertEqual(logic.app_package('system_process', packages), 'system_process')
+        self.assertIsNone(logic.app_package('android.hardware.audio.service', packages))
+        self.assertIsNone(logic.app_package('', packages))
+        self.assertEqual(logic.app_package('com.x.y', set()), 'com.x.y')
+        self.assertIsNone(logic.app_package('/system/bin/vold', set()))
+        self.assertIsNone(logic.app_package('logd', set()))
+        self.assertEqual(logic.app_log_path(os.path.join('L', 'T650', 'logs.txt'), 'a/b:c'),
+                         os.path.join('L', 'T650', 'a_b_c', 'logs.txt'))
+
+    def test_log_apps(self):
+        self.assertEqual(logic.log_app('com.a:remote', {'com.a'}), 'com.a')
+        self.assertIsNone(logic.log_app('com.b', {'com.a'}))
+        self.assertIsNone(logic.log_app('', set()))
+        self.assertEqual(logic.parse_log_apps([' com.b', 'com.a', 'com.b', '']), ['com.a', 'com.b'])
+        self.assertEqual(logic.parse_log_apps('com.a, com.b'), ['com.a', 'com.b'])
+        self.assertEqual(logic.parse_log_apps(None), [])
+        self.assertEqual(logic.parse_log_apps([]), [])
+        self.assertEqual(logic.log_app_choices({'com.r', 'com.o', 'system_process'}, {'com.o'}, {'com.i', 'com.r'},
+                                               {'com.c', 'com.r'}),
+                         ['com.o', 'com.r', 'system_process', 'com.i', 'com.c'])
+        self.assertEqual(logic.log_app_choices({'com.a', logic.PIA_PACKAGE}, {'com.z'}, {logic.PA_PACKAGE, 'com.b'},
+                                               []),
+                         [logic.PA_PACKAGE, logic.PIA_PACKAGE, 'com.z', 'com.a', 'com.b'])
+        self.assertEqual(logic.app_tag(logic.PA_PACKAGE), ' (PA)')
+        self.assertEqual(logic.app_tag(logic.PIA_PACKAGE), ' (PIA)')
+        self.assertEqual(logic.app_tag('com.a'), '')
+        ps = 'USER PID PPID NAME\nu0_a1 10 1 com.r:svc\nroot 11 1 /system/bin/vold\nsystem 12 1 system_server\n'
+        self.assertEqual(logic.running_apps(ps, {'com.r'}), {'com.r', 'system_process'})
+        self.assertEqual(logic.foreground_app(
+            'mCurrentFocus=Window{ce68f25 u0 StatusBar}\n  mFocusedApp=AppWindowToken{c0308b1 token=Token{57efc3b '
+            'ActivityRecord{9be52ca u0 com.global.integrated/com.x.Main t6171}}}'), 'com.global.integrated')
+        self.assertEqual(logic.foreground_app('mCurrentFocus=Window{3a u0 com.a/com.a.Main}'), 'com.a')
+        self.assertEqual(logic.foreground_app(
+            'mFocusedApp=ActivityRecord{2227486 u0 com.g/com.g.Main} t158}'), 'com.g')
+        self.assertIsNone(logic.foreground_app(''))
+
+    def test_app_versions(self):
+        pa, pia = logic.PA_PACKAGE, logic.PIA_PACKAGE
+        text = (f'@{pa}\r\n    versionName=1.2.3\r\n    versionName=0.9\r\n@{pia}\r\n'
+                f'    versionName=4.5-qa\r\n')
+        versions = logic.parse_app_versions(text)
+        self.assertEqual(versions, {pa: '1.2.3', pia: '4.5-qa'})
+        self.assertEqual(logic.app_version_text(versions), f'PA ({pa}) 1.2.3, PIA ({pia}) 4.5-qa')
+        missing = logic.parse_app_versions(f'@{pa}\n  versionName=1.2.3\n@{pia}\nUnable to find package: {pia}\n')
+        self.assertEqual(missing, {pa: '1.2.3', pia: ''})
+        self.assertEqual(logic.app_version_text(missing), f'PA ({pa}) 1.2.3, PIA ({pia}) Not installed')
+        self.assertIsNone(logic.parse_app_versions(f'@{pa}\n@{pia}\n'))
+        self.assertIsNone(logic.parse_app_versions(f'@{pa}\n  versionName=1.2.3\n@{pia}\n'))
+        self.assertIn("grep -E 'versionName|Unable to find'", logic.VERSION_COMMAND)
+        self.assertTrue(logic.VERSION_COMMAND.startswith('if [ "$(getprop sys.boot_completed)" = 1 ]; then for p in '
+                                                         f'{pa} {pia}; do echo "@$p"; dumpsys package $p | '))
+        self.assertIsNone(logic.parse_app_versions(''))
+        self.assertIsNone(logic.parse_app_versions(f'@{pa}\nversionName=1\n'))
+        self.assertIsNone(logic.app_version_text(None))
+        self.assertTrue(logic.version_mismatch([versions, {pa: '1.2.4', pia: '4.5-qa'}], pa))
+        self.assertFalse(logic.version_mismatch([versions, {pa: '1.2.4', pia: '4.5-qa'}], pia))
+        self.assertFalse(logic.version_mismatch([versions, missing], pia))
+        self.assertFalse(logic.version_mismatch([], pa))
+
+    def test_app_status_and_events(self):
+        self.assertEqual(logic.app_label(logic.PIA_PACKAGE), 'PIA (com.global.integrated)')
+        self.assertEqual(logic.app_label('com.x'), 'com.x')
+        self.assertEqual(logic.app_status_text({100: 'com.global.wwca', 200: 'com.x', 201: 'com.global.wwca:svc'},
+                                               ['com.x', 'com.global.wwca', 'com.y']),
+                         'PA (com.global.wwca) running (pid 100), PIA (com.global.integrated) not running, '
+                         'com.x running (pid 200), com.y not running')
+        self.assertEqual(logic.app_status_text({7: 'com.global.integrated', 3: 'com.global.integrated'}, []),
+                         'PA (com.global.wwca) not running, PIA (com.global.integrated) running (pid 3, 7)')
+        am = 'ActivityManager'
+        self.assertEqual(logic.parse_app_event(am, 'Start proc 1234:com.global.wwca/u0a87 for top-activity {x}'),
+                         ('APP STARTED', 'com.global.wwca', '1234', ''))
+        self.assertEqual(logic.parse_app_event(am, 'Killing 3298:com.global.wwca/u0a87 (adj 100): stop '
+                                                   'com.global.wwca due to from pid 2723'),
+                         ('APP STOPPED', 'com.global.wwca', '3298', 'stop com.global.wwca due to from pid 2723'))
+        self.assertEqual(logic.parse_app_event(am, 'Killing 8872:com.global.wwca/u0a691 (adj 200): stop '
+                                                   'com.global.wwca'),
+                         ('APP STOPPED', 'com.global.wwca', '8872', 'stop com.global.wwca'))
+        self.assertEqual(logic.parse_app_event(am, 'Killing 55:com.a:remote/u0a9: empty #17'),
+                         ('APP STOPPED', 'com.a:remote', '55', 'empty #17'))
+        self.assertEqual(logic.parse_app_event(am, 'Process com.a (pid 9) has died: fg TOP'),
+                         ('APP STOPPED', 'com.a', '9', 'process died'))
+        self.assertEqual(logic.parse_app_event(am, 'ANR in com.a (com.a/.Main)'),
+                         ('APP NOT RESPONDING', 'com.a', '', ''))
+        self.assertEqual(logic.parse_app_event('AndroidRuntime', 'FATAL EXCEPTION: main '),
+                         ('APP CRASHED', '', '', 'FATAL EXCEPTION: main'))
+        self.assertEqual(logic.parse_app_event('libc', 'Fatal signal 11 (SIGSEGV)'),
+                         ('APP CRASHED', '', '', 'Fatal signal 11 (SIGSEGV)'))
+        self.assertIsNone(logic.parse_app_event(am, 'Force stopping com.global.wwca appid=10087 user=0: from pid 1'))
+        self.assertIsNone(logic.parse_app_event('Tag', 'Start proc 1:com.a/u0a1 for x'))
+        self.assertIsNone(logic.parse_app_event('AndroidRuntime', 'Shutting down VM'))
+        now = datetime(2026, 1, 5, 10, 0, 0)
+        self.assertEqual(logic.parse_device_time('12-31 23:59:58\r\n', now), datetime(2025, 12, 31, 23, 59, 58))
+        self.assertEqual(logic.parse_device_time('01-05 09:59:58', now), datetime(2026, 1, 5, 9, 59, 58))
+        self.assertIsNone(logic.parse_device_time('error: closed', now))
+
+
+class MacHotKeysTest(unittest.TestCase):
+    def test_handler_passes_on_hotkeys_it_does_not_own(self):
+        from scrcpy_monitor import screenrec
+
+        def carbon(ident):
+            def get_parameter(event, name, kind, actual, size, used, out):
+                out._obj.signature = screenrec._fourcc('scrm')
+                out._obj.id = ident
+                return 0
+            return SimpleNamespace(GetEventParameter=get_parameter)
+
+        emitted = []
+        menu = screenrec.MacHotKeys(emitted.append, ((4, 46, 0x1800, 'menu'),))
+        recorder = screenrec.MacHotKeys(emitted.append)
+        menu.carbon = recorder.carbon = carbon(4)
+        self.assertEqual(recorder._handle(None, None, None), -9874)
+        self.assertEqual(menu._handle(None, None, None), 0)
+        recorder.carbon = carbon(3)
+        self.assertEqual(recorder._handle(None, None, None), 0)
+        self.assertEqual(emitted, ['menu', 'shot'])
+
+
+class SessionEndTest(unittest.TestCase):
+    def stop(self, session_ending):
+        import threading
+        from scrcpy_monitor.engine import Engine
+        calls = []
+        engine = Engine.__new__(Engine)
+        engine.exiting = False
+        engine.session_ending = session_ending
+        engine.sessions = {}
+        engine.finished = threading.Event()
+        engine.tools = SimpleNamespace(ffprobe='ffprobe')
+        engine.publish = lambda: None
+        for name in ('stop_adb_jobs', 'stop_all_device_logs', 'stop_combines', 'stop_labels'):
+            setattr(engine, name, lambda name=name: calls.append(name))
+        for name in ('update_stops', 'update_merges', 'update_combines', 'update_combine_handovers'):
+            setattr(engine, name, lambda value, name=name: calls.append((name, value)))
+        engine.update_labels = lambda value, force: calls.append(('update_labels', value))
+        engine.stop_monitor()
+        self.assertTrue(engine.finished.is_set())
+        return engine, calls
+
+    def test_session_end_saves_without_long_waits(self):
+        engine, calls = self.stop(True)
+        self.assertEqual(calls, ['stop_adb_jobs', 'stop_all_device_logs', ('update_stops', 20),
+                                 ('update_combine_handovers', True), ('update_merges', 30), 'stop_combines',
+                                 'stop_labels'])
+        with tempfile.NamedTemporaryFile(delete=False) as video:
+            video.write(b'x' * 2048)
+        try:
+            self.assertTrue(engine.test_video_file(video.name))
+        finally:
+            os.unlink(video.name)
+
+    def test_normal_exit_keeps_full_waits(self):
+        _, calls = self.stop(False)
+        self.assertIn(('update_merges', 600), calls)
+        self.assertIn(('update_combines', 120), calls)
+        self.assertIn(('update_labels', 120), calls)
+
+    def test_system_quit_routes_by_quit_reason(self):
+        from unittest import mock
+        from scrcpy_monitor import ui
+        calls = []
+
+        def quit(mac, logout, **flags):
+            state = dict(finishing=False, session_ended=False, request_exit=lambda: calls.append('exit'),
+                         end_session=lambda: calls.append('end'))
+            state.update(flags)
+            with mock.patch.object(ui, 'IS_MAC', mac), mock.patch.object(ui, 'mac_session_ending', return_value=logout):
+                result = ui.Controller.system_quit(SimpleNamespace(**state), lambda: calls.append('cancel'))
+            handled = list(calls)
+            calls.clear()
+            return result, handled
+
+        self.assertEqual(quit(True, False), (True, ['cancel', 'exit']))
+        self.assertEqual(quit(True, True), (True, ['end']))
+        self.assertEqual(quit(False, False), (True, ['end']))
+        self.assertEqual(quit(True, False, finishing=True), (False, []))
+        self.assertEqual(quit(False, True, session_ended=True), (False, []))
 
 
 if __name__ == '__main__':
