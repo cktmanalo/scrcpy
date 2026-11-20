@@ -24,19 +24,43 @@ Options:
 | `--record`, `--record-dir`, `--record-encoder`, `--record-arg`, `--keep-parts` | Recording options. `--record` starts recording every device right away. |
 | `--port-base N` | First local port for scrcpy sessions. Each session uses a block of 4 ports: the window uses `N:N+1` and the recorder `N+2:N+3`. |
 | `--poll-seconds`, `--no-discovery`, `--no-update-check`, `--no-tray`, `--no-panel`, `--list` | See `--help`. |
-| `--command start-recording\|stop-recording\|show-panel\|exit` | Sends a command to the running instance. |
+| `--command start-recording\|stop-recording\|start-logs\|stop-logs\|show-panel\|exit` | Sends a command to the running instance. |
 
 Options the monitor does not recognize, and everything after `--`, are passed to scrcpy.
 
 Only one instance runs at a time; it uses `QLocalServer`. A second launch asks the running instance to show the panel and show again any device you closed, as the ps1 does. If the running instance is exiting, the second launch waits for it to finish and then starts.
 
+When you log out or shut down (macOS, Linux desktops with session management, or `SIGTERM`), the monitor stops and saves the device and screen recordings and device logs before it exits, as the ps1 does when Windows signs out. It waits at most about a minute and skips building the combined video and the labeled copies.
+
 ## Control panel and device list
 
-Global actions are in the panel's menu bar: **File** (Open recordings folder, Change recordings folder, Open log, Exit), **Recording** (Start all, Stop all), **Window** (Arrange windows) and **Help** (User guide, Check for updates, Check for updates automatically, About). **Help > User guide** shows the how-to guide for the current OS inside the app (`scrcpy-monitor-guide.html` on Windows, `scrcpy-monitor-guide-macos-linux.html` on macOS and Linux, bundled with the packaged app). On macOS these menus appear in the top screen menu bar, and Qt moves About and Exit (as Quit) into the application menu. Click a column header to sort the list.
+Global actions are in the panel's menu bar: **File** (Open recordings folder, Change recordings folder, Open log, Exit), **Recording** (Start all, Stop all, Screen recording), **Logs** (Start or stop device logs on all devices, Open device log of selected device, Open device logs folder, Change device logs folder, Choose apps for per-app logs), **Window** (Arrange windows, Show tray menu) and **Help** (User guide, Check for updates, Check for updates automatically, About). **Help > User guide** shows the how-to guide for the current OS inside the app (`scrcpy-monitor-guide.html` on Windows, `scrcpy-monitor-guide-macos-linux.html` on macOS and Linux, bundled with the packaged app). On macOS these menus appear in the top screen menu bar, and Qt moves About and Exit (as Quit) into the application menu. Click a column header to sort the list.
+
+**Ctrl+Alt+M** (Control+Option+M on macOS) opens the tray menu at the mouse pointer from any application, the same as **Window > Show tray menu**. On Linux it is grabbed with `XGrabKey` on an X11 session; on macOS it uses Carbon `RegisterEventHotKey`. If another application already uses the combination, the log says so and the Window item still works. The Python build on Windows has only the Window item.
 
 - A restarting device stays in the list as "Device restarting" and reconnects in the same window. The monitor detects a restart from the power menu or `svc power reboot`; a restart started with `adb reboot` is not detected, so that device is removed and reappears when it is back.
 - A device that is turned off is removed right away. One that is unplugged or drops off Wi-Fi is removed after 30 seconds. A device is never removed while it is recording.
 - Closing a device window, or **Stop and close** in the panel or tray menu, stops that device and removes it from the list. **Refresh** shows it again.
+
+### Disk space
+
+Recordings have no time limit; they run until you stop them or the disk is almost full. The panel status bar shows the free space of the recordings folder and turns red below 2 GB; click it to change the recordings folder. Below 2 GB, starting a recording asks whether to change the folder, record anyway or cancel, and a warning is shown once while recording. Below 500 MB, recording cannot start, and every device and screen recording is stopped and saved automatically.
+
+### Device logs
+
+**Start device logs** in the panel, the **Logs** menu, the tray menu or `--command start-logs` captures each device's `adb logcat` in parallel and saves it automatically to a text file in the Android Studio Logcat format (date and time, PID-TID, tag, app name, level, message):
+
+```
+<Device logs folder>/<Device Name>/logs_<Device Name>_<Device Serial>_<yyyyMMdd_HHmmss>.txt
+```
+
+The lines of the apps checked in **Logs > Choose apps for per-app logs...** (a list of PA and PIA first, then every app open, running or installed on the connected devices, none checked by default, remembered for all devices) are also saved to a file with the same name in a subfolder named after the app package; with no app checked, only the full device log is saved:
+
+```
+<Device logs folder>/<Device Name>/<App Package>/logs_<Device Name>_<Device Serial>_<yyyyMMdd_HHmmss>.txt
+```
+
+The Device logs column shows how long each device has been logged and the size of the log. An `APP STATUS` line records whether PA, PIA and the checked apps are running (with their pids) when logging starts and after every restart or reconnect, and `APP STARTED`, `APP STOPPED`, `APP CRASHED` and `APP NOT RESPONDING` lines are added as they happen. Logging continues in the same file while the device restarts or reconnects (and across a switch between USB and Wi-Fi), with `DEVICE DISCONNECTED`, `DEVICE RESTARTED` or `DEVICE RECONNECTED` lines; lines already saved are not written again after a reconnect. The file is flushed every second and can be opened while logging (**Open device log**). Logging stops when you stop it, close the device or exit. The default folder is `Documents/scrcpy Logs` on Windows and `Documents/Scrcpy Logs` on macOS and Linux; **Logs > Change device logs folder...** changes it for logs started afterwards.
 
 ## Device windows
 
@@ -46,6 +70,34 @@ Device windows are arranged as in the Windows ps1 on macOS and Linux (the Python
 
 - **Linux:** Xlib through ctypes. It finds each window by `_NET_WM_PID` and moves it with `_NET_MOVERESIZE_WINDOW`, or with `XMoveResizeWindow` when the window manager does not support it. On a Wayland session that has XWayland (`DISPLAY` is set), the monitor starts scrcpy with `SDL_VIDEO_DRIVER=x11`, because native Wayland windows cannot be moved by another app. Under fractional scaling, XWayland windows can look slightly blurry. Without X11 or XWayland, windows open where the compositor puts them.
 - **macOS:** the Accessibility API. Allow Scrcpy Monitor (or Terminal, when running from source) in **System Settings > Privacy & Security > Accessibility**. Until it is allowed, windows open where macOS puts them, and **Arrange windows** shows the permission prompt.
+
+## Screen recording
+
+**Recording > Screen recording** in the panel, or **Screen recording** in the tray menu, records the desktop instead of a device. It needs ffmpeg. You can choose one of these targets:
+
+- **Rectangle on screen:** a frame that you move and resize. The toolbar sets a fixed size or fits it to the screen. It opens where it was last placed, or up to 1280x720 in the center of the main screen the first time.
+- **Select area...:** drag a rectangle on any screen.
+- **Full screen:** one screen, or all screens together. The list is built from the screens connected to the computer each time the menu opens: Screen 1 is the main screen and the others are numbered left to right.
+- **Lock to window:** a device window or any other window. The recording follows the window when it moves.
+- **Around mouse:** a fixed-size area that follows the cursor.
+
+Only Rectangle on screen and Select area... show a frame; the other targets show only the toolbar.
+
+The toolbar starts and stops the recording, pauses it, takes a screenshot and opens the folder. These hotkeys work from any application:
+
+| Hotkey | Action |
+| --- | --- |
+| F12 | Start or stop the recording |
+| Shift+F12 | Pause or resume |
+| F11 | Take a screenshot |
+
+A pause or a window resize starts a new part. When the recording stops, the parts are joined into `Screen Recordings/Screen_Capture_<yyyyMMdd_HHmmss>.mp4` under the recordings folder. Screenshots are saved as `Screenshot_<yyyyMMdd_HHmmss_fff>.png` in the same folder.
+
+Capture works differently on each platform:
+
+- **Linux:** ffmpeg `x11grab`, on an X11 session only. While the toolbar would be in the recorded area (full screen, window and mouse modes), it is hidden during the recording; use F12 or the menu to stop. The hotkeys are grabbed with `XGrabKey`.
+- **macOS:** ffmpeg `avfoundation`. Allow Scrcpy Monitor in **System Settings > Privacy & Security > Screen Recording**. As on Linux, the toolbar is hidden during the recording while it would be in the recorded area; use F12 or the menu to stop. The hotkeys use Carbon `RegisterEventHotKey`, and on some keyboards they need Fn.
+- **Windows:** ffmpeg `gdigrab`. The frame and toolbar are excluded from capture. The PowerShell monitor also supports this feature, and uses `ddagrab` when it is available.
 
 ## Tool lookup
 
@@ -176,7 +228,8 @@ The tests cover the pure logic in `scrcpy_monitor/logic.py`:
 - connect-failure reasons;
 - version display;
 - free port blocks;
-- the USB-priority decision.
+- the USB-priority decision;
+- screen recording areas, capture commands and part merging.
 
 ## Windows test plan
 
@@ -188,6 +241,8 @@ python -m unittest discover -s tests
 python main.py --serial 192.168.68.103:5555 --port-base 28200
 python main.py --command start-recording      # wait ~10 s
 python main.py --command stop-recording       # the mp4 appears under Videos\scrcpy Recordings\<device>
+python main.py --command start-logs           # wait ~10 s
+python main.py --command stop-logs            # the txt appears under Documents\scrcpy Logs\<device>
 python main.py --command exit
 ```
 

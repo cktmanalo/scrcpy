@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import logic, windowing
+from .logcat import LogcatCapture
 from .logic import connection_type, safe_name
 from .system import (IS_WINDOWS, BackgroundCommand, ScrcpyProcess, hidden_kwargs, kill_process, kill_tree,
                      list_processes, log, pid_alive, read_json, run_hidden, send_interrupt, stop_gracefully,
@@ -65,6 +66,7 @@ class Session:
         self.recorder_started_at = None
         self.recorder_part = None
         self.recorder_log = None
+        self.codec_error_at = None
         self.recorder_failures = 0
         self.next_record_attempt = now
         self.software_encoder = software_encoder
@@ -74,11 +76,13 @@ class Session:
         self.combine_member = None
         self.part_starts = {}
         self.part_start_pending = False
+        self.log_capture = None
 
 
 class SessionView:
     __slots__ = ('serial', 'title', 'connection', 'status', 'recording_text', 'recording', 'user_closed',
-                 'disconnected', 'standby', 'last_state', 'moved_to', 'stopping', 'window_shown')
+                 'disconnected', 'standby', 'last_state', 'moved_to', 'stopping', 'window_shown', 'pid',
+                 'logs_text', 'logging', 'log_path')
 
     def __init__(self, **values):
         for key, value in values.items():
@@ -92,6 +96,8 @@ class Snapshot:
         self.scan_enabled = values.get('scan_enabled', False)
         self.refresh_enabled = values.get('refresh_enabled', False)
         self.record_dir = values.get('record_dir', '')
+        self.device_log_dir = values.get('device_log_dir', '')
+        self.log_handovers = values.get('log_handovers', 0)
         self.merges = values.get('merges', 0)
         self.combines = values.get('combines', 0)
         self.labels = values.get('labels', 0)
@@ -100,6 +106,9 @@ class Snapshot:
         self.exiting = values.get('exiting', False)
         self.scan_ports = values.get('scan_ports', list(logic.DEFAULT_SCAN_PORTS))
         self.discovery_off = values.get('discovery_off', False)
+        self.disk_free = values.get('disk_free', -1)
+        self.disk_dir = values.get('disk_dir')
+        self.version_warning = values.get('version_warning', '')
 
 
 class Options:
@@ -107,6 +116,8 @@ class Options:
         self.serials = []
         self.record = False
         self.record_dir = None
+        self.device_log_dir = None
+        self.log_apps = []
         self.record_encoder = 'auto'
         self.record_args = []
         self.keep_parts = False
@@ -246,6 +257,9 @@ class Engine:
         self.tools = tools
         self.serial_filter = list(options.serials)
         self.record_dir = options.record_dir
+        self.device_log_dir = options.device_log_dir
+        self.log_apps = frozenset(options.log_apps)
+        self.log_handovers = {}
         self.queue = queue.Queue()
         self.ui_events = queue.Queue()
         self.finished = threading.Event()
@@ -254,6 +268,8 @@ class Engine:
         self._fast_queued = False
         self._queue_lock = threading.Lock()
         self.panel_visible = False
+        self.screen_active = False
+        self.screen_pending = 0
         self.has_panel = True
         self.panel_pending = False
         self.arrange_area = None
@@ -290,9 +306,20 @@ class Engine:
         self.standby = {}
         self.wifi_serials = {}
         self.exiting = False
+        self.session_ending = False
         self.open_windows_requested = False
         self.scrcpy_version = ''
-        self.snapshot = Snapshot(record_dir=str(self.record_dir))
+        self.screen_recording = False
+        self.screen_stop_pending = False
+        self.disk_free = -1
+        self.disk_checked_dir = None
+        self.disk_next_check = 0.0
+        self.disk_warned = False
+        self.disk_refused_at = 0.0
+        self.app_versions = {}
+        self.version_scanning = False
+        self.version_next_scan = 0.0
+        self.snapshot = Snapshot(record_dir=str(self.record_dir), device_log_dir=str(self.device_log_dir))
 
     def start(self):
         self.thread.start()
@@ -339,6 +366,7 @@ class Engine:
                         self.invoke_control_requests()
                         self.update_stops()
                         self.update_part_starts()
+                        self.update_disk_space()
                 elif item == 'exit':
                     self.stop_monitor()
                 elif callable(item):
@@ -356,6 +384,41 @@ class Engine:
 
     def message(self, text, icon='warning'):
         self.ui_events.put(('message', text, icon))
+
+    def record_free_space(self, force=False):
+        folder = str(self.record_dir)
+        now = time.monotonic()
+        if force or now >= self.disk_next_check or folder != self.disk_checked_dir:
+            self.disk_free = logic.disk_free(folder)
+            self.disk_checked_dir = folder
+            self.disk_next_check = now + (10 if self.disk_free >= 0 else 60)
+        return self.disk_free
+
+    def update_disk_space(self):
+        sessions = [s for s in self.sessions.values() if s.recording]
+        screen = self.screen_recording and not self.screen_stop_pending
+        if not sessions and not screen:
+            self.disk_warned = False
+            if self.panel_visible:
+                self.record_free_space()
+            return
+        free = self.record_free_space()
+        level = logic.disk_level(free)
+        if level == 'critical':
+            for session in sessions:
+                self.stop_recording(session)
+            if screen:
+                self.screen_stop_pending = True
+            self.disk_warned = False
+            self.notify(f'Recording stopped: only {logic.format_bytes(free)} is left in {self.record_dir}. The '
+                        'recordings were saved. Free up space or change the recordings folder.', 'error')
+        elif level == 'low':
+            if not self.disk_warned:
+                self.disk_warned = True
+                self.notify(f'Low disk space: {logic.format_bytes(free)} left for recordings in {self.record_dir}. '
+                            'Recording stops automatically below 500 MB.', 'warning')
+        elif level == 'ok':
+            self.disk_warned = False
 
     def confirm(self, text, action):
         self.ui_events.put(('confirm', text, action))
@@ -427,7 +490,7 @@ class Engine:
                 return False
         except OSError:
             return False
-        if not self.tools.ffprobe:
+        if not self.tools.ffprobe or self.session_ending:
             return True
         output = run_hidden([self.tools.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of',
                              'default=nw=1:nk=1', str(path)], 30).strip()
@@ -463,7 +526,10 @@ class Engine:
                 continue
             log(f'[{session.serial}] Record button: {request}')
             if request == 'start':
-                self.start_recording(session)
+                if logic.disk_level(self.record_free_space(True)) in ('low', 'critical'):
+                    self.ui_events.put(('record_request', session.serial))
+                else:
+                    self.start_recording(session)
             elif request == 'stop':
                 self.stop_recording(session)
             self.set_record_state(session)
@@ -546,7 +612,7 @@ class Engine:
                 if now >= session.next_wake:
                     session.next_wake = now + timedelta(seconds=10)
                     log(f'[{session.serial}] No video yet; waking the device screen.')
-                    self.adb(['-s', session.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP'], 3)
+                    self.adb(['-s', session.serial, 'shell', 'case $(dumpsys power) in *mWakefulness=Asleep*|*mWakefulness=Dozing*) input keyevent KEYCODE_POWER;; esac'], 3)
                 return
             exit_code = session.display.returncode
             ran = _seconds(now - session.display_started_at)
@@ -650,6 +716,13 @@ class Engine:
     def start_recording(self, session):
         if session.recording or session.user_closed or session.serial in self.standby:
             return
+        if logic.disk_level(self.record_free_space()) == 'critical':
+            if time.monotonic() - self.disk_refused_at >= 10:
+                self.disk_refused_at = time.monotonic()
+                self.notify(f'Recording not started: less than 500 MB is free in {self.record_dir}. Free up space or '
+                            'change the recordings folder.', 'error')
+            self.set_record_state(session)
+            return
         session.recording = True
         session.recording_started_at = datetime.now()
         session.recording_base = None
@@ -695,6 +768,7 @@ class Engine:
         log(f'[{session.serial}] Starting recorder: {subprocess.list2cmdline(args)}')
         session.recorder = self.start_scrcpy(args, session.recorder_log)
         session.recorder_started_at = datetime.now()
+        session.codec_error_at = None
         session.recorder_part = part
         session.parts.append(part)
         if session.combine_member:
@@ -719,12 +793,18 @@ class Engine:
     def test_encoder_failure(self, session):
         if self.options.record_encoder != 'auto' or session.software_encoder:
             return False
-        if _seconds(datetime.now() - session.recorder_started_at) > 60:
+        if not session.codec_error_at:
+            if _seconds(datetime.now() - session.recorder_started_at) > 60:
+                return False
+            try:
+                if 'CodecException' not in Path(session.recorder_log).read_text(encoding='utf-8', errors='replace'):
+                    return False
+            except OSError:
+                return False
+            session.codec_error_at = datetime.now()
+        if not session.recorder.exited and _seconds(datetime.now() - session.codec_error_at) < 5:
             return False
-        try:
-            return 'CodecException' in Path(session.recorder_log).read_text(encoding='utf-8', errors='replace')
-        except OSError:
-            return False
+        return not self.test_video_file(session.recorder_part)
 
     def remove_recorder_part(self, session):
         if session.recorder_part in session.parts:
@@ -899,6 +979,47 @@ class Engine:
             log(f'Failed to start ffmpeg: {error}')
         self.merges.append(merge)
         log(f'Joining {len(parts)} parts into {output}')
+
+    def post_screen_recording(self, base, parts):
+        with self._queue_lock:
+            self.screen_pending += 1
+        self.post(lambda: self.complete_screen_recording(base, parts))
+
+    def complete_screen_recording(self, base, all_parts):
+        try:
+            self._complete_screen_recording(base, all_parts)
+        finally:
+            with self._queue_lock:
+                self.screen_pending -= 1
+
+    def _complete_screen_recording(self, base, all_parts):
+        parts = []
+        for part in all_parts:
+            if self.test_video_file(part):
+                parts.append(part)
+                continue
+            try:
+                Path(part).unlink()
+            except OSError:
+                pass
+        if not parts:
+            self.notify('Screen recording stopped; nothing was recorded.')
+            return
+        output = f'{base}.mp4'
+        list_file = self.paths.state / f'concat-{uuid.uuid4().hex}.txt'
+        sizes = [self.video_size(part) for part in parts] if self.tools.ffprobe and len(parts) > 1 else []
+        encoder = self.get_combine_encoder_args() if len(set(sizes)) > 1 else []
+        steps, lines = logic.screen_merge_steps(parts, sizes, list_file, output, encoder)
+        if lines:
+            list_file.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        merge = {'process': None, 'steps': steps, 'parts': parts, 'temps': [], 'output': output,
+                 'list_file': list_file, 'member': None, 'segments': [], 'title': ''}
+        try:
+            merge['process'] = self.start_merge_step(merge)
+        except OSError as error:
+            log(f'Failed to start ffmpeg: {error}')
+        self.merges.append(merge)
+        log(f'Saving the screen recording ({len(parts)} part(s)) to {output}')
 
     def start_merge_step(self, merge):
         args = merge['steps'].pop(0)
@@ -1196,6 +1317,9 @@ class Engine:
                         'recording was saved.', 'warning')
 
     def add_recording_header(self, title, path, group=None):
+        if not title:
+            self.notify(f'Screen recording saved: {path}')
+            return
         if not self.tools.ffmpeg or not self.tools.ffprobe:
             self.notify(f'Recording saved: {path}')
             return
@@ -1638,6 +1762,8 @@ class Engine:
             self.update_display(session, devices, ready)
             if not session.user_closed:
                 self.update_recorder(session, devices, ready)
+        self.update_device_logs()
+        self.update_version_scan()
         self.update_arrange()
         tracked = list(self.sessions.values())
         monitored = [s for s in tracked if not s.disconnected and s.name and s.serial not in self.standby]
@@ -1655,7 +1781,8 @@ class Engine:
         opened = [s for s in monitored if not s.user_closed]
         if opened:
             self.closed_by_user = False
-        if (not self.panel_visible and self.closed_by_user and not opened
+        if (not self.panel_visible and self.closed_by_user and not opened and not self.screen_active
+                and not self.screen_pending
                 and not any(s.moved_to for s in tracked) and not self.combine_active() and not self.labels):
             log('All scrcpy windows were closed.')
             self.stop_monitor()
@@ -1700,6 +1827,8 @@ class Engine:
         session.user_closed = True
         session.pending_action = action
         self.stop_recording(session)
+        if not session.moved_to:
+            self.stop_device_log([session])
         self.stop_power_watch(session)
         if session.connector:
             if session.connector.poll() is None:
@@ -1771,6 +1900,7 @@ class Engine:
             session.move_deadline = datetime.now() + timedelta(seconds=30)
 
     def remove_session(self, session):
+        self.move_device_log(session)
         self.close_session(session, None)
         self.sessions.pop(session.serial, None)
         self.removed_serials.add(session.serial)
@@ -1784,6 +1914,7 @@ class Engine:
                 partners.append(self.standby[serial])
             for closed in [serial] + partners:
                 self.closed_serials[closed] = False
+            self.stop_device_log([session] + [self.sessions[p] for p in partners if p in self.sessions])
         self.remove_session(session)
         for partner in partners:
             if partner in self.sessions:
@@ -2025,7 +2156,229 @@ class Engine:
 
     def set_record_dir(self, folder):
         self.record_dir = folder
+        self.disk_next_check = 0.0
         log(f'Recordings folder changed to {folder}')
+
+    def set_device_log_dir(self, folder):
+        self.device_log_dir = folder
+        log(f'Device logs folder changed to {folder} (used by device logs started from now on)')
+
+    def set_log_apps(self, apps):
+        self.log_apps = frozenset(apps)
+        captures = [s.log_capture for s in self.sessions.values() if s.log_capture]
+        captures += [entry[0] for entry in self.log_handovers.values()]
+        for capture in captures:
+            capture.set_apps(self.log_apps)
+        log(f'Apps for per-app logs: {", ".join(sorted(self.log_apps)) or "none"}')
+
+    def scan_running_apps(self, serials):
+        running, opened, user_apps = set(), set(), set()
+        for serial in serials:
+            packages = logic.parse_packages(self.adb(['-s', serial, 'shell', 'pm list packages'], 15))
+            user_apps |= logic.parse_packages(self.adb(['-s', serial, 'shell', 'pm list packages -3'], 15))
+            user_apps |= {logic.PA_PACKAGE, logic.PIA_PACKAGE} & packages
+            text = self.adb(['-s', serial, 'shell', 'ps -A -o PID,NAME'], 10)
+            if len(text.split('\n')) <= 3:
+                text = self.adb(['-s', serial, 'shell', 'ps'], 10)
+            running |= logic.running_apps(text, packages)
+            app = logic.foreground_app(self.adb(['-s', serial, 'shell', 'dumpsys window'], 10))
+            if app:
+                opened.add(app)
+        return running | opened, opened, user_apps
+
+    def update_version_scan(self):
+        if self.version_scanning or time.monotonic() < self.version_next_scan:
+            return
+        serials = [s.serial for s in self.sessions.values()
+                   if s.last_state == 'device' and s.serial not in self.standby]
+        if not serials:
+            return
+        self.version_scanning = True
+        self.version_next_scan = time.monotonic() + 30
+        threading.Thread(target=self._scan_versions, args=(serials,), name='version scan', daemon=True).start()
+
+    def _scan_versions(self, serials):
+        result = {}
+        try:
+            for serial in serials:
+                if self.exiting:
+                    break
+                versions = logic.parse_app_versions(self.adb(['-s', serial, 'shell', logic.VERSION_COMMAND], 10))
+                if versions is not None:
+                    result[serial] = versions
+        except Exception as error:
+            log(f'Reading PA and PIA versions failed: {error}')
+        self.post(lambda: self.complete_version_scan(result))
+
+    def complete_version_scan(self, result):
+        self.version_scanning = False
+        for serial, versions in result.items():
+            text = logic.app_version_text(versions)
+            if text != logic.app_version_text(self.app_versions.get(serial)):
+                log(f'[{serial}] App versions: {text}')
+            self.app_versions[serial] = versions
+            session = self.sessions.get(serial)
+            if session and session.log_capture:
+                session.log_capture.note_versions(versions, False)
+
+    def device_log_name(self, session):
+        name = session.name
+        if not name and session.last_state == 'device':
+            name = self.get_prop(session.serial, 'ro.product.model')
+        return safe_name(name or '') or session.safe_serial
+
+    def device_hardware_serial(self, session):
+        hardware = session.serial
+        if connection_type(session.serial) == 'Wi-Fi':
+            hardware = self.wifi_serials.get(session.serial)
+            if not hardware and session.last_state == 'device':
+                hardware = self.get_prop(session.serial, 'ro.serialno')
+                if hardware:
+                    self.wifi_serials[session.serial] = hardware
+        return safe_name(hardware or '') or session.safe_serial
+
+    def start_device_log(self, session):
+        if session.log_capture or session.user_closed or session.serial in self.standby:
+            return
+        device_name = self.device_log_name(session)
+        hardware = self.device_hardware_serial(session)
+        folder = Path(self.device_log_dir) / device_name
+        path = logic.device_log_path(str(folder), device_name, hardware, datetime.now(), os.path.exists)
+        try:
+            capture = LogcatCapture(self.tools.adb, session.serial, path,
+                                    f'{device_name}, serial {hardware}, adb {session.serial}', self.tools.env,
+                                    self.log_apps)
+            capture.start()
+        except OSError as error:
+            self.notify(f'Could not start device logs for {session.title}: {error}', 'error')
+            return
+        session.log_capture = capture
+        log(f'[{session.serial}] Device logs started: {path}')
+        self.notify(f'Device logs started for {session.title}.')
+
+    def complete_device_logs(self, captures, quiet=False):
+        captures = [c for c in captures if c]
+        for capture in captures:
+            capture.request_stop()
+        for capture in captures:
+            try:
+                capture.stop()
+                failure = f'; stopped by an error: {capture.error}' if capture.failed else ''
+                log(f'Device logs saved: {capture.path} ({capture.entries} entries){failure}')
+            except Exception:
+                log('ERROR: ' + traceback.format_exc())
+        if quiet or not captures:
+            return
+        if len(captures) == 1:
+            self.notify(f'Device logs saved: {captures[0].path}')
+        else:
+            self.notify(f'Device logs of {len(captures)} devices saved in {self.device_log_dir}')
+
+    def stop_device_log(self, sessions, quiet=False):
+        captures = []
+        for session in sessions:
+            if session and session.log_capture:
+                captures.append(session.log_capture)
+                session.log_capture = None
+        self.complete_device_logs(captures, quiet)
+
+    def stop_all_device_logs(self):
+        captures = []
+        for session in self.sessions.values():
+            if session.log_capture:
+                captures.append(session.log_capture)
+                session.log_capture = None
+        captures += [entry[0] for entry in self.log_handovers.values()]
+        self.log_handovers.clear()
+        self.complete_device_logs(captures, True)
+
+    def move_device_log(self, session):
+        capture = session.log_capture
+        if not capture:
+            return
+        session.log_capture = None
+        serial = session.serial
+        moving = bool(session.moved_to and session.move_address)
+        candidates = [session.move_address] if moving else []
+        if serial in self.standby:
+            candidates.append(self.standby[serial])
+        candidates += [s for s, target in self.standby.items() if target == serial]
+        for candidate in candidates:
+            target = self.sessions.get(candidate)
+            if (not target or target is session or target.user_closed or target.log_capture
+                    or candidate in self.closed_serials):
+                continue
+            capture.serial = candidate
+            target.log_capture = capture
+            log(f'[{serial}] Device logs continue over {candidate}.')
+            return
+        key = session.move_address if moving else serial
+        capture.serial = key
+        seconds = 60 if session.moved_to else 300
+        self.log_handovers[key] = (capture, datetime.now() + timedelta(seconds=seconds))
+        log(f'[{serial}] Device logs wait up to {seconds} seconds for {key}.')
+
+    def update_device_logs(self):
+        now = datetime.now()
+        for key, (capture, until) in list(self.log_handovers.items()):
+            session = self.sessions.get(key)
+            if session and not session.user_closed and not session.log_capture:
+                del self.log_handovers[key]
+                session.log_capture = capture
+                log(f'[{key}] Device logs resumed.')
+            elif now >= until or capture.failed:
+                del self.log_handovers[key]
+                log(f'[{key}] The device did not come back; saving its device logs.')
+                self.complete_device_logs([capture])
+        for session in [s for s in list(self.sessions.values()) if s.log_capture]:
+            capture = session.log_capture
+            if capture.failed:
+                session.log_capture = None
+                self.complete_device_logs([capture], True)
+                self.notify(f'Device logs of {session.title} stopped: {capture.error}. The logs up to that point '
+                            f'were saved in {capture.path}.', 'error')
+                continue
+            if session.serial not in self.standby:
+                continue
+            active = self.sessions.get(self.standby[session.serial])
+            if not active or active.user_closed or active.log_capture:
+                continue
+            capture.serial = active.serial
+            active.log_capture = capture
+            session.log_capture = None
+            log(f'[{session.serial}] Device logs continue over {active.serial}.')
+
+    def toggle_device_log(self, serials):
+        selected = [self.sessions[s] for s in serials if s in self.sessions]
+        selected = [s for s in selected if not s.user_closed and s.serial not in self.standby]
+        to_start = [s for s in selected if not s.log_capture]
+        if to_start:
+            for session in to_start:
+                self.start_device_log(session)
+        else:
+            self.stop_device_log(selected)
+
+    def start_all_device_logs(self, serials=()):
+        for session in self.target_sessions(serials):
+            self.start_device_log(session)
+
+    def stop_all_logs(self, serials=()):
+        captures = [self.log_handovers.pop(key)[0] for key in list(self.log_handovers) if not serials or key in serials]
+        for session in list(self.sessions.values()):
+            if session.log_capture and (not serials or session.serial in serials):
+                captures.append(session.log_capture)
+                session.log_capture = None
+        self.complete_device_logs(captures)
+
+    def logs_text(self, session):
+        capture = session.log_capture
+        if not capture:
+            return ''
+        text = (f'Logging {logic.format_elapsed(_seconds(datetime.now() - capture.started_at))} - '
+                f'{logic.format_bytes(capture.size)}')
+        if capture.state != 'Logging':
+            text += ' (waiting for device)'
+        return text
 
     def stop_monitor(self):
         if self.exiting:
@@ -2036,14 +2389,15 @@ class Engine:
         steps = [self.stop_adb_jobs]
         steps += [lambda s=s: self.stop_power_watch(s) for s in list(self.sessions.values())]
         steps += [lambda s=s: self.stop_recording(s) for s in list(self.sessions.values())]
-        steps.append(lambda: self.update_stops(45))
+        steps.append(self.stop_all_device_logs)
+        steps.append(lambda: self.update_stops(20 if self.session_ending else 45))
         steps.append(lambda: self.update_combine_handovers(True))
         steps += [lambda s=s: self.invoke_pending_action(s) for s in list(self.sessions.values()) if s.pending_action]
         steps += [lambda s=s: self._close_processes(s) for s in list(self.sessions.values())]
-        steps.append(lambda: self.update_merges(600))
-        steps.append(lambda: self.update_combines(120))
+        steps.append(lambda: self.update_merges(30 if self.session_ending else 600))
+        steps.append(lambda: self.session_ending or self.update_combines(120))
         steps.append(self.stop_combines)
-        steps.append(lambda: self.update_labels(120, force=True))
+        steps.append(lambda: self.session_ending or self.update_labels(120, force=True))
         steps.append(self.stop_labels)
         for step in steps:
             try:
@@ -2104,12 +2458,22 @@ class Engine:
                 status=self.session_status(session), recording_text=self.recording_text(session),
                 recording=session.recording, user_closed=session.user_closed, disconnected=session.disconnected,
                 standby=session.serial in self.standby, last_state=session.last_state, moved_to=session.moved_to,
-                stopping=session.stopping, window_shown=bool(session.display and session.window_shown)))
+                stopping=session.stopping, window_shown=bool(session.display and session.window_shown),
+                pid=session.display.pid if session.display else 0, logs_text=self.logs_text(session),
+                logging=bool(session.log_capture),
+                log_path=session.log_capture.path if session.log_capture else ''))
+        known = [self.app_versions[s.serial] for s in self.sessions.values()
+                 if s.serial in self.app_versions and s.last_state == 'device' and s.serial not in self.standby]
+        mismatched = ' and '.join(name for name, package in (('PA', logic.PA_PACKAGE), ('PIA', logic.PIA_PACKAGE))
+                                  if logic.version_mismatch(known, package))
         self.snapshot = Snapshot(
-            views, discovery_status=self.discovery_status, record_dir=str(self.record_dir), merges=len(self.merges),
+            views, discovery_status=self.discovery_status, record_dir=str(self.record_dir),
+            device_log_dir=str(self.device_log_dir), log_handovers=len(self.log_handovers), merges=len(self.merges),
             combines=len(self.combines), labels=len(self.labels), combine_active=self.combine_active(),
             connecting=[job.address for job in self.connects if job.manual], exiting=self.exiting,
             scan_enabled=not (self.discovery_disabled() or self.discovery or self.probe),
             refresh_enabled=bool(self.closed_serials) or not (self.discovery_disabled() or self.discovery
                                                               or self.probe),
-            scan_ports=self.scan_ports(), discovery_off=self.discovery_disabled())
+            scan_ports=self.scan_ports(), discovery_off=self.discovery_disabled(), disk_free=self.disk_free,
+            disk_dir=self.disk_checked_dir,
+            version_warning=f'{mismatched} version mismatch between devices' if mismatched else '')

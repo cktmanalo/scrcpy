@@ -11,7 +11,8 @@
     "Refresh" in the control panel or tray icon, or running the monitor again, shows it again. Once every
     window is closed, the monitor exits unless the control panel is open. The control panel opens when the
     first device window starts; closing it keeps the monitor in the tray. Global actions are in its File,
-    Recording, Window and Help menus, and a column header click sorts the device list.
+    Recording, Logs, Window and Help menus, and a column header click sorts the device list. Ctrl+Alt+M
+    opens the tray menu at the mouse pointer from any application.
 
     Device windows are arranged on the screen of the control panel: one device is centered, several are
     placed around the center without overlapping, each at 100% when it fits and scaled down only to fit.
@@ -33,9 +34,41 @@
     Every screen is scaled by the same factor, so a smaller device keeps its real size and proportions:
         <RecordDir>\Combined\Screen_Recording_Combined_<yyyyMMdd_HHmmss>.mp4
 
+    Recording > "Screen recording" in the control panel or the tray icon records the desktop instead of a
+    device: a rectangle on screen that is moved and resized by its frame, a selected area, one screen or all
+    screens, a window (a device window or any other window, followed when it moves) or the area around the
+    mouse. Its toolbar starts and stops the recording, pauses it, takes a screenshot and opens the folder;
+    F12 starts or stops, Shift+F12 pauses or resumes and F11 takes a screenshot from any application. The
+    frame and toolbar are not recorded. A pause or a window resize starts a new part, and the parts are joined
+    into one MP4 when the recording stops:
+        <RecordDir>\Screen Recordings\Screen_Capture_<yyyyMMdd_HHmmss>.mp4
+        <RecordDir>\Screen Recordings\Screenshot_<yyyyMMdd_HHmmss_fff>.png
+
     The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
     default. When scrcpy.exe is next to this script (portable package), scrcpy, adb and ffmpeg are used from
     this folder.
+
+    The status bar of the control panel shows the free space on the drive of the recordings folder (click
+    it to change the folder). Below 2 GB free, starting a recording asks whether to choose another folder
+    and a running recording shows one warning; below 500 MB, recording does not start, and every device
+    and screen recording is stopped and saved.
+
+    "Start device logs" in the control panel, its Logs menu, the tray icon or -Command StartLogs saves the
+    adb logcat of a device to a text file in the Android Studio Logcat format (date, time, PID-TID, tag,
+    package, level, message) while the device is mirrored. The capture stays connected while the device
+    restarts or reconnects, and the file shows where the device restarted. It is written as it runs and
+    saved when the logs are stopped, the device is closed or disconnected, or the monitor exits:
+        <DeviceLogDir>\<Device Name>\logs_<Device Name>_<Device Serial>_<yyyyMMdd_HHmmss>.txt
+    The lines of the apps checked in Logs > "Choose apps for per-app logs..." (which lists PA and PIA first,
+    then every app open, running or installed on the connected devices, none checked by default, like the
+    Logcat package filter) are also saved to a file with the same name in a subfolder named after the app
+    package; with no app checked, only the full device log is saved:
+        <DeviceLogDir>\<Device Name>\<App Package>\logs_<Device Name>_<Device Serial>_<yyyyMMdd_HHmmss>.txt
+    The device logs folder is chosen from Logs > "Change device logs folder...". The Device logs column
+    shows the elapsed time and size of each log.
+    APP STATUS lines record whether PA, PIA and the checked apps are running (with the pid) when logging
+    starts and after every restart or reconnection, and APP STARTED, APP STOPPED, APP CRASHED and APP NOT
+    RESPONDING lines record those events as they happen.
 
     Wi-Fi devices that advertise adb on the network (mDNS, for example after "adb tcpip 5555") are found and
     connected automatically unless -NoDiscovery or -Serial is given. "Connect Wi-Fi device..." in the control
@@ -60,6 +93,8 @@
     .\scrcpy-monitor.ps1 -Command StartRecording -Serial 192.168.68.100:5555
 .EXAMPLE
     .\scrcpy-monitor.ps1 -Command StopRecording
+.EXAMPLE
+    .\scrcpy-monitor.ps1 -Command StartLogs -Serial 192.168.68.100:5555
 #>
 [CmdletBinding()]
 param(
@@ -72,7 +107,7 @@ param(
     [string]$RecordEncoder = 'auto',
     [string[]]$RecordArgs,
     [switch]$KeepParts,
-    [ValidateSet('StartRecording', 'StopRecording', 'ShowPanel', 'Exit')]
+    [ValidateSet('StartRecording', 'StopRecording', 'StartLogs', 'StopLogs', 'ShowPanel', 'Exit')]
     [string]$Command,
     [switch]$List,
     [switch]$NoTray,
@@ -93,6 +128,7 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$script:Prompts = 0
 
 if ($SendCtrlC) {
     Add-Type -Namespace ScrcpyMonitor -Name Console -MemberDefinition @'
@@ -363,6 +399,19 @@ function Stop-ProcessTree([int]$ProcessId) {
 }
 
 function Send-CtrlC([System.Diagnostics.Process]$Process) {
+    if ($script:SessionEnding) {
+        try {
+            [void][ScrcpyMonitor.Window]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+            [void][ScrcpyMonitor.Window]::FreeConsole()
+            if (-not ([ScrcpyMonitor.Window]::AttachConsole([uint32]$Process.Id) -and [ScrcpyMonitor.Window]::GenerateConsoleCtrlEvent(0, 0))) {
+                Write-Log "Could not send Ctrl+C to process $($Process.Id)."
+            }
+            [void][ScrcpyMonitor.Window]::FreeConsole()
+        } catch {
+            Write-Log "Could not send Ctrl+C to process $($Process.Id): $($_.Exception.Message)"
+        }
+        return $null
+    }
     try {
         $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -SendCtrlC {1}' -f $PSCommandPath, $Process.Id
         return [System.Diagnostics.Process]::Start((New-HiddenStartInfo $script:PowerShellExe $arguments))
@@ -389,7 +438,7 @@ function Stop-ScrcpyProcess([System.Diagnostics.Process]$Process, [int]$TimeoutM
 function Test-VideoFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     if ((Get-Item -LiteralPath $Path).Length -lt 1024) { return $false }
-    if (-not $script:Ffprobe) { return $true }
+    if (-not $script:Ffprobe -or $script:SessionEnding) { return $true }
     $duration = (Invoke-Hidden $script:Ffprobe @('-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', $Path) 30000).Trim()
     $value = 0.0
     [double]::TryParse($duration, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value) -and $value -gt 0
@@ -461,6 +510,99 @@ function Show-Notification([string]$Message, [string]$Icon = 'Info') {
     }
 }
 
+function Get-ExistingFolder([string]$Path) {
+    $folder = $Path
+    while ($folder) {
+        if ([System.IO.Directory]::Exists($folder)) { return $folder }
+        try { $folder = [System.IO.Path]::GetDirectoryName($folder) } catch { return $null }
+    }
+    $null
+}
+
+function Get-DiskFreeBytes([string]$Path) {
+    try {
+        $folder = Get-ExistingFolder $Path
+        if (-not $folder) { return -1L }
+        if (-not $script:Fso) { $script:Fso = New-Object -ComObject Scripting.FileSystemObject }
+        $drive = $script:Fso.GetDrive($script:Fso.GetDriveName($folder))
+        if (-not $drive.IsReady) { return -1L }
+        return [long]$drive.AvailableSpace
+    } catch {
+        return -1L
+    }
+}
+
+function Get-RecordFreeSpace([switch]$Force) {
+    $now = Get-Date
+    if ($Force -or $now -ge $script:DiskNextCheck -or $script:DiskCheckedDir -ne $RecordDir) {
+        $script:DiskFree = Get-DiskFreeBytes $RecordDir
+        $script:DiskCheckedDir = $RecordDir
+        $script:DiskNextCheck = $now.AddSeconds($(if ($script:DiskFree -lt 0) { 60 } else { 10 }))
+    }
+    $script:DiskFree
+}
+
+function Get-DiskLevel([long]$Free) {
+    if ($Free -lt 0) { return 'unknown' }
+    if ($Free -lt $script:DiskCritical) { return 'critical' }
+    if ($Free -lt $script:DiskLow) { return 'low' }
+    'ok'
+}
+
+function Confirm-RecordSpace {
+    if ($script:DiskPrompting) { return $false }
+    if (((Get-Date) - $script:DiskConfirmedAt).TotalSeconds -lt 5) { return $true }
+    $script:DiskPrompting = $true
+    try {
+        while ($true) {
+            $free = Get-RecordFreeSpace -Force
+            $level = Get-DiskLevel $free
+            if ($level -eq 'ok' -or $level -eq 'unknown') { break }
+            $text = "Only $(Format-ScreenBytes $free) is free on the drive of the recordings folder:`n$RecordDir`n`n"
+            if ($level -eq 'critical') {
+                $answer = Show-Message ($text + 'Recording needs at least 500 MB of free space. Choose another recordings folder?') 'YesNo' 'Error'
+                if ($answer -ne 'Yes') { return $false }
+            } else {
+                $answer = Show-Message ($text + "Recording stops automatically when less than 500 MB is left.`n`nYes: choose another recordings folder`nNo: record here anyway`nCancel: do not record") 'YesNoCancel' 'Warning'
+                if ($answer -eq 'No') { break }
+                if ($answer -ne 'Yes') { return $false }
+            }
+            if (-not (Select-RecordFolder)) { return $false }
+            if ((Get-DiskLevel (Get-RecordFreeSpace -Force)) -ne 'critical') { break }
+        }
+        $script:DiskConfirmedAt = Get-Date
+        return $true
+    } finally {
+        $script:DiskPrompting = $false
+    }
+}
+
+function Update-DiskSpace {
+    if ($script:Exiting) { return }
+    $sessions = @($script:Sessions.Values | Where-Object { $_.Recording })
+    $screen = $script:ScreenRec -and $script:ScreenRec.Recording
+    if (-not $sessions.Count -and -not $screen) {
+        $script:DiskWarned = $false
+        return
+    }
+    $free = Get-RecordFreeSpace
+    $level = Get-DiskLevel $free
+    if ($level -eq 'critical') {
+        foreach ($session in $sessions) { Stop-Recording $session }
+        if ($screen) { Stop-ScreenRecording }
+        $script:DiskWarned = $false
+        Show-Notification "Recording stopped: only $(Format-ScreenBytes $free) is left in $RecordDir. The recordings were saved. Free up space or change the recordings folder." 'Error'
+        Update-TrayText
+    } elseif ($level -eq 'low') {
+        if (-not $script:DiskWarned) {
+            $script:DiskWarned = $true
+            Show-Notification "Low disk space: $(Format-ScreenBytes $free) left for recordings in $RecordDir. Recording stops automatically below 500 MB." 'Warning'
+        }
+    } elseif ($level -eq 'ok') {
+        $script:DiskWarned = $false
+    }
+}
+
 function Get-FreePortBlock {
     $used = @($script:Sessions.Values | ForEach-Object { $_.Port })
     for ($port = 27200; $port -lt 29200; $port += 4) {
@@ -513,6 +655,7 @@ function New-Session([string]$DeviceSerial, [string]$State) {
         RecorderStartedAt  = $null
         RecorderPart       = $null
         RecorderLog        = $null
+        CodecErrorAt       = $null
         RecorderFailures   = 0
         NextRecordAttempt  = Get-Date
         SoftwareEncoder    = $(if ($RecordEncoder -eq 'auto') { Get-CachedEncoder $DeviceSerial } else { $null })
@@ -522,6 +665,7 @@ function New-Session([string]$DeviceSerial, [string]$State) {
         CombineMember      = $null
         PartStarts         = @{}
         PartStartPending   = $false
+        LogCapture         = $null
     }
     $script:Sessions[$DeviceSerial] = $session
     Set-RecordState $session
@@ -534,6 +678,7 @@ function Set-RecordState($Session) {
 }
 
 function Invoke-ControlRequests {
+    if ($script:DiskPrompting) { return }
     foreach ($session in @($script:Sessions.Values)) {
         $requestPath = "$($session.ControlPath).request"
         if (-not [System.IO.File]::Exists($requestPath)) { continue }
@@ -546,7 +691,7 @@ function Invoke-ControlRequests {
         }
         Write-Log "[$($session.Serial)] Record button: $request"
         switch ($request) {
-            'start' { Start-Recording $session }
+            'start' { if (Confirm-RecordSpace) { Start-Recording $session } }
             'stop' { Stop-Recording $session }
         }
         Set-RecordState $session
@@ -764,7 +909,7 @@ function Update-Display($Session, $Devices, [ref]$Ready) {
             if ($now -ge $Session.NextWake) {
                 $Session.NextWake = $now.AddSeconds(10)
                 Write-Log "[$($Session.Serial)] No video yet; waking the device screen."
-                [void](Invoke-Adb @('-s', $Session.Serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP') 3000)
+                [void](Invoke-Adb @('-s', $Session.Serial, 'shell', 'case $(dumpsys power) in *mWakefulness=Asleep*|*mWakefulness=Dozing*) input keyevent KEYCODE_POWER;; esac') 3000)
             }
             return
         }
@@ -806,6 +951,13 @@ function Update-Display($Session, $Devices, [ref]$Ready) {
 
 function Start-Recording($Session) {
     if ($Session.Recording -or $Session.UserClosed -or $script:Standby.ContainsKey($Session.Serial)) { return }
+    if ((Get-DiskLevel (Get-RecordFreeSpace)) -eq 'critical') {
+        if (((Get-Date) - $script:DiskRefusedAt).TotalSeconds -ge 10) {
+            $script:DiskRefusedAt = Get-Date
+            Show-Notification "Recording not started: less than 500 MB is free in $RecordDir. Free up space or change the recordings folder." 'Error'
+        }
+        return
+    }
     $Session.Recording = $true
     $Session.RecordingStartedAt = Get-Date
     $Session.RecordingBase = $null
@@ -847,6 +999,7 @@ function Start-RecorderPart($Session) {
     Write-Log "[$($Session.Serial)] Starting recorder: $(ConvertTo-ArgumentString $arguments)"
     $Session.Recorder = Start-ScrcpyProcess $arguments $Session.RecorderLog
     $Session.RecorderStartedAt = Get-Date
+    $Session.CodecErrorAt = $null
     $Session.RecorderPart = $part
     [void]$Session.Parts.Add($part)
     if ($Session.CombineMember) {
@@ -876,13 +1029,18 @@ function Update-PartStarts {
 
 function Test-EncoderFailure($Session) {
     if ($RecordEncoder -ne 'auto' -or $Session.SoftwareEncoder) { return $false }
-    if (((Get-Date) - $Session.RecorderStartedAt).TotalSeconds -gt 60) { return $false }
-    try {
-        $content = Get-Content -LiteralPath $Session.RecorderLog -Raw -ErrorAction Stop
-        return ($content -and $content -match 'CodecException')
-    } catch {
-        return $false
+    if (-not $Session.CodecErrorAt) {
+        if (((Get-Date) - $Session.RecorderStartedAt).TotalSeconds -gt 60) { return $false }
+        try {
+            $content = Get-Content -LiteralPath $Session.RecorderLog -Raw -ErrorAction Stop
+        } catch {
+            return $false
+        }
+        if (-not ($content -and $content -match 'CodecException')) { return $false }
+        $Session.CodecErrorAt = Get-Date
     }
+    if (-not $Session.Recorder.HasExited -and ((Get-Date) - $Session.CodecErrorAt).TotalSeconds -lt 5) { return $false }
+    return -not (Test-VideoFile $Session.RecorderPart)
 }
 
 function Remove-RecorderPart($Session) {
@@ -1452,6 +1610,10 @@ function Stop-Combines {
 }
 
 function Add-RecordingHeader([string]$Title, [string]$Path, $Group = $null) {
+    if (-not $Title) {
+        Show-Notification "Screen recording saved: $Path"
+        return
+    }
     if (-not $script:Ffmpeg -or -not $script:Ffprobe) {
         Show-Notification "Recording saved: $Path"
         return
@@ -1495,6 +1657,13 @@ function Start-Label($Label) {
     Write-Log "Adding the device name header to $($Label.Path)"
 }
 
+function Remove-TempFile([string]$Path) {
+    for ($i = 0; $i -lt 10 -and (Test-Path -LiteralPath $Path); $i++) {
+        if ($i) { Start-Sleep -Milliseconds 200 }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Complete-Label($Label, [int]$ExitCode) {
     $script:Labels.Remove($Label)
     if ($Label.Process) {
@@ -1519,7 +1688,7 @@ function Complete-Label($Label, [int]$ExitCode) {
     } else {
         Write-Log "Could not add the device name header to $($Label.Path) (ffmpeg exit code $ExitCode); the recording was kept without it."
     }
-    Remove-Item -LiteralPath $Label.Temp -Force -ErrorAction SilentlyContinue
+    Remove-TempFile $Label.Temp
     if ($labeled) {
         Show-Notification "Recording saved: $($Label.Path)"
     } else {
@@ -1573,7 +1742,7 @@ function Stop-Labels {
                 $label.Process.Dispose()
             }
         } catch { }
-        Remove-Item -LiteralPath $label.Temp -Force -ErrorAction SilentlyContinue
+        Remove-TempFile $label.Temp
         if ($label.Header) { Remove-Item -LiteralPath $label.Header -Force -ErrorAction SilentlyContinue }
         Write-Log "Device name header for $($label.Path) cancelled at exit; the recording was kept without it."
         Show-Notification "Recording saved without the device name header: $($label.Path)"
@@ -1596,6 +1765,8 @@ function Invoke-Requests {
         switch ($request.Command) {
             'StartRecording' { foreach ($session in (Get-TargetSessions $serials)) { Start-Recording $session } }
             'StopRecording' { foreach ($session in (Get-TargetSessions $serials)) { Stop-Recording $session } }
+            'StartLogs' { foreach ($session in (Get-TargetSessions $serials)) { Start-DeviceLog $session } }
+            'StopLogs' { Stop-AllLogs $serials }
             'ShowPanel' {
                 if ($script:Panel) { Show-Panel }
                 else { Show-Notification 'scrcpy monitor is already running (see the tray icon).' }
@@ -2014,11 +2185,12 @@ function Invoke-Tick {
     }
     $opened = @($monitored | Where-Object { -not $_.UserClosed })
     if ($opened.Count) { $script:ClosedByUser = $false }
-    if (-not ($script:Panel -and $script:Panel.Visible) -and $script:ClosedByUser -and -not $opened.Count -and -not ($tracked | Where-Object { $_.MovedTo }) -and -not (Test-CombineActive) -and -not $script:Labels.Count) {
+    if (-not ($script:Panel -and $script:Panel.Visible) -and $script:ClosedByUser -and -not $opened.Count -and -not ($tracked | Where-Object { $_.MovedTo }) -and -not (Test-CombineActive) -and -not $script:Labels.Count -and -not $script:ScreenRec) {
         Write-Log 'All scrcpy windows were closed.'
         Stop-Monitor
         return
     }
+    Update-DeviceLogs
     Update-Arrange
     Update-TrayText
 }
@@ -2026,7 +2198,13 @@ function Invoke-Tick {
 function Update-TrayText {
     if (-not $script:Tray) { return }
     $recording = @($script:Sessions.Values | Where-Object { $_.Recording }).Count
-    $text = if ($recording) { "Scrcpy Monitor - recording $recording device(s)" } else { 'Scrcpy Monitor' }
+    $logging = @($script:Sessions.Values | Where-Object { $_.LogCapture }).Count
+    $screen = $script:ScreenRec -and $script:ScreenRec.Recording
+    $text = if ($recording -and $screen) { "Scrcpy Monitor - recording $recording device(s) and the screen" }
+            elseif ($recording) { "Scrcpy Monitor - recording $recording device(s)" }
+            elseif ($screen) { 'Scrcpy Monitor - recording the screen' }
+            else { 'Scrcpy Monitor' }
+    if ($logging) { $text += $(if ($text -eq 'Scrcpy Monitor') { " - logging $logging device(s)" } else { ", logging $logging" }) }
     $script:Tray.Text = $text.Substring(0, [Math]::Min(63, $text.Length))
 }
 
@@ -2037,7 +2215,10 @@ function Update-TrayMenu {
     if ($script:Panel) {
         $showPanel = $menu.Items.Add('Show control panel')
         $showPanel.Font = New-Object System.Drawing.Font($showPanel.Font, [System.Drawing.FontStyle]::Bold)
-        $showPanel.add_Click({ Invoke-Safely { Show-Panel } })
+        $showPanel.add_Click({ Invoke-Safely {
+            if ($script:Panel.IsHandleCreated) { [void]$script:Panel.BeginInvoke([System.Windows.Forms.MethodInvoker]{ Invoke-Safely { Show-Panel } }) }
+            else { Show-Panel }
+        } })
         [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     }
 
@@ -2063,6 +2244,7 @@ function Update-TrayMenu {
             continue
         }
         if ($session.Recording) { $label += '  [REC]' }
+        if ($session.LogCapture) { $label += '  [LOG]' }
         $item = New-Object System.Windows.Forms.ToolStripMenuItem $label
         $toggle = New-Object System.Windows.Forms.ToolStripMenuItem $(if ($session.Recording) { 'Stop recording' } else { 'Start recording' })
         $toggle.Tag = $session.Serial
@@ -2070,11 +2252,21 @@ function Update-TrayMenu {
             param($sender, $e)
             Invoke-Safely {
                 $target = $script:Sessions[$sender.Tag]
-                if ($target.Recording) { Stop-Recording $target } else { Start-Recording $target }
+                if ($target.Recording) { Stop-Recording $target } elseif (Confirm-RecordSpace) { Start-Recording $target }
                 Update-TrayText
             }
         })
         [void]$item.DropDownItems.Add($toggle)
+        $logs = New-Object System.Windows.Forms.ToolStripMenuItem $(if ($session.LogCapture) { 'Stop device logs' } else { 'Start device logs' })
+        $logs.Tag = $session.Serial
+        $logs.add_Click({ param($sender, $e) Invoke-Safely { Switch-DeviceLog @($script:Sessions[$sender.Tag]); Update-TrayText } })
+        [void]$item.DropDownItems.Add($logs)
+        if ($session.LogCapture) {
+            $openDeviceLog = New-Object System.Windows.Forms.ToolStripMenuItem 'Open device log'
+            $openDeviceLog.Tag = $session.Serial
+            $openDeviceLog.add_Click({ param($sender, $e) Invoke-Safely { Open-DeviceLog @($script:Sessions[$sender.Tag]) } })
+            [void]$item.DropDownItems.Add($openDeviceLog)
+        }
         if ($session.Connection -in @('Wi-Fi', 'USB')) {
             $switch = New-Object System.Windows.Forms.ToolStripMenuItem $(if ($session.Connection -eq 'Wi-Fi') { 'Switch to USB' } else { 'Switch to Wi-Fi' })
             $switch.Tag = $session.Serial
@@ -2107,10 +2299,17 @@ function Update-TrayMenu {
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $startAll = $menu.Items.Add('Start recording on all devices')
     $startAll.Enabled = @($sessions | Where-Object { -not $_.Recording -and -not $script:Standby.ContainsKey($_.Serial) }).Count -gt 0
-    $startAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s }; Update-TrayText } })
+    $startAll.add_Click({ Invoke-Safely { if (Confirm-RecordSpace) { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } }; Update-TrayText } })
     $stopAll = $menu.Items.Add('Stop recording on all devices')
     $stopAll.Enabled = @($sessions | Where-Object { $_.Recording }).Count -gt 0
     $stopAll.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s }; Update-TrayText } })
+    $startLogs = $menu.Items.Add('Start device logs on all devices')
+    $startLogs.Enabled = @($sessions | Where-Object { -not $_.LogCapture -and -not $script:Standby.ContainsKey($_.Serial) }).Count -gt 0
+    $startLogs.add_Click({ Invoke-Safely { foreach ($s in (Get-TargetSessions @())) { Start-DeviceLog $s }; Update-TrayText } })
+    $stopLogs = $menu.Items.Add('Stop device logs on all devices')
+    $stopLogs.Enabled = @($script:Sessions.Values | Where-Object { $_.LogCapture }).Count -gt 0 -or $script:LogHandovers.Count -gt 0
+    $stopLogs.add_Click({ Invoke-Safely { Stop-AllLogs @(); Update-TrayText } })
+    [void](Add-ScreenRecordMenu $menu.Items)
     $connectWifi = $menu.Items.Add('Connect Wi-Fi device...')
     $connectWifi.add_Click({ Invoke-Safely { Show-ConnectDialog } })
     $refresh = $menu.Items.Add('Refresh devices')
@@ -2123,7 +2322,14 @@ function Update-TrayMenu {
     $openFolder = $menu.Items.Add('Open recordings folder')
     $openFolder.add_Click({ Invoke-Safely { Open-RecordFolder } })
     $changeFolder = $menu.Items.Add('Change recordings folder...')
-    $changeFolder.add_Click({ Invoke-Safely { Select-RecordFolder } })
+    $changeFolder.add_Click({ Invoke-Safely { [void](Select-RecordFolder) } })
+    $openLogsFolder = $menu.Items.Add('Open device logs folder')
+    $openLogsFolder.add_Click({ Invoke-Safely { Open-DeviceLogFolder } })
+    $changeLogsFolder = $menu.Items.Add('Change device logs folder...')
+    $changeLogsFolder.add_Click({ Invoke-Safely { [void](Select-DeviceLogFolder) } })
+    $chooseLogApps = $menu.Items.Add('Choose apps for per-app logs...')
+    $chooseLogApps.Enabled = -not $script:AppsScan
+    $chooseLogApps.add_Click({ Invoke-Safely { Select-LogApps } })
     $openLog = $menu.Items.Add('Open log')
     $openLog.add_Click({ Invoke-Safely { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" } })
     if ($script:UpdateConfig) {
@@ -2199,7 +2405,12 @@ function Show-About {
         "- Device windows open centered without overlapping, at 100% when they fit, and are arranged again when a window opens or closes (Window > Arrange windows).`n" +
         "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device with the device name as a header above the screen.`n" +
         "- Record combined also joins the recordings of the selected devices into one video laid out like the arranged device windows, with each device name above its screen; each device keeps its real size and proportions.`n" +
-        "- Click a column header to sort the list; global actions are in the File, Recording, Window and Help menus.`n" +
+        "- Screen recording (Recording menu or tray icon) records the desktop: a movable, resizable rectangle, a selected area, one or all screens (listed from the screens connected to this computer), a window or the area around the mouse, with pause and screenshots (F12 record, Shift+F12 pause, F11 screenshot).`n" +
+        "- The status bar shows the recordings folder and its free space; recordings have no time limit and are stopped and saved automatically when the disk is almost full.`n" +
+        "- Device logs (Logs menu, Start device logs or the tray icon) save each device's logcat in the Android Studio Logcat format to a text file, one folder per device, with a copy per checked app (Logs > Choose apps for per-app logs..., which lists PA and PIA first, then the open, running and installed apps, none checked by default) in a subfolder named after the app package; logging continues across restarts and reconnections in the same file.`n" +
+        "- The device log records whether PA, PIA and the checked apps are running (APP STATUS) at the start and after every restart or reconnection, with APP STARTED, APP STOPPED, APP CRASHED and APP NOT RESPONDING lines as they happen; the control panel shows the elapsed time and size of each device log.`n" +
+        "- Click a column header to sort the list; global actions are in the File, Recording, Logs, Window and Help menus.`n" +
+        "- Ctrl+Alt+M opens the tray menu at the mouse pointer from any application (also Window > Show tray menu).`n" +
         "- Checks for updates at startup (Help > Check for updates automatically) or on request; the portable version updates itself.`n`n" +
         'Built on scrcpy by Genymobile (Apache License 2.0).'
     $layout.Controls.Add($details)
@@ -2292,9 +2503,2514 @@ function Show-Guide {
     $form.Activate()
 }
 
+function Initialize-ScreenRecorder {
+    if (-not ('ScrcpyMonitor.RecFrame' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+namespace ScrcpyMonitor {
+    using System;
+    using System.Collections.Generic;
+    using System.Drawing;
+    using System.Drawing.Drawing2D;
+    using System.Drawing.Imaging;
+    using System.Runtime.InteropServices;
+    using System.Windows.Forms;
+
+    public class DisplayInfo {
+        public IntPtr Handle;
+        public Rectangle Bounds;
+        public bool Primary;
+        public int DdaIndex = -1;
+        public string Device = "";
+        public int Number;
+    }
+
+    public static class ScreenNative {
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct MONITORINFOEX { public int Size; public RECT Monitor; public RECT Work; public uint Flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Device; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] internal struct DXGI_OUTPUT_DESC { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName; public RECT Desktop; public int Attached; public int Rotation; public IntPtr Monitor; }
+        [ComImport, Guid("7b7166ec-21c7-44ae-b21a-c9ae321ae369"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        internal interface IDXGIFactory { void SetPrivateData(); void SetPrivateDataInterface(); void GetPrivateData(); void GetParent(); [PreserveSig] int EnumAdapters(uint index, out IDXGIAdapter adapter); }
+        [ComImport, Guid("2411e7e1-12ac-4ccf-bd14-9798e8534dc0"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        internal interface IDXGIAdapter { void SetPrivateData(); void SetPrivateDataInterface(); void GetPrivateData(); void GetParent(); [PreserveSig] int EnumOutputs(uint index, out IDXGIOutput output); }
+        [ComImport, Guid("ae02eedb-c735-4690-8d52-5a8dc20213aa"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        internal interface IDXGIOutput { void SetPrivateData(); void SetPrivateDataInterface(); void GetPrivateData(); void GetParent(); [PreserveSig] int GetDesc(out DXGI_OUTPUT_DESC desc); }
+        delegate bool MonitorEnumProc(IntPtr monitor, IntPtr hdc, IntPtr rect, IntPtr data);
+        [DllImport("dxgi.dll")] static extern int CreateDXGIFactory1([In] ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IDXGIFactory factory);
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFOEX info);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromRect(ref RECT rect, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")] static extern bool GetPhysicalCursorPos(out POINT point);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
+        public static bool IsCloaked(IntPtr hWnd)
+        {
+            int value;
+            try { return DwmGetWindowAttribute(hWnd, 14, out value, 4) == 0 && value != 0; }
+            catch (Exception) { return false; }
+        }
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
+        [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+        [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+
+        public static IntPtr EnterPerMonitor() {
+            try { return SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { return IntPtr.Zero; }
+        }
+
+        public static void Leave(IntPtr previous) {
+            if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+        }
+
+        public static float Scale(IntPtr hWnd) {
+            try { uint dpi = GetDpiForWindow(hWnd); return dpi > 0 ? dpi / 96f : 1f; } catch (EntryPointNotFoundException) { return 1f; }
+        }
+
+        public static void ExcludeFromCapture(IntPtr hWnd) {
+            try { SetWindowDisplayAffinity(hWnd, 0x11); } catch (EntryPointNotFoundException) { }
+        }
+
+        public static DisplayInfo[] Displays() {
+            var list = new List<DisplayInfo>();
+            IntPtr previous = EnterPerMonitor();
+            try {
+                MonitorEnumProc proc = delegate(IntPtr monitor, IntPtr hdc, IntPtr rect, IntPtr data) {
+                    var info = new MONITORINFOEX();
+                    info.Size = Marshal.SizeOf(typeof(MONITORINFOEX));
+                    if (GetMonitorInfo(monitor, ref info)) {
+                        var display = new DisplayInfo();
+                        display.Handle = monitor;
+                        display.Bounds = Rectangle.FromLTRB(info.Monitor.Left, info.Monitor.Top, info.Monitor.Right, info.Monitor.Bottom);
+                        display.Primary = (info.Flags & 1) != 0;
+                        display.Device = info.Device ?? "";
+                        list.Add(display);
+                    }
+                    return true;
+                };
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+                GC.KeepAlive(proc);
+            } finally {
+                Leave(previous);
+            }
+            try { MapDda(list); } catch (Exception) { }
+            list.Sort(delegate(DisplayInfo a, DisplayInfo b) {
+                if (a.Primary != b.Primary) return a.Primary ? -1 : 1;
+                return a.Bounds.X != b.Bounds.X ? a.Bounds.X.CompareTo(b.Bounds.X) : a.Bounds.Y.CompareTo(b.Bounds.Y);
+            });
+            for (int i = 0; i < list.Count; i++) list[i].Number = i + 1;
+            return list.ToArray();
+        }
+
+        static void MapDda(List<DisplayInfo> list) {
+            var riid = new Guid("770aae78-f26f-4dba-a829-253c83d1b387");
+            IDXGIFactory factory;
+            if (CreateDXGIFactory1(ref riid, out factory) != 0 || factory == null) return;
+            try {
+                IDXGIAdapter adapter;
+                if (factory.EnumAdapters(0, out adapter) != 0 || adapter == null) return;
+                try {
+                    for (uint i = 0; i < 16; i++) {
+                        IDXGIOutput output;
+                        if (adapter.EnumOutputs(i, out output) != 0 || output == null) break;
+                        try {
+                            DXGI_OUTPUT_DESC desc;
+                            if (output.GetDesc(out desc) != 0) continue;
+                            foreach (var display in list) {
+                                if (display.Handle == desc.Monitor || (desc.DeviceName != null && desc.DeviceName == display.Device)) display.DdaIndex = (int)i;
+                            }
+                        } finally {
+                            Marshal.ReleaseComObject(output);
+                        }
+                    }
+                } finally {
+                    Marshal.ReleaseComObject(adapter);
+                }
+            } finally {
+                Marshal.ReleaseComObject(factory);
+            }
+        }
+
+        public static Rectangle VirtualBounds(DisplayInfo[] displays) {
+            Rectangle all = Rectangle.Empty;
+            foreach (var display in displays) all = all.IsEmpty ? display.Bounds : Rectangle.Union(all, display.Bounds);
+            return all;
+        }
+
+        public static Rectangle MonitorBounds(Rectangle area) {
+            IntPtr previous = EnterPerMonitor();
+            try {
+                var rect = new RECT();
+                rect.Left = area.Left; rect.Top = area.Top; rect.Right = area.Right; rect.Bottom = area.Bottom;
+                var info = new MONITORINFOEX();
+                info.Size = Marshal.SizeOf(typeof(MONITORINFOEX));
+                if (!GetMonitorInfo(MonitorFromRect(ref rect, 2), ref info)) return area;
+                return Rectangle.FromLTRB(info.Monitor.Left, info.Monitor.Top, info.Monitor.Right, info.Monitor.Bottom);
+            } finally {
+                Leave(previous);
+            }
+        }
+
+        public static Point Cursor() {
+            POINT point;
+            if (GetPhysicalCursorPos(out point)) return new Point(point.X, point.Y);
+            return System.Windows.Forms.Cursor.Position;
+        }
+
+        public static Rectangle ClientBounds(IntPtr hWnd) {
+            IntPtr previous = EnterPerMonitor();
+            try {
+                RECT rect;
+                if (!GetClientRect(hWnd, out rect)) return Rectangle.Empty;
+                var origin = new POINT();
+                if (!ClientToScreen(hWnd, ref origin)) return Rectangle.Empty;
+                return new Rectangle(origin.X, origin.Y, rect.Right - rect.Left, rect.Bottom - rect.Top);
+            } finally {
+                Leave(previous);
+            }
+        }
+
+        public static bool SaveScreenshot(Rectangle area, string path) {
+            if (area.Width <= 0 || area.Height <= 0) return false;
+            IntPtr previous = EnterPerMonitor();
+            try {
+                using (var bitmap = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb)) {
+                    using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen(area.Location, Point.Empty, area.Size);
+                    bitmap.Save(path, ImageFormat.Png);
+                }
+                return true;
+            } finally {
+                Leave(previous);
+            }
+        }
+
+        public static bool SaveWindowShot(IntPtr hWnd, string path) {
+            IntPtr previous = EnterPerMonitor();
+            try {
+                RECT rect;
+                if (!GetClientRect(hWnd, out rect) || rect.Right <= 0 || rect.Bottom <= 0) return false;
+                using (var bitmap = new Bitmap(rect.Right, rect.Bottom, PixelFormat.Format32bppRgb)) {
+                    bool ok;
+                    using (var graphics = Graphics.FromImage(bitmap)) {
+                        IntPtr hdc = graphics.GetHdc();
+                        try { ok = PrintWindow(hWnd, hdc, 3); } finally { graphics.ReleaseHdc(hdc); }
+                    }
+                    if (!ok) return false;
+                    bitmap.Save(path, ImageFormat.Png);
+                }
+                return true;
+            } finally {
+                Leave(previous);
+            }
+        }
+
+        public static Bitmap CaptureArea(Rectangle area) {
+            IntPtr previous = EnterPerMonitor();
+            try {
+                var bitmap = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+                using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen(area.Location, Point.Empty, area.Size);
+                return bitmap;
+            } finally {
+                Leave(previous);
+            }
+        }
+    }
+
+    public class RecFrame : Form {
+        class ToolButton { public string Id; public string Glyph; public string Text; public string Tip; public Rectangle Bounds; public bool Enabled = true; public Color Color = Color.White; }
+
+        public event EventHandler Command;
+        public string LastCommand = "";
+        public int PresetWidth;
+        public int PresetHeight;
+        public readonly bool BarOnly;
+        public bool Recording { get; private set; }
+        public bool Paused { get; private set; }
+        string mode = "";
+        string time = "00:00:00";
+        string size = "";
+        Rectangle capture;
+        Rectangle frameArea;
+        Rectangle toolbar;
+        int toolbarPosition;
+        float scale = 1f;
+        int border = 4;
+        int toolbarHeight = 34;
+        bool layingOut;
+        readonly List<ToolButton> buttons = new List<ToolButton>();
+        string hover;
+        readonly ToolTip tip = new ToolTip();
+        int dragEdges;
+        Point dragStart;
+        Rectangle dragRect;
+        static readonly Color Key = Color.FromArgb(255, 1, 0, 1);
+        static string iconFamily;
+
+        static string IconFamily {
+            get {
+                if (iconFamily == null) {
+                    iconFamily = "";
+                    foreach (var family in FontFamily.Families) {
+                        if (family.Name == "Segoe Fluent Icons") { iconFamily = family.Name; break; }
+                        if (family.Name == "Segoe MDL2 Assets") iconFamily = family.Name;
+                    }
+                }
+                return iconFamily;
+            }
+        }
+
+        RecFrame(bool barOnly) {
+            BarOnly = barOnly;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            BackColor = Key;
+            TransparencyKey = Key;
+            DoubleBuffered = true;
+            Text = "Scrcpy Monitor screen recorder";
+            MinimumSize = new Size(1, 1);
+        }
+
+        public static RecFrame Create(bool barOnly, Rectangle area) {
+            IntPtr previous = ScreenNative.EnterPerMonitor();
+            try {
+                var frame = new RecFrame(barOnly);
+                frame.CreateControl();
+                IntPtr handle = frame.Handle;
+                frame.scale = ScreenNative.Scale(handle);
+                ScreenNative.ExcludeFromCapture(handle);
+                frame.capture = area;
+                frame.Arrange();
+                return frame;
+            } finally {
+                ScreenNative.Leave(previous);
+            }
+        }
+
+        protected override CreateParams CreateParams {
+            get {
+                var parameters = base.CreateParams;
+                parameters.ExStyle |= 0x80;
+                return parameters;
+            }
+        }
+
+        public Rectangle CaptureArea { get { return capture; } }
+
+        public string Mode {
+            get { return mode; }
+            set { mode = value ?? ""; RunPerMonitor(Arrange); }
+        }
+
+        public void SetCaptureArea(Rectangle area) {
+            capture = area;
+            RunPerMonitor(Arrange);
+        }
+
+        public void PlaceBar(Rectangle monitor) {
+            RunPerMonitor(delegate {
+                Arrange();
+                SetBounds(monitor.X + (monitor.Width - Width) / 2, monitor.Y + (int)(8 * scale), Width, Height);
+            });
+        }
+
+        public void SetState(bool recording, bool paused) {
+            Recording = recording;
+            Paused = paused;
+            if (!recording) time = "00:00:00";
+            RunPerMonitor(Arrange);
+            Invalidate();
+        }
+
+        public void SetStatus(string elapsed, string fileSize) {
+            if (elapsed == time && fileSize == size) return;
+            bool resize = (fileSize ?? "").Length != size.Length;
+            time = elapsed ?? "";
+            size = fileSize ?? "";
+            if (resize) RunPerMonitor(Arrange);
+            Invalidate();
+        }
+
+        void RunPerMonitor(MethodInvoker action) {
+            IntPtr previous = ScreenNative.EnterPerMonitor();
+            try { action(); } finally { ScreenNative.Leave(previous); }
+        }
+
+        Font IconFont() { return new Font(IconFamily.Length > 0 ? IconFamily : "Segoe UI Symbol", 13f * scale, GraphicsUnit.Pixel); }
+        Font TextFont() { return new Font("Segoe UI", 13f * scale, GraphicsUnit.Pixel); }
+
+        void AddButton(string id, string glyph, string fallback, string tipText, bool enabled, Color color) {
+            var button = new ToolButton();
+            button.Id = id;
+            button.Glyph = IconFamily.Length > 0 ? glyph : null;
+            button.Text = button.Glyph != null ? null : fallback;
+            button.Tip = tipText;
+            button.Enabled = enabled;
+            button.Color = color;
+            buttons.Add(button);
+        }
+
+        void AddText(string id, string text, Color color) {
+            var button = new ToolButton();
+            button.Id = id;
+            button.Text = text;
+            button.Enabled = false;
+            button.Color = color;
+            buttons.Add(button);
+        }
+
+        void BuildButtons() {
+            buttons.Clear();
+            var red = Color.FromArgb(255, 70, 70);
+            if (Recording) AddButton("rec", "\uE71A", "Stop", "Stop recording (F12)", true, Color.White);
+            else AddButton("rec", "\uE7C8", "REC", "Start recording (F12)", true, red);
+            AddButton("pause", Paused ? "\uE768" : "\uE769", Paused ? "Resume" : "Pause", (Paused ? "Resume" : "Pause") + " recording (Shift+F12)", Recording, Color.White);
+            AddButton("shot", "\uE722", "Shot", "Take a screenshot (F11)", true, Color.White);
+            if (BarOnly) {
+                AddText("mode", mode, Color.Gainsboro);
+            } else {
+                AddButton("size", null, string.Format("{0} \u00D7 {1}  \u25BE", capture.Width, capture.Height), "Choose the recording size", !Recording, Color.White);
+                AddButton("full", "\uE740", "Full", "Fit the frame to this screen", !Recording, Color.White);
+            }
+            AddText("time", time, Recording ? (Paused ? Color.Orange : red) : Color.Gainsboro);
+            AddText("bytes", size, Color.Gainsboro);
+            AddButton("folder", "\uE838", "Folder", "Open the recordings folder", true, Color.White);
+            AddButton("close", "\uE8BB", "X", Recording ? "Stop recording and close" : "Close the screen recorder", true, Color.White);
+        }
+
+        int MeasureButtons() {
+            int x = (int)(6 * scale);
+            int height = toolbarHeight - (int)(8 * scale);
+            using (var iconFont = IconFont())
+            using (var textFont = TextFont()) {
+                foreach (var button in buttons) {
+                    int width;
+                    if (button.Glyph != null) width = toolbarHeight - (int)(6 * scale);
+                    else if (string.IsNullOrEmpty(button.Text)) width = 0;
+                    else width = TextRenderer.MeasureText(button.Text, textFont).Width + (int)(10 * scale);
+                    if (button.Id == "time") width = Math.Max(width, TextRenderer.MeasureText("00:00:00", textFont).Width + (int)(10 * scale));
+                    button.Bounds = new Rectangle(x, (int)(4 * scale), width, height);
+                    x += width + (int)(3 * scale);
+                }
+            }
+            return x + (int)(3 * scale);
+        }
+
+        void Arrange() {
+            if (layingOut) return;
+            layingOut = true;
+            try {
+                border = Math.Max(3, (int)Math.Round(4 * scale));
+                toolbarHeight = (int)Math.Round(34 * scale);
+                BuildButtons();
+                int toolbarWidth = MeasureButtons();
+                if (BarOnly) {
+                    toolbar = new Rectangle(0, 0, toolbarWidth, toolbarHeight);
+                    frameArea = Rectangle.Empty;
+                    SetBounds(Left, Top, toolbarWidth, toolbarHeight);
+                } else {
+                    Rectangle monitor = ScreenNative.MonitorBounds(capture);
+                    int frameWidth = capture.Width + 2 * border;
+                    int frameHeight = capture.Height + 2 * border;
+                    if (capture.Top - border - toolbarHeight >= monitor.Top) toolbarPosition = 0;
+                    else if (capture.Bottom + border + toolbarHeight <= monitor.Bottom) toolbarPosition = 1;
+                    else toolbarPosition = 2;
+                    int width = Math.Max(frameWidth, toolbarWidth + (toolbarPosition == 2 ? 2 * border : 0));
+                    if (toolbarPosition == 0) {
+                        toolbar = new Rectangle(0, 0, toolbarWidth, toolbarHeight);
+                        frameArea = new Rectangle(0, toolbarHeight, frameWidth, frameHeight);
+                        SetBounds(capture.X - border, capture.Y - border - toolbarHeight, width, frameHeight + toolbarHeight);
+                    } else if (toolbarPosition == 1) {
+                        toolbar = new Rectangle(0, frameHeight, toolbarWidth, toolbarHeight);
+                        frameArea = new Rectangle(0, 0, frameWidth, frameHeight);
+                        SetBounds(capture.X - border, capture.Y - border, width, frameHeight + toolbarHeight);
+                    } else {
+                        toolbar = new Rectangle(border, border, toolbarWidth, toolbarHeight);
+                        frameArea = new Rectangle(0, 0, frameWidth, frameHeight);
+                        SetBounds(capture.X - border, capture.Y - border, width, Math.Max(frameHeight, toolbarHeight + 2 * border));
+                    }
+                }
+                foreach (var button in buttons) button.Bounds.Offset(toolbar.Location);
+            } finally {
+                layingOut = false;
+            }
+            Invalidate();
+        }
+
+        protected override void OnLocationChanged(EventArgs e) {
+            base.OnLocationChanged(e);
+            if (layingOut || BarOnly) return;
+            int top = toolbarPosition == 0 ? Top + toolbarHeight + border : Top + border;
+            capture = new Rectangle(Left + border, top, capture.Width, capture.Height);
+        }
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x02E0) {
+                scale = ScreenNative.Scale(Handle);
+                Arrange();
+                return;
+            }
+            if (m.Msg == 0x0084) {
+                base.WndProc(ref m);
+                var point = PointToClient(new Point((short)((long)m.LParam & 0xFFFF), (short)(((long)m.LParam >> 16) & 0xFFFF)));
+                if (toolbar.Contains(point) && ButtonAt(point) == null && (BarOnly || !Recording)) m.Result = new IntPtr(2);
+                return;
+            }
+            if (m.Msg == 0x0232 && !BarOnly) {
+                base.WndProc(ref m);
+                Arrange();
+                Raise("moved");
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        ToolButton ButtonAt(Point point) {
+            foreach (var button in buttons) {
+                if (button.Bounds.Contains(point) && (button.Glyph != null || button.Id == "size" || (button.Text != null && button.Enabled) || button.Tip != null)) {
+                    if (button.Id == "time" || button.Id == "bytes" || button.Id == "mode") continue;
+                    return button;
+                }
+            }
+            return null;
+        }
+
+        int EdgesAt(Point point) {
+            if (BarOnly || Recording || frameArea.IsEmpty || !frameArea.Contains(point)) return 0;
+            if (toolbar.Contains(point)) return 0;
+            int grip = Math.Max(border * 2, (int)(10 * scale));
+            int corner = (int)(18 * scale);
+            var inner = Rectangle.Inflate(frameArea, -border, -border);
+            if (inner.Contains(point)) return 0;
+            int edges = 0;
+            if (point.X < frameArea.Left + grip || (point.Y < frameArea.Top + grip || point.Y >= frameArea.Bottom - grip) && point.X < frameArea.Left + corner) edges |= 1;
+            if (point.X >= frameArea.Right - grip || (point.Y < frameArea.Top + grip || point.Y >= frameArea.Bottom - grip) && point.X >= frameArea.Right - corner) edges |= 4;
+            if (point.Y < frameArea.Top + grip || (point.X < frameArea.Left + grip || point.X >= frameArea.Right - grip) && point.Y < frameArea.Top + corner) edges |= 2;
+            if (point.Y >= frameArea.Bottom - grip || (point.X < frameArea.Left + grip || point.X >= frameArea.Right - grip) && point.Y >= frameArea.Bottom - corner) edges |= 8;
+            return edges;
+        }
+
+        static Cursor EdgeCursor(int edges) {
+            switch (edges) {
+                case 1: case 4: return Cursors.SizeWE;
+                case 2: case 8: return Cursors.SizeNS;
+                case 3: case 12: return Cursors.SizeNWSE;
+                case 6: case 9: return Cursors.SizeNESW;
+                default: return Cursors.Default;
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e) {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            int edges = EdgesAt(e.Location);
+            if (edges == 0) return;
+            dragEdges = edges;
+            dragStart = ScreenNative.Cursor();
+            dragRect = capture;
+            Capture = true;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e) {
+            base.OnMouseMove(e);
+            if (dragEdges != 0) {
+                var now = ScreenNative.Cursor();
+                int dx = now.X - dragStart.X, dy = now.Y - dragStart.Y;
+                int left = dragRect.Left, top = dragRect.Top, right = dragRect.Right, bottom = dragRect.Bottom;
+                int min = (int)(64 * scale);
+                if ((dragEdges & 1) != 0) left = Math.Min(left + dx, right - min);
+                if ((dragEdges & 4) != 0) right = Math.Max(right + dx, left + min);
+                if ((dragEdges & 2) != 0) top = Math.Min(top + dy, bottom - min);
+                if ((dragEdges & 8) != 0) bottom = Math.Max(bottom + dy, top + min);
+                int width = (right - left) & ~1, height = (bottom - top) & ~1;
+                if ((dragEdges & 1) != 0) left = right - width;
+                if ((dragEdges & 2) != 0) top = bottom - height;
+                capture = new Rectangle(left, top, width, height);
+                Arrange();
+                Update();
+                return;
+            }
+            var button = ButtonAt(e.Location);
+            string id = button == null ? null : button.Id;
+            if (id != hover) {
+                hover = id;
+                Invalidate(toolbar);
+                tip.Hide(this);
+                if (button != null && button.Tip != null) tip.Show(button.Tip, this, button.Bounds.Left, toolbar.Bottom + (int)(4 * scale), 2500);
+            }
+            Cursor = EdgeCursor(EdgesAt(e.Location));
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e) {
+            base.OnMouseUp(e);
+            if (dragEdges != 0) {
+                dragEdges = 0;
+                Capture = false;
+                Arrange();
+                Raise("moved");
+                return;
+            }
+            if (e.Button != MouseButtons.Left) return;
+            var button = ButtonAt(e.Location);
+            if (button == null || !button.Enabled) return;
+            if (button.Id == "size") { ShowSizes(button); return; }
+            if (button.Id == "full") {
+                capture = ScreenNative.MonitorBounds(capture);
+                capture.Width &= ~1;
+                capture.Height &= ~1;
+                Arrange();
+                Raise("moved");
+                return;
+            }
+            Raise(button.Id);
+        }
+
+        protected override void OnMouseLeave(EventArgs e) {
+            base.OnMouseLeave(e);
+            if (hover != null) { hover = null; tip.Hide(this); Invalidate(toolbar); }
+        }
+
+        void ShowSizes(ToolButton button) {
+            var menu = new ContextMenuStrip();
+            int[][] sizes = { new[] { 1920, 1080 }, new[] { 1280, 720 }, new[] { 854, 480 }, new[] { 640, 360 }, new[] { 1024, 768 }, new[] { 800, 600 }, new[] { 640, 480 }, new[] { 320, 240 } };
+            foreach (var pair in sizes) {
+                var item = new ToolStripMenuItem(string.Format("{0} \u00D7 {1}", pair[0], pair[1]));
+                item.Tag = pair;
+                item.Checked = capture.Width == pair[0] && capture.Height == pair[1];
+                item.Click += delegate(object sender, EventArgs args) {
+                    var chosen = (int[])((ToolStripItem)sender).Tag;
+                    ApplySize(chosen[0], chosen[1]);
+                };
+                menu.Items.Add(item);
+            }
+            menu.Items.Add(new ToolStripSeparator());
+            var full = new ToolStripMenuItem("Full screen");
+            full.Click += delegate { capture = ScreenNative.MonitorBounds(capture); capture.Width &= ~1; capture.Height &= ~1; Arrange(); Raise("moved"); };
+            menu.Items.Add(full);
+            var select = new ToolStripMenuItem("Select area...");
+            select.Click += delegate { Raise("select"); };
+            menu.Items.Add(select);
+            menu.Closed += delegate { BeginInvoke(new MethodInvoker(menu.Dispose)); };
+            menu.Show(this, new Point(button.Bounds.Left, button.Bounds.Bottom));
+        }
+
+        void ApplySize(int width, int height) {
+            Rectangle monitor = ScreenNative.MonitorBounds(capture);
+            width = Math.Min(width, monitor.Width) & ~1;
+            height = Math.Min(height, monitor.Height) & ~1;
+            int left = Math.Max(monitor.Left, Math.Min(capture.Left, monitor.Right - width));
+            int top = Math.Max(monitor.Top, Math.Min(capture.Top, monitor.Bottom - height));
+            capture = new Rectangle(left, top, width, height);
+            Arrange();
+            Raise("moved");
+        }
+
+        void Raise(string name) {
+            LastCommand = name;
+            var handler = Command;
+            if (handler != null) handler(this, EventArgs.Empty);
+        }
+
+        protected override void OnPaint(PaintEventArgs e) {
+            var graphics = e.Graphics;
+            graphics.Clear(Key);
+            if (!frameArea.IsEmpty) {
+                var color = Recording ? (Paused ? Color.Orange : Color.FromArgb(230, 30, 30)) : Color.FromArgb(30, 144, 255);
+                using (var brush = new SolidBrush(color)) {
+                    var inner = Rectangle.Inflate(frameArea, -border, -border);
+                    graphics.FillRectangle(brush, frameArea.Left, frameArea.Top, frameArea.Width, border);
+                    graphics.FillRectangle(brush, frameArea.Left, inner.Bottom, frameArea.Width, border);
+                    graphics.FillRectangle(brush, frameArea.Left, inner.Top, border, inner.Height);
+                    graphics.FillRectangle(brush, inner.Right, inner.Top, border, inner.Height);
+                    if (!Recording) {
+                        int handle = Math.Max(border * 2, (int)(9 * scale));
+                        int[] xs = { frameArea.Left, frameArea.Left + (frameArea.Width - handle) / 2, frameArea.Right - handle };
+                        int[] ys = { frameArea.Top, frameArea.Top + (frameArea.Height - handle) / 2, frameArea.Bottom - handle };
+                        using (var pen = new Pen(color))
+                        foreach (int x in xs) foreach (int y in ys) {
+                            if (x == xs[1] && y == ys[1]) continue;
+                            graphics.FillRectangle(Brushes.White, x, y, handle - 1, handle - 1);
+                            graphics.DrawRectangle(pen, x, y, handle - 1, handle - 1);
+                        }
+                    }
+                }
+            }
+            using (var back = new SolidBrush(Color.FromArgb(38, 38, 42)))
+                graphics.FillRectangle(back, toolbar);
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var iconFont = IconFont())
+            using (var textFont = TextFont()) {
+                foreach (var button in buttons) {
+                    bool clickable = ButtonAt(new Point(button.Bounds.Left + 1, button.Bounds.Top + 1)) == button;
+                    if (clickable && button.Enabled && hover == button.Id) {
+                        using (var brush = new SolidBrush(Color.FromArgb(70, 70, 78))) graphics.FillRectangle(brush, button.Bounds);
+                    }
+                    var color = button.Enabled || !clickable ? button.Color : Color.FromArgb(110, 110, 110);
+                    var flags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+                    if (button.Glyph != null) TextRenderer.DrawText(graphics, button.Glyph, iconFont, button.Bounds, color, flags);
+                    else if (!string.IsNullOrEmpty(button.Text)) TextRenderer.DrawText(graphics, button.Text, textFont, button.Bounds, color, flags);
+                }
+            }
+        }
+
+        protected override void Dispose(bool disposing) {
+            if (disposing) tip.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    public class AreaPicker : Form {
+        Bitmap shot;
+        Rectangle bounds;
+        Point start;
+        Rectangle selection;
+        bool dragging;
+        public Rectangle Result = Rectangle.Empty;
+        float scale = 1f;
+
+        AreaPicker(Rectangle virtualBounds) {
+            bounds = virtualBounds;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            DoubleBuffered = true;
+            Cursor = Cursors.Cross;
+            KeyPreview = true;
+            Text = "Select the recording area";
+        }
+
+        public static Rectangle Pick(Rectangle virtualBounds) {
+            IntPtr previous = ScreenNative.EnterPerMonitor();
+            AreaPicker picker;
+            try {
+                picker = new AreaPicker(virtualBounds);
+                picker.shot = ScreenNative.CaptureArea(virtualBounds);
+                picker.CreateControl();
+                picker.scale = ScreenNative.Scale(picker.Handle);
+                picker.SetBounds(virtualBounds.X, virtualBounds.Y, virtualBounds.Width, virtualBounds.Height);
+            } finally {
+                ScreenNative.Leave(previous);
+            }
+            using (picker) {
+                picker.ShowDialog();
+                picker.shot.Dispose();
+                return picker.Result;
+            }
+        }
+
+        protected override CreateParams CreateParams {
+            get {
+                var parameters = base.CreateParams;
+                parameters.ExStyle |= 0x80;
+                return parameters;
+            }
+        }
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x02E0) return;
+            base.WndProc(ref m);
+        }
+
+        protected override void OnShown(EventArgs e) {
+            base.OnShown(e);
+            Activate();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e) {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Escape) Close();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e) {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Right) { Close(); return; }
+            if (e.Button != MouseButtons.Left) return;
+            start = e.Location;
+            selection = new Rectangle(start, Size.Empty);
+            dragging = true;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e) {
+            base.OnMouseMove(e);
+            if (!dragging) return;
+            var previous = selection;
+            selection = Rectangle.FromLTRB(Math.Min(start.X, e.X), Math.Min(start.Y, e.Y), Math.Max(start.X, e.X), Math.Max(start.Y, e.Y));
+            var dirty = Rectangle.Union(previous, selection);
+            dirty.Inflate((int)(200 * scale), (int)(60 * scale));
+            Invalidate(dirty);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e) {
+            base.OnMouseUp(e);
+            if (!dragging || e.Button != MouseButtons.Left) return;
+            dragging = false;
+            var area = selection;
+            area.Offset(bounds.Location);
+            if (area.Width < 16 || area.Height < 16) area = ScreenNative.MonitorBounds(new Rectangle(bounds.X + e.X, bounds.Y + e.Y, 1, 1));
+            area.Width &= ~1;
+            area.Height &= ~1;
+            Result = area;
+            Close();
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+
+        protected override void OnPaint(PaintEventArgs e) {
+            var graphics = e.Graphics;
+            graphics.DrawImage(shot, e.ClipRectangle, e.ClipRectangle, GraphicsUnit.Pixel);
+            using (var dim = new SolidBrush(Color.FromArgb(120, 0, 0, 0))) {
+                using (var region = new Region(new Rectangle(Point.Empty, Size))) {
+                    if (selection.Width > 0 && selection.Height > 0) region.Exclude(selection);
+                    graphics.FillRegion(dim, region);
+                }
+            }
+            using (var font = new Font("Segoe UI", 15f * scale, GraphicsUnit.Pixel)) {
+                if (selection.Width > 0 && selection.Height > 0) {
+                    using (var pen = new Pen(Color.FromArgb(230, 30, 30), Math.Max(1f, 2f * scale)))
+                        graphics.DrawRectangle(pen, selection);
+                    string label = string.Format("{0} \u00D7 {1}", selection.Width & ~1, selection.Height & ~1);
+                    var labelSize = TextRenderer.MeasureText(label, font);
+                    var labelRect = new Rectangle(selection.Left, Math.Max(0, selection.Top - labelSize.Height - 4), labelSize.Width + 8, labelSize.Height + 2);
+                    using (var back = new SolidBrush(Color.FromArgb(200, 30, 30, 30))) graphics.FillRectangle(back, labelRect);
+                    TextRenderer.DrawText(graphics, label, font, labelRect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                } else {
+                    var cursor = PointToClient(ScreenNative.Cursor());
+                    var monitor = ScreenNative.MonitorBounds(new Rectangle(cursor.X + bounds.X, cursor.Y + bounds.Y, 1, 1));
+                    monitor.Offset(-bounds.X, -bounds.Y);
+                    string help = "Drag to select the recording area. Click to select the whole screen. Esc cancels.";
+                    var helpSize = TextRenderer.MeasureText(help, font);
+                    var helpRect = new Rectangle(monitor.Left + (monitor.Width - helpSize.Width) / 2 - 12, monitor.Top + (int)(40 * scale), helpSize.Width + 24, helpSize.Height + 12);
+                    using (var back = new SolidBrush(Color.FromArgb(210, 30, 30, 30))) graphics.FillRectangle(back, helpRect);
+                    TextRenderer.DrawText(graphics, help, font, helpRect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+            }
+        }
+    }
+
+    public class RecHotKeys : NativeWindow, IDisposable {
+        delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+
+        [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr Hwnd; public int Message; public IntPtr WParam; public IntPtr LParam; public uint Time; public int X; public int Y; }
+        [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hWnd, uint min, uint max);
+        [DllImport("user32.dll")] static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
+        [DllImport("user32.dll")] static extern bool PostThreadMessage(uint thread, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+        public event EventHandler Pressed;
+        public string LastKey = "";
+        HookProc proc;
+        IntPtr hook;
+        IntPtr target;
+        System.Threading.Thread thread;
+        uint threadId;
+        readonly bool[] down = new bool[2];
+
+        public RecHotKeys() {
+            var parameters = new CreateParams();
+            parameters.Parent = new IntPtr(-3);
+            CreateHandle(parameters);
+            target = Handle;
+        }
+
+        public bool Enabled { get { return thread != null; } }
+
+        public bool Enable() {
+            if (thread != null) return true;
+            bool installed = false;
+            using (var ready = new System.Threading.ManualResetEvent(false)) {
+                var worker = new System.Threading.Thread(delegate() {
+                    MSG msg;
+                    threadId = GetCurrentThreadId();
+                    PeekMessage(out msg, IntPtr.Zero, 0, 0, 0);
+                    proc = Hook;
+                    hook = SetWindowsHookEx(13, proc, GetModuleHandle(null), 0);
+                    installed = hook != IntPtr.Zero;
+                    ready.Set();
+                    if (!installed) return;
+                    while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+                    UnhookWindowsHookEx(hook);
+                    hook = IntPtr.Zero;
+                });
+                worker.IsBackground = true;
+                worker.Name = "Screen recorder hotkeys";
+                worker.Start();
+                if (!ready.WaitOne(5000) || !installed) return false;
+                thread = worker;
+            }
+            return true;
+        }
+
+        public void Disable() {
+            if (thread == null) return;
+            PostThreadMessage(threadId, 0x12, IntPtr.Zero, IntPtr.Zero);
+            thread.Join(2000);
+            thread = null;
+            down[0] = down[1] = false;
+        }
+        static bool Held(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+
+        IntPtr Hook(int code, IntPtr wParam, IntPtr lParam) {
+            if (code >= 0) {
+                int message = wParam.ToInt32();
+                int key = Marshal.ReadInt32(lParam);
+                if (key == 0x7A || key == 0x7B) {
+                    int slot = key == 0x7B ? 1 : 0;
+                    bool isDown = message == 0x100 || message == 0x104;
+                    bool isUp = message == 0x101 || message == 0x105;
+                    if (isDown && !Held(0x11) && !Held(0x12) && !Held(0x5B) && !Held(0x5C)) {
+                        bool shift = Held(0x10);
+                        int id = key == 0x7B ? (shift ? 2 : 1) : (shift ? 0 : 3);
+                        if (id != 0) {
+                            if (!down[slot]) PostMessage(target, 0x8001, new IntPtr(id), IntPtr.Zero);
+                            down[slot] = true;
+                            return new IntPtr(1);
+                        }
+                    } else if (isUp && down[slot]) {
+                        down[slot] = false;
+                        return new IntPtr(1);
+                    }
+                }
+            }
+            return CallNextHookEx(hook, code, wParam, lParam);
+        }
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x8001) {
+                int id = m.WParam.ToInt32();
+                LastKey = id == 1 ? "rec" : id == 2 ? "pause" : "shot";
+                var handler = Pressed;
+                if (handler != null) handler(this, EventArgs.Empty);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        public void Dispose() {
+            Disable();
+            DestroyHandle();
+        }
+    }
+}
+'@
+    }
+    if (-not $script:ScreenKeys) {
+        $script:ScreenKeys = New-Object ScrcpyMonitor.RecHotKeys
+        $script:ScreenKeys.add_Pressed({ Invoke-Safely { Invoke-ScreenCommand $script:ScreenKeys.LastKey } })
+    }
+    if (-not $script:ScreenTimer) {
+        $script:ScreenTimer = New-Object System.Windows.Forms.Timer
+        $script:ScreenTimer.Interval = 100
+        $script:ScreenTimer.add_Tick({ Invoke-Safely { Update-ScreenRecorder } })
+    }
+}
+
+function Test-DdaGrab {
+    if ($null -eq $script:ScreenDda) {
+        $list = Invoke-Hidden $script:Ffmpeg @('-hide_banner', '-filters') 15000
+        if (-not $list) { return $false }
+        $script:ScreenDda = [bool]($list -match '\sddagrab\s')
+    }
+    $script:ScreenDda
+}
+
+function Get-ScreenFolder {
+    $folder = Join-Path $RecordDir 'Screen Recordings'
+    [void](New-Item -ItemType Directory -Force -Path $folder)
+    $folder
+}
+
+function Open-ScreenFolder {
+    Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$(Get-ScreenFolder)`""
+}
+
+function Get-EvenSize([int]$Value) {
+    [Math]::Max(2, $Value - ($Value % 2))
+}
+
+function Get-FileLength([string]$Path) {
+    try { (New-Object System.IO.FileInfo $Path).Length } catch { 0L }
+}
+
+function Format-ScreenBytes([long]$Bytes) {
+    if ($Bytes -ge 1GB) { return '{0:0.00} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:0.0} MB' -f ($Bytes / 1MB) }
+    '{0:0} KB' -f ($Bytes / 1KB)
+}
+
+function ConvertTo-ScreenArea([System.Drawing.Rectangle]$Area) {
+    if ($Area.Width -lt 16 -or $Area.Height -lt 16) { return [System.Drawing.Rectangle]::Empty }
+    [System.Drawing.Rectangle]::new($Area.X, $Area.Y, (Get-EvenSize $Area.Width), (Get-EvenSize $Area.Height))
+}
+
+function Save-ScreenArea([System.Drawing.Rectangle]$Area) {
+    Set-Setting 'ScreenArea' ('{0},{1},{2},{3}' -f $Area.X, $Area.Y, $Area.Width, $Area.Height)
+}
+
+function Get-SavedScreenArea($Displays) {
+    $virtual = [ScrcpyMonitor.ScreenNative]::VirtualBounds($Displays)
+    if ([string](Get-Setting 'ScreenArea') -match '^(-?\d+),(-?\d+),(\d+),(\d+)$') {
+        $area = [System.Drawing.Rectangle]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4])
+        if ($area.Width -ge 16 -and $area.Height -ge 16 -and $virtual.Contains($area)) { return $area }
+    }
+    $primary = $Displays[0].Bounds
+    $width = Get-EvenSize ([Math]::Min(1280, $primary.Width - 80))
+    $height = Get-EvenSize ([Math]::Min(720, $primary.Height - 160))
+    [System.Drawing.Rectangle]::new($primary.X + [int][Math]::Floor(($primary.Width - $width) / 2), $primary.Y + [int][Math]::Floor(($primary.Height - $height) / 2), $width, $height)
+}
+
+function Get-ScreenFollowSize {
+    if ([string](Get-Setting 'ScreenFollowSize') -match '^(\d+)x(\d+)$' -and [int]$Matches[1] -ge 64 -and [int]$Matches[2] -ge 64) {
+        return [System.Drawing.Size]::new([int]$Matches[1], [int]$Matches[2])
+    }
+    [System.Drawing.Size]::new(1280, 720)
+}
+
+function Get-ScreenDisplayAt($Displays, [System.Drawing.Point]$Point) {
+    foreach ($display in $Displays) { if ($display.Bounds.Contains($Point)) { return $display } }
+    $Displays[0]
+}
+
+function Get-ScreenWindow($State) {
+    if ($State.WindowSerial -and $script:Sessions.ContainsKey($State.WindowSerial) -and (Get-Date) -ge $State.NextWindowLookup -and
+        -not [ScrcpyMonitor.ScreenNative]::IsWindow($State.Window)) {
+        $State.NextWindowLookup = (Get-Date).AddSeconds(1)
+        $session = $script:Sessions[$State.WindowSerial]
+        if ($session.ScrcpyPid) {
+            try {
+                $process = [System.Diagnostics.Process]::GetProcessById($session.ScrcpyPid)
+                try { $State.Window = $process.MainWindowHandle } finally { $process.Dispose() }
+            } catch { }
+        }
+    }
+    $State.Window
+}
+
+function Get-ScreenArea($State, $Displays) {
+    switch ($State.Mode) {
+        'rect' { return $State.Frame.CaptureArea }
+        'all' { return [ScrcpyMonitor.ScreenNative]::VirtualBounds($Displays) }
+        'monitor' {
+            $display = @($Displays | Where-Object { $_.Device -eq $State.Device }) | Select-Object -First 1
+            if (-not $display) { $display = $Displays[0] }
+            return $display.Bounds
+        }
+        'window' {
+            $handle = Get-ScreenWindow $State
+            if ($handle -eq [IntPtr]::Zero -or -not [ScrcpyMonitor.ScreenNative]::IsWindow($handle) -or [ScrcpyMonitor.ScreenNative]::IsIconic($handle)) {
+                return [System.Drawing.Rectangle]::Empty
+            }
+            return [ScrcpyMonitor.ScreenNative]::ClientBounds($handle)
+        }
+        default {
+            $cursor = [ScrcpyMonitor.ScreenNative]::Cursor()
+            $bounds = (Get-ScreenDisplayAt $Displays $cursor).Bounds
+            $width = Get-EvenSize ([Math]::Min($State.FollowSize.Width, $bounds.Width))
+            $height = Get-EvenSize ([Math]::Min($State.FollowSize.Height, $bounds.Height))
+            $x = [Math]::Max($bounds.Left, [Math]::Min($cursor.X - [int][Math]::Floor($width / 2), $bounds.Right - $width))
+            $y = [Math]::Max($bounds.Top, [Math]::Min($cursor.Y - [int][Math]::Floor($height / 2), $bounds.Bottom - $height))
+            return [System.Drawing.Rectangle]::new($x, $y, $width, $height)
+        }
+    }
+}
+
+function Start-ScreenPart($State) {
+    $displays = @([ScrcpyMonitor.ScreenNative]::Displays())
+    if (-not $displays.Count) { throw 'No screen was found.' }
+    $State.Displays = $displays
+    $area = Get-ScreenArea $State $displays
+    if ($area.Width -lt 2 -or $area.Height -lt 2) { throw 'The window to record is closed or minimized.' }
+    $follow = $State.Mode -eq 'window' -or $State.Mode -eq 'mouse'
+    $sources = @(if ($follow) { $displays } else { $displays | Where-Object { $_.Bounds.IntersectsWith($area) } })
+    if (-not $sources.Count) { throw 'The recording area is outside the screens.' }
+    $box = [ScrcpyMonitor.ScreenNative]::VirtualBounds($sources)
+    if (-not $follow) { $area = [System.Drawing.Rectangle]::Intersect($area, $box) }
+    $width = Get-EvenSize ([Math]::Min($area.Width, $box.Width))
+    $height = Get-EvenSize ([Math]::Min($area.Height, $box.Height))
+    $useDda = -not $State.NoDda -and (Test-DdaGrab) -and -not @($sources | Where-Object { $_.DdaIndex -lt 0 }).Count
+    if (-not $useDda -and -not $follow) { $box = [System.Drawing.Rectangle]::new($area.X, $area.Y, $width, $height) }
+    $x = [Math]::Max(0, [Math]::Min($area.X - $box.X, $box.Width - $width))
+    $y = [Math]::Max(0, [Math]::Min($area.Y - $box.Y, $box.Height - $height))
+    $crop = $follow -or $width -ne $box.Width -or $height -ne $box.Height
+    $inputArgs = @()
+    if ($useDda) {
+        $chains = @($sources | ForEach-Object { "ddagrab=output_idx=$($_.DdaIndex):framerate=30:draw_mouse=1" })
+        if ($sources.Count -eq 1 -and -not $follow) {
+            $graph = $chains[0]
+            if ($crop) { $graph += ":offset_x=$($box.X + $x - $sources[0].Bounds.X):offset_y=$($box.Y + $y - $sources[0].Bounds.Y):video_size=${width}x$height" }
+            $graph += ',hwdownload,format=bgra'
+            $crop = $false
+        } elseif ($sources.Count -eq 1) {
+            $graph = $chains[0] + ',hwdownload,format=bgra'
+        } else {
+            $labels = ''
+            $parts = for ($i = 0; $i -lt $sources.Count; $i++) {
+                $labels += "[s$i]"
+                "$($chains[$i]),hwdownload,format=bgra[s$i]"
+            }
+            $layout = @($sources | ForEach-Object { '{0}_{1}' -f ($_.Bounds.X - $box.X), ($_.Bounds.Y - $box.Y) }) -join '|'
+            $graph = ($parts -join ';') + ";${labels}xstack=inputs=$($sources.Count):layout=${layout}:fill=black"
+        }
+    } else {
+        $inputArgs = @('-f', 'gdigrab', '-framerate', '30', '-draw_mouse', '1', '-offset_x', "$($box.X)", '-offset_y', "$($box.Y)", '-video_size', "$($box.Width)x$($box.Height)", '-i', 'desktop')
+        $graph = '[0:v]null'
+    }
+    if ($crop) { $graph += ",crop=w=${width}:h=${height}:x=${x}:y=${y}:exact=1" }
+    $graph += ',format=yuv420p[v]'
+    $State.Follow = if ($follow) { [pscustomobject]@{ Box = $box; Width = $width; Height = $height; X = $x; Y = $y } } else { $null }
+    $State.PendingSize = ''
+    $State.ResizedAt = $null
+
+    $index = $State.Parts.Count + 1
+    $part = '{0}_part{1:D2}.mkv' -f $State.Base, $index
+    $log = Join-Path $script:LogDir ('screen-record-part{0:D2}.log' -f $index)
+    $arguments = @('-hide_banner', '-loglevel', 'warning', '-nostats', '-stats_period', '0.05') + $inputArgs + @('-filter_complex', $graph, '-map', '[v]') +
+                 (Get-CombineEncoderArgs) + @('-pix_fmt', 'yuv420p', '-g', '60', '-y', $part)
+    $psi = New-HiddenStartInfo $env:ComSpec ('/d /s /c ""{0}" {1} 2> "{2}""' -f $script:Ffmpeg, (ConvertTo-ArgumentString $arguments), $log)
+    $psi.RedirectStandardInput = $true
+    Write-Log "Starting screen recorder: $(ConvertTo-ArgumentString $arguments)"
+    $State.Process = [System.Diagnostics.Process]::Start($psi)
+    $State.Part = $part
+    $State.PartLog = $log
+    $State.PartStartedAt = Get-Date
+    $State.UsedDda = $useDda
+    [void]$State.Parts.Add($part)
+}
+
+function Stop-ScreenPart($State) {
+    $process = $State.Process
+    if (-not $process) { return }
+    $State.Process = $null
+    if ($State.PartStartedAt) {
+        $State.Elapsed += (Get-Date) - $State.PartStartedAt
+        $State.PartStartedAt = $null
+    }
+    try {
+        if (-not $process.HasExited) {
+            $process.StandardInput.Write('q')
+            $process.StandardInput.Flush()
+        }
+    } catch { }
+    if (-not $process.WaitForExit(8000)) {
+        Write-Log 'The screen recorder did not stop gracefully; killing it.'
+        Stop-ProcessTree $process.Id
+        [void]$process.WaitForExit(3000)
+    }
+    try { $process.StandardInput.Dispose() } catch { }
+    $process.Dispose()
+    $State.DoneBytes += Get-FileLength $State.Part
+}
+
+function Restore-ScreenPart($State) {
+    $exitCode = $State.Process.ExitCode
+    $quick = $State.PartStartedAt -and ((Get-Date) - $State.PartStartedAt).TotalSeconds -lt 5
+    $tail = @(Get-Content -LiteralPath $State.PartLog -Tail 3 -ErrorAction SilentlyContinue) -join ' | '
+    Write-Log "The screen recorder stopped unexpectedly (exit code $exitCode): $tail"
+    Stop-ScreenPart $State
+    if ($quick -and $State.UsedDda) {
+        $State.NoDda = $true
+        Write-Log 'Falling back to GDI screen capture.'
+    }
+    $now = Get-Date
+    [void]$State.Failures.Add($now)
+    foreach ($time in @($State.Failures)) { if (($now - $time).TotalSeconds -gt 30) { $State.Failures.Remove($time) } }
+    if ($State.Failures.Count -ge 3) {
+        Show-Notification "Screen recording stopped because ffmpeg failed repeatedly. $tail" 'Warning'
+        Stop-ScreenRecording
+        return
+    }
+    try { Start-ScreenPart $State } catch {
+        Show-Notification "Screen recording stopped: $($_.Exception.Message)" 'Warning'
+        Stop-ScreenRecording
+    }
+}
+
+function Update-ScreenFollow($State, [datetime]$Now) {
+    $follow = $State.Follow
+    $area = Get-ScreenArea $State $State.Displays
+    if ($area.Width -lt 2 -or $area.Height -lt 2) { return }
+    if ($State.Mode -eq 'window') {
+        $width = Get-EvenSize ([Math]::Min($area.Width, $follow.Box.Width))
+        $height = Get-EvenSize ([Math]::Min($area.Height, $follow.Box.Height))
+        if ($width -ne $follow.Width -or $height -ne $follow.Height) {
+            $size = "${width}x$height"
+            if ($State.PendingSize -ne $size) {
+                $State.PendingSize = $size
+                $State.ResizedAt = $Now
+            } elseif (($Now - $State.ResizedAt).TotalMilliseconds -ge 800) {
+                Write-Log "The recorded window was resized to $size; starting a new part."
+                Stop-ScreenPart $State
+                try { Start-ScreenPart $State } catch {
+                    Show-Notification "Screen recording stopped: $($_.Exception.Message)" 'Warning'
+                    Stop-ScreenRecording
+                }
+                return
+            }
+        } else {
+            $State.PendingSize = ''
+        }
+    }
+    $x = [Math]::Max(0, [Math]::Min($area.X - $follow.Box.X, $follow.Box.Width - $follow.Width))
+    $y = [Math]::Max(0, [Math]::Min($area.Y - $follow.Box.Y, $follow.Box.Height - $follow.Height))
+    if ($x -eq $follow.X -and $y -eq $follow.Y) { return }
+    try {
+        $writer = $State.Process.StandardInput
+        if ($x -ne $follow.X) { $writer.Write("ccrop -1 x $x`n") }
+        if ($y -ne $follow.Y) { $writer.Write("ccrop -1 y $y`n") }
+        $writer.Flush()
+        $follow.X = $x
+        $follow.Y = $y
+    } catch { }
+}
+
+function Update-ScreenRecorder {
+    $state = $script:ScreenRec
+    if (-not $state) {
+        $script:ScreenTimer.Stop()
+        return
+    }
+    $now = Get-Date
+    if ($state.Recording -and -not $state.Paused -and $state.Process) {
+        if ($state.Process.HasExited) { Restore-ScreenPart $state }
+        elseif ($state.Follow -and $now -ge $state.NextFollow) {
+            $state.NextFollow = $now.AddMilliseconds(200)
+            Update-ScreenFollow $state $now
+        }
+    }
+    if ($state.Recording -and $state.Frame -and $now -ge $state.NextStatus) {
+        $state.NextStatus = $now.AddMilliseconds(500)
+        $elapsed = $state.Elapsed
+        if ($state.PartStartedAt) { $elapsed += $now - $state.PartStartedAt }
+        $bytes = $state.DoneBytes
+        if ($state.Process) { $bytes += Get-FileLength $state.Part }
+        $state.Frame.SetStatus(('{0:00}:{1:mm}:{1:ss}' -f [int][Math]::Floor($elapsed.TotalHours), $elapsed), (Format-ScreenBytes $bytes))
+    }
+}
+
+function Start-ScreenRecording {
+    $state = $script:ScreenRec
+    if (-not $state -or $state.Recording) { return }
+    if (-not (Confirm-RecordSpace) -or $script:ScreenRec -ne $state -or $state.Recording) { return }
+    $folder = Get-ScreenFolder
+    $stem = 'Screen_Capture_{0:yyyyMMdd_HHmmss}' -f (Get-Date)
+    $base = Join-Path $folder $stem
+    $suffix = 2
+    while ((Test-Path -LiteralPath "$base.mp4") -or (Test-Path -LiteralPath "${base}_part01.mkv")) {
+        $base = Join-Path $folder "${stem}_$suffix"
+        $suffix++
+    }
+    $state.Base = $base
+    $state.Parts.Clear()
+    $state.Failures.Clear()
+    $state.Elapsed = [TimeSpan]::Zero
+    $state.DoneBytes = 0L
+    $state.NoDda = $false
+    Get-ChildItem -LiteralPath $script:LogDir -Filter 'screen-record-part*.log' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    try { Start-ScreenPart $state } catch {
+        Show-Notification "Could not start the screen recording: $($_.Exception.Message)" 'Warning'
+        return
+    }
+    $state.Recording = $true
+    $state.Paused = $false
+    $state.NextStatus = Get-Date
+    if ($state.Frame) { $state.Frame.SetState($true, $false) }
+    Write-Log "Screen recording started: $($state.Label)"
+    Update-TrayText
+}
+
+function Stop-ScreenRecording {
+    $state = $script:ScreenRec
+    if (-not $state -or -not $state.Recording) { return }
+    Stop-ScreenPart $state
+    $state.Recording = $false
+    $state.Paused = $false
+    if ($state.Frame) {
+        $state.Frame.SetState($false, $false)
+        $state.Frame.SetStatus('00:00:00', '')
+    }
+    Complete-ScreenRecording $state
+    Update-TrayText
+}
+
+function Switch-ScreenPause {
+    $state = $script:ScreenRec
+    if (-not $state -or -not $state.Recording) { return }
+    if ($state.Paused) {
+        try { Start-ScreenPart $state } catch {
+            Show-Notification "Screen recording stopped: $($_.Exception.Message)" 'Warning'
+            Stop-ScreenRecording
+            return
+        }
+        $state.Paused = $false
+        Write-Log 'Screen recording resumed.'
+    } else {
+        Stop-ScreenPart $state
+        $state.Paused = $true
+        Write-Log 'Screen recording paused.'
+    }
+    if ($state.Frame) { $state.Frame.SetState($true, $state.Paused) }
+}
+
+function Complete-ScreenRecording($State) {
+    $parts = @($State.Parts | Where-Object { Test-VideoFile $_ })
+    foreach ($part in @($State.Parts | Where-Object { $parts -notcontains $_ })) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+    $State.Parts.Clear()
+    if (-not $parts.Count) {
+        Show-Notification 'Screen recording stopped; nothing was recorded.'
+        return
+    }
+    $output = "$($State.Base).mp4"
+    $listFile = Join-Path $script:StateDir ("concat-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $sizes = @(if ($script:Ffprobe -and $parts.Count -gt 1) { $parts | ForEach-Object { Get-VideoSize $_ } })
+    $widths = @(for ($i = 0; $i -lt $sizes.Count; $i += 2) { $sizes[$i] })
+    $heights = @(for ($i = 1; $i -lt $sizes.Count; $i += 2) { $sizes[$i] })
+    $steps = New-Object System.Collections.ArrayList
+    if (@($widths | Select-Object -Unique).Count -le 1 -and @($heights | Select-Object -Unique).Count -le 1) {
+        $lines = foreach ($part in $parts) { "file '" + ($part -replace "'", "'\''") + "'" }
+        [System.IO.File]::WriteAllLines($listFile, [string[]]$lines)
+        [void]$steps.Add(@('-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', $listFile, '-c', 'copy', '-movflags', '+faststart', $output))
+    } else {
+        $width = ($widths | Measure-Object -Maximum).Maximum
+        $height = ($heights | Measure-Object -Maximum).Maximum
+        $inputs = @()
+        $filters = @()
+        $labels = ''
+        for ($i = 0; $i -lt $parts.Count; $i++) {
+            $inputs += @('-i', $parts[$i])
+            $filters += "[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v$i]"
+            $labels += "[v$i]"
+        }
+        $graph = ($filters -join ';') + ";${labels}concat=n=$($parts.Count):v=1:a=0[v]"
+        [void]$steps.Add(@('-hide_banner', '-nostdin', '-loglevel', 'error', '-y') + $inputs + @('-filter_complex', $graph, '-map', '[v]') +
+                         (Get-CombineEncoderArgs) + @('-pix_fmt', 'yuv420p', '-movflags', '+faststart', $output))
+    }
+    $merge = [pscustomobject]@{ Process = $null; Steps = $steps; Parts = $parts; Temps = @(); Output = $output; ListFile = $listFile; Member = $null; Segments = @(); Title = '' }
+    try {
+        $merge.Process = Start-MergeStep $merge
+    } catch {
+        Write-Log "Failed to start ffmpeg: $($_.Exception.Message)"
+    }
+    [void]$script:Merges.Add($merge)
+    Write-Log "Saving the screen recording ($($parts.Count) part(s)) to $output"
+}
+
+function Save-ScreenShot {
+    $state = $script:ScreenRec
+    if (-not $state) { return }
+    $area = Get-ScreenArea $state @([ScrcpyMonitor.ScreenNative]::Displays())
+    if ($area.Width -lt 2 -or $area.Height -lt 2) {
+        Show-Notification 'Nothing to capture: the window is closed or minimized.' 'Warning'
+        return
+    }
+    $path = Join-Path (Get-ScreenFolder) ('Screenshot_{0:yyyyMMdd_HHmmss_fff}.png' -f (Get-Date))
+    if ([ScrcpyMonitor.ScreenNative]::SaveScreenshot($area, $path)) { Show-Notification "Screenshot saved: $path" }
+    else { Show-Notification 'Could not take the screenshot.' 'Warning' }
+}
+
+function Select-ScreenArea($State) {
+    $State.Frame.Hide()
+    try {
+        $area = ConvertTo-ScreenArea ([ScrcpyMonitor.AreaPicker]::Pick([ScrcpyMonitor.ScreenNative]::VirtualBounds([ScrcpyMonitor.ScreenNative]::Displays())))
+    } finally {
+        if ($script:ScreenRec -eq $State -and $State.Frame) { $State.Frame.Show() }
+    }
+    if ($area.IsEmpty -or $script:ScreenRec -ne $State -or -not $State.Frame) { return }
+    $State.Frame.SetCaptureArea($area)
+    Save-ScreenArea $area
+}
+
+function Invoke-ScreenCommand([string]$Name) {
+    $state = $script:ScreenRec
+    if (-not $state) { return }
+    switch ($Name) {
+        'rec' { if ($state.Recording) { Stop-ScreenRecording } else { Start-ScreenRecording } }
+        'pause' { Switch-ScreenPause }
+        'shot' { Save-ScreenShot }
+        'folder' { Open-ScreenFolder }
+        'close' { Close-ScreenRecorder }
+        'moved' { if ($state.Frame) { Save-ScreenArea $state.Frame.CaptureArea } }
+        'select' { Select-ScreenArea $state }
+    }
+}
+
+function Close-ScreenRecorder {
+    $state = $script:ScreenRec
+    if (-not $state) { return }
+    Stop-ScreenRecording
+    $script:ScreenRec = $null
+    if ($script:ScreenTimer) { $script:ScreenTimer.Stop() }
+    if ($script:ScreenKeys) { $script:ScreenKeys.Disable() }
+    if ($state.Frame) {
+        $frame = $state.Frame
+        $state.Frame = $null
+        $frame.Close()
+    }
+    Update-TrayText
+}
+
+function Open-ScreenRecorder([string]$Mode, [string]$Target = '', [string]$Label = '') {
+    if (-not $script:Ffmpeg) {
+        Show-Notification 'Screen recording needs ffmpeg, which was not found.' 'Warning'
+        return
+    }
+    Initialize-ScreenRecorder
+    if ($script:ScreenRec -and $script:ScreenRec.Recording) {
+        Show-Notification 'A screen recording is in progress. Stop it (F12) before choosing another area.'
+        return
+    }
+    $displays = @([ScrcpyMonitor.ScreenNative]::Displays())
+    if (-not $displays.Count) { return }
+    Close-ScreenRecorder
+    $area = [System.Drawing.Rectangle]::Empty
+    if ($Mode -eq 'select') {
+        $area = ConvertTo-ScreenArea ([ScrcpyMonitor.AreaPicker]::Pick([ScrcpyMonitor.ScreenNative]::VirtualBounds($displays)))
+        if ($area.IsEmpty) { return }
+        Save-ScreenArea $area
+        $Mode = 'rect'
+    } elseif ($Mode -eq 'rect') {
+        $area = Get-SavedScreenArea $displays
+    }
+    $state = [pscustomobject]@{
+        Mode = $Mode; Device = ''; Window = [IntPtr]::Zero; WindowSerial = ''; Label = 'Rectangle on screen'; Frame = $null
+        Recording = $false; Paused = $false; Process = $null; Part = $null; PartLog = $null; PartStartedAt = $null
+        Parts = (New-Object System.Collections.ArrayList); Base = $null; Elapsed = [TimeSpan]::Zero; DoneBytes = 0L
+        Failures = (New-Object System.Collections.ArrayList); NoDda = $false; UsedDda = $false; Displays = $displays
+        Follow = $null; FollowSize = (Get-ScreenFollowSize); PendingSize = ''; ResizedAt = $null; NextStatus = Get-Date; NextFollow = Get-Date; NextWindowLookup = Get-Date
+    }
+    $barArea = $displays[0].Bounds
+    switch ($Mode) {
+        'all' {
+            $virtual = [ScrcpyMonitor.ScreenNative]::VirtualBounds($displays)
+            $state.Label = 'Full screen ({0} x {1})' -f $virtual.Width, $virtual.Height
+        }
+        'monitor' {
+            $display = @($displays | Where-Object { "$($_.Number)" -eq $Target }) | Select-Object -First 1
+            if (-not $display) { $display = $displays[0] }
+            $state.Device = $display.Device
+            $state.Label = if ($displays.Count -gt 1) { 'Screen {0} ({1} x {2})' -f $display.Number, $display.Bounds.Width, $display.Bounds.Height } else { 'Full screen ({0} x {1})' -f $display.Bounds.Width, $display.Bounds.Height }
+            $barArea = $display.Bounds
+        }
+        'window' {
+            if ($Target -like 'serial:*') {
+                $state.WindowSerial = $Target.Substring(7)
+            } elseif ($Target -match '^hwnd:(\d+)$') {
+                $state.Window = [IntPtr][long]$Matches[1]
+            }
+            $handle = Get-ScreenWindow $state
+            if ($handle -eq [IntPtr]::Zero -or -not [ScrcpyMonitor.ScreenNative]::IsWindow($handle)) {
+                Show-Notification 'The window to record is no longer open.' 'Warning'
+                return
+            }
+            $state.Label = "Window: $Label"
+            $client = [ScrcpyMonitor.ScreenNative]::ClientBounds($handle)
+            if (-not $client.IsEmpty) { $barArea = [ScrcpyMonitor.ScreenNative]::MonitorBounds($client) }
+        }
+        'mouse' {
+            if ($Target -match '^(\d+)x(\d+)$') {
+                $state.FollowSize = [System.Drawing.Size]::new([int]$Matches[1], [int]$Matches[2])
+                Set-Setting 'ScreenFollowSize' $Target
+            }
+            $state.Label = 'Around mouse ({0} x {1})' -f $state.FollowSize.Width, $state.FollowSize.Height
+            $barArea = (Get-ScreenDisplayAt $displays ([ScrcpyMonitor.ScreenNative]::Cursor())).Bounds
+        }
+    }
+    if ($Mode -eq 'rect') {
+        $frame = [ScrcpyMonitor.RecFrame]::Create($false, $area)
+    } else {
+        $frame = [ScrcpyMonitor.RecFrame]::Create($true, [System.Drawing.Rectangle]::Empty)
+        $frame.Mode = $state.Label
+        $frame.PlaceBar($barArea)
+    }
+    $frame.add_Command({ param($sender, $e) Invoke-Safely { Invoke-ScreenCommand $sender.LastCommand } })
+    $frame.add_FormClosed({
+        param($sender, $e)
+        Invoke-Safely {
+            $current = $script:ScreenRec
+            if ($current -and $current.Frame -eq $sender) {
+                $current.Frame = $null
+                Close-ScreenRecorder
+            }
+        }
+    })
+    $state.Frame = $frame
+    $script:ScreenRec = $state
+    $frame.Show()
+    if (-not $script:ScreenKeys.Enable()) { Write-Log 'Could not enable the screen recorder hotkeys.' }
+    $script:ScreenTimer.Start()
+    Write-Log "Screen recorder opened: $($state.Label)"
+}
+
+function Request-ScreenRecorder([string]$Mode, [string]$Target = '', [string]$Label = '') {
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 200
+    $timer.Tag = @($Mode, $Target, $Label)
+    $timer.add_Tick({
+        param($sender, $e)
+        $sender.Stop()
+        $request = $sender.Tag
+        $sender.Dispose()
+        Invoke-Safely { Open-ScreenRecorder $request[0] $request[1] $request[2] }
+    })
+    $timer.Start()
+}
+
+function Get-ScreenWindowChoices {
+    $choices = New-Object System.Collections.ArrayList
+    $owned = @{}
+    foreach ($session in @($script:Sessions.Values | Where-Object { $_.WindowShown -and $_.ScrcpyPid } | Sort-Object Title)) {
+        $owned[[int]$session.ScrcpyPid] = $true
+        [void]$choices.Add([pscustomobject]@{ Text = $session.Title; Target = "serial:$($session.Serial)"; Device = $true })
+    }
+    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+        try {
+            if ($process.Id -eq $PID -or $owned.ContainsKey($process.Id)) { continue }
+            $handle = $process.MainWindowHandle
+            $title = $process.MainWindowTitle
+            if ($handle -eq [IntPtr]::Zero -or -not $title -or -not [ScrcpyMonitor.ScreenNative]::IsWindowVisible($handle) -or [ScrcpyMonitor.ScreenNative]::IsCloaked($handle)) { continue }
+            if ($title.Length -gt 60) { $title = $title.Substring(0, 57) + '...' }
+            [void]$choices.Add([pscustomobject]@{ Text = $title; Target = "hwnd:$($handle.ToInt64())"; Device = $false })
+        } catch { } finally { $process.Dispose() }
+    }
+    $devices = @($choices | Where-Object { $_.Device })
+    $others = @($choices | Where-Object { -not $_.Device } | Sort-Object Text)
+    , @($devices + $others)
+}
+
+function Add-ScreenMenuItem([System.Windows.Forms.ToolStripItemCollection]$Items, [string]$Text, [object[]]$Action, [bool]$Checked = $false) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem $Text
+    $item.Tag = $Action
+    $item.Checked = $Checked
+    $item.add_Click({
+        param($sender, $e)
+        Invoke-Safely {
+            $action = $sender.Tag
+            if ($action[0] -eq 'cmd') { Invoke-ScreenCommand $action[1] }
+            elseif ($action[0] -eq 'folder') { Open-ScreenFolder }
+            else { Request-ScreenRecorder $action[1] $action[2] $action[3] }
+            Update-TrayText
+        }
+    })
+    [void]$Items.Add($item)
+    $item
+}
+
+function Add-ScreenRecordMenu([System.Windows.Forms.ToolStripItemCollection]$Items) {
+    $root = New-Object System.Windows.Forms.ToolStripMenuItem 'Screen recording'
+    [void]$root.DropDownItems.Add('...')
+    $root.add_DropDownOpening({ param($sender, $e) Invoke-Safely { Update-ScreenRecordMenu $sender } })
+    [void]$Items.Add($root)
+    $root
+}
+
+function Update-ScreenRecordMenu([System.Windows.Forms.ToolStripMenuItem]$Root) {
+    $items = $Root.DropDownItems
+    $items.Clear()
+    if (-not $script:Ffmpeg) {
+        $missing = New-Object System.Windows.Forms.ToolStripMenuItem 'Needs ffmpeg (not found)'
+        $missing.Enabled = $false
+        [void]$items.Add($missing)
+        return
+    }
+    $state = $script:ScreenRec
+    if ($state) {
+        $recText = if ($state.Recording) { 'Stop screen recording (F12)' } else { 'Start screen recording (F12)' }
+        [void](Add-ScreenMenuItem $items $recText @('cmd', 'rec'))
+        if ($state.Recording) {
+            [void](Add-ScreenMenuItem $items $(if ($state.Paused) { 'Resume (Shift+F12)' } else { 'Pause (Shift+F12)' }) @('cmd', 'pause'))
+        }
+        [void](Add-ScreenMenuItem $items 'Take screenshot (F11)' @('cmd', 'shot'))
+        if (-not $state.Recording) { [void](Add-ScreenMenuItem $items 'Close screen recorder' @('cmd', 'close')) }
+        [void]$items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    }
+    if (-not ($state -and $state.Recording)) {
+        Initialize-ScreenRecorder
+        $mode = if ($state) { $state.Mode } else { '' }
+        [void](Add-ScreenMenuItem $items 'Rectangle on screen' @('open', 'rect', '', '') ($mode -eq 'rect'))
+        [void](Add-ScreenMenuItem $items 'Select area...' @('open', 'select', '', ''))
+        $displays = @([ScrcpyMonitor.ScreenNative]::Displays())
+        if ($displays.Count -gt 1) {
+            $virtual = [ScrcpyMonitor.ScreenNative]::VirtualBounds($displays)
+            [void](Add-ScreenMenuItem $items ('Full screen - all screens ({0} x {1})' -f $virtual.Width, $virtual.Height) @('open', 'all', '', '') ($mode -eq 'all'))
+        }
+        foreach ($display in $displays) {
+            $text = if ($displays.Count -gt 1) { 'Screen {0} ({1} x {2}){3}' -f $display.Number, $display.Bounds.Width, $display.Bounds.Height, $(if ($display.Primary) { ', main' } else { '' }) }
+                    else { 'Full screen ({0} x {1})' -f $display.Bounds.Width, $display.Bounds.Height }
+            [void](Add-ScreenMenuItem $items $text @('open', 'monitor', "$($display.Number)", '') ($mode -eq 'monitor' -and $state.Device -eq $display.Device))
+        }
+        $windowMenu = New-Object System.Windows.Forms.ToolStripMenuItem 'Lock to window'
+        $windowMenu.Checked = $mode -eq 'window'
+        $choices = Get-ScreenWindowChoices
+        $previousDevice = $true
+        foreach ($choice in $choices) {
+            if ($previousDevice -and -not $choice.Device -and $windowMenu.DropDownItems.Count) { [void]$windowMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
+            $previousDevice = $choice.Device
+            [void](Add-ScreenMenuItem $windowMenu.DropDownItems $choice.Text @('open', 'window', $choice.Target, $choice.Text))
+        }
+        if (-not $choices.Count) {
+            $none = New-Object System.Windows.Forms.ToolStripMenuItem 'No window'
+            $none.Enabled = $false
+            [void]$windowMenu.DropDownItems.Add($none)
+        }
+        [void]$items.Add($windowMenu)
+        $mouseMenu = New-Object System.Windows.Forms.ToolStripMenuItem 'Around mouse'
+        $mouseMenu.Checked = $mode -eq 'mouse'
+        $saved = Get-ScreenFollowSize
+        foreach ($size in @('1920x1080', '1280x720', '854x480', '640x360', '800x600', '640x480')) {
+            [void](Add-ScreenMenuItem $mouseMenu.DropDownItems ($size -replace 'x', ' x ') @('open', 'mouse', $size, '') ($size -eq "$($saved.Width)x$($saved.Height)"))
+        }
+        [void]$items.Add($mouseMenu)
+        [void]$items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    }
+    [void](Add-ScreenMenuItem $items 'Open screen recordings folder' @('folder'))
+}
+
 function Open-RecordFolder {
     [void](New-Item -ItemType Directory -Force -Path $RecordDir)
     Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$RecordDir`""
+}
+
+function Initialize-LogcatCapture {
+    if ('ScrcpyMonitor.LogcatCapture' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+
+namespace ScrcpyMonitor {
+    public class LogcatCapture {
+        static readonly Regex HeaderPattern = new Regex(@"^\[ (\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\.(\d+)\s+(?:\S+:\s*)?(\d+):\s*(\d+)\s+([VDIWEFAS])/(.*?)\s*\]$", RegexOptions.Compiled);
+        static readonly Regex BootPattern = new Regex(@"^[0-9a-fA-F-]{16,}$", RegexOptions.Compiled);
+        static readonly Regex VersionPattern = new Regex(@"versionName=(\S+)", RegexOptions.Compiled);
+        static readonly Regex StartProcPattern = new Regex(@"^Start proc (\d+):([^/\s]+)/", RegexOptions.Compiled);
+        static readonly Regex KillingPattern = new Regex(@"^Killing (\d+):([^/\s]+)/\S+(?: \(adj -?\d+\))?: (.*)$", RegexOptions.Compiled);
+        static readonly Regex ClockPattern = new Regex(@"^(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)()", RegexOptions.Compiled);
+        static readonly Regex DiedPattern = new Regex(@"^Process (\S+) \(pid (\d+)\) has died", RegexOptions.Compiled);
+        static readonly Regex AnrPattern = new Regex(@"^ANR in (\S+)", RegexOptions.Compiled);
+        const string Rule = "----------------------------";
+        public const string PaPackage = "com.global.wwca";
+        public const string PiaPackage = "com.global.integrated";
+        const string VersionCommand = "if [ \"$(getprop sys.boot_completed)\" = 1 ]; then for p in " + PaPackage + " " + PiaPackage + "; do echo \"@$p\"; dumpsys package $p | grep -E 'versionName|Unable to find'; done; fi";
+        readonly object versionLock = new object();
+        string versionText;
+        bool versionPending;
+        DateTime statusTime = DateTime.MinValue;
+        readonly HashSet<int> stoppedPids = new HashSet<int>();
+        readonly string adb;
+        readonly string label;
+        readonly object writeLock = new object();
+        readonly object processLock = new object();
+        readonly List<Process> children = new List<Process>();
+        readonly ManualResetEvent stopEvent = new ManualResetEvent(false);
+        readonly Dictionary<int, string> pids = new Dictionary<int, string>();
+        readonly HashSet<int> missingPids = new HashSet<int>();
+        readonly List<string> entryLines = new List<string>();
+        readonly Dictionary<string, StreamWriter> appWriters = new Dictionary<string, StreamWriter>();
+        readonly HashSet<string> appFailed = new HashSet<string>();
+        volatile HashSet<string> apps = new HashSet<string>();
+        string entryApp;
+        StreamWriter writer;
+        Timer flushTimer;
+        Thread thread;
+        DateTime pidsRefreshedAt = DateTime.MinValue;
+        volatile bool stopping;
+        volatile string serial;
+        volatile string state = "Waiting for device";
+        volatile string error;
+        long entries;
+        string reading;
+        bool entryOpen;
+        bool entryEmitted;
+        bool entrySkipped;
+        int pendingBlanks;
+        DateTime entryTime;
+        int entryPid;
+        int entryTid;
+        string entryLevel;
+        string entryTag;
+        string indent = "";
+        bool filtering;
+        DateTime lastKey = DateTime.MinValue;
+        int lastKeyCount;
+        int seenAtLastKey;
+
+        public LogcatCapture(string adbPath, string deviceSerial, string path, string deviceLabel) {
+            adb = adbPath;
+            serial = deviceSerial;
+            label = deviceLabel;
+            Path = path;
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
+            writer = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
+            StartedAt = DateTime.Now;
+        }
+
+        public string Path { get; private set; }
+        public DateTime StartedAt { get; private set; }
+        public string Serial { get { return serial; } set { serial = value; } }
+        public string State { get { return state; } }
+        public string Error { get { return error; } }
+        public bool Failed { get { return error != null; } }
+        public long Entries { get { return Interlocked.Read(ref entries); } }
+        public long Size { get { try { return new FileInfo(Path).Length; } catch (Exception) { return 0; } } }
+
+        public void SetApps(string[] list) {
+            apps = new HashSet<string>(list ?? new string[0]);
+        }
+
+        public void Start() {
+            Marker("LOGGING STARTED: " + label);
+            flushTimer = new Timer(delegate { Flush(); }, null, 1000, 1000);
+            thread = new Thread(Run);
+            thread.IsBackground = true;
+            thread.Name = "Logcat " + serial;
+            thread.Start();
+        }
+
+        public void RequestStop() {
+            stopping = true;
+            stopEvent.Set();
+            KillChildren();
+        }
+
+        public void Stop() {
+            RequestStop();
+            if (thread != null) thread.Join(5000);
+            if (flushTimer != null) flushTimer.Dispose();
+            lock (writeLock) {
+                if (writer == null) return;
+                string marker = MarkerText(error == null ? "LOGGING STOPPED" : "LOGGING STOPPED: " + error);
+                foreach (string app in new List<string>(appWriters.Keys)) {
+                    WriteApp(app, marker);
+                    CloseApp(app);
+                }
+                try {
+                    writer.WriteLine(marker);
+                    writer.Flush();
+                } catch (Exception) { }
+                try { writer.Dispose(); } catch (Exception) { }
+                writer = null;
+            }
+        }
+
+        static string MarkerText(string text) {
+            return Rule + " " + text + " (" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + ") " + Rule;
+        }
+
+        void Marker(string text) {
+            string line = MarkerText(text);
+            Write(line, null);
+            lock (writeLock) {
+                foreach (string app in new List<string>(appWriters.Keys)) WriteApp(app, line);
+            }
+        }
+
+        bool IsTracked(string package) {
+            return package == PaPackage || package == PiaPackage || apps.Contains(package);
+        }
+
+        static string AppLabel(string package) {
+            if (package == PaPackage) return "PA (" + package + ")";
+            if (package == PiaPackage) return "PIA (" + package + ")";
+            return package;
+        }
+
+        public static string AppStatusText(Dictionary<int, string> processes, IEnumerable<string> chosen) {
+            List<string> tracked = new List<string> { PaPackage, PiaPackage };
+            List<string> others = new List<string>();
+            foreach (string app in chosen ?? new string[0]) {
+                if (!tracked.Contains(app) && !others.Contains(app)) others.Add(app);
+            }
+            others.Sort(StringComparer.Ordinal);
+            tracked.AddRange(others);
+            List<string> parts = new List<string>();
+            foreach (string app in tracked) {
+                List<int> found = new List<int>();
+                foreach (KeyValuePair<int, string> pair in processes) {
+                    if (pair.Value == app) found.Add(pair.Key);
+                }
+                found.Sort();
+                parts.Add(AppLabel(app) + (found.Count > 0 ? " running (pid " + string.Join(", ", found) + ")" : " not running"));
+            }
+            return string.Join(", ", parts);
+        }
+
+        public static string[] ParseAppEvent(string tag, string message) {
+            Match match;
+            if (tag == "ActivityManager") {
+                match = StartProcPattern.Match(message);
+                if (match.Success) return new string[] { "APP STARTED", match.Groups[2].Value, match.Groups[1].Value, "" };
+                match = KillingPattern.Match(message);
+                if (match.Success) return new string[] { "APP STOPPED", match.Groups[2].Value, match.Groups[1].Value, match.Groups[3].Value.Trim() };
+                match = DiedPattern.Match(message);
+                if (match.Success) return new string[] { "APP STOPPED", match.Groups[1].Value, match.Groups[2].Value, "process died" };
+                match = AnrPattern.Match(message);
+                if (match.Success) return new string[] { "APP NOT RESPONDING", match.Groups[1].Value, "", "" };
+                return null;
+            }
+            if ((tag == "AndroidRuntime" && message.StartsWith("FATAL EXCEPTION")) || (tag == "libc" && message.StartsWith("Fatal signal"))) {
+                return new string[] { "APP CRASHED", "", "", message.Trim() };
+            }
+            return null;
+        }
+
+        void NoteAppEvent(string name) {
+            if (entryLines.Count == 0 || entryTime < statusTime) return;
+            string[] found = ParseAppEvent(entryTag, entryLines[0]);
+            if (found == null) return;
+            string process = found[1].Length > 0 ? found[1] : name;
+            string pidText = found[2].Length > 0 ? found[2] : (found[0] == "APP CRASHED" ? entryPid.ToString(CultureInfo.InvariantCulture) : "");
+            int pid;
+            bool hasPid = int.TryParse(pidText, NumberStyles.None, CultureInfo.InvariantCulture, out pid);
+            if (found[0] == "APP STARTED" && hasPid) {
+                pids[pid] = process;
+                missingPids.Remove(pid);
+            }
+            if (process.Length == 0 || process.IndexOf(':') >= 0 || !IsTracked(process)) return;
+            if (found[0] == "APP STARTED" && hasPid) stoppedPids.Remove(pid);
+            else if (found[0] == "APP STOPPED" && hasPid && !stoppedPids.Add(pid)) return;
+            Marker(found[0] + ": " + AppLabel(process) + (hasPid ? ", pid " + pidText : "") + (found[3].Length > 0 ? " - " + found[3] : ""));
+        }
+
+        DateTime DeviceNow(string device) {
+            Match match = ClockPattern.Match(RunAdb(new string[] { "-s", device, "shell", "date '+%m-%d %H:%M:%S'" }, 5000).Trim());
+            return match.Success ? ParseTime(match) : DateTime.MinValue;
+        }
+
+        void Write(string text, string app) {
+            lock (writeLock) {
+                if (writer == null) return;
+                try { writer.WriteLine(text); } catch (Exception ex) { Fail(ex); return; }
+                if (app == null) return;
+                if (!appWriters.ContainsKey(app)) {
+                    if (appFailed.Contains(app) || appWriters.Count >= 500) return;
+                    try {
+                        string appPath = AppLogPath(Path, app);
+                        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(appPath));
+                        appWriters[app] = new StreamWriter(new FileStream(appPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
+                    } catch (Exception) {
+                        appFailed.Add(app);
+                        return;
+                    }
+                    WriteApp(app, MarkerText("LOGGING STARTED: " + label));
+                }
+                WriteApp(app, text);
+            }
+        }
+
+        void WriteApp(string app, string text) {
+            StreamWriter appWriter;
+            if (!appWriters.TryGetValue(app, out appWriter)) return;
+            try { appWriter.WriteLine(text); } catch (Exception) { CloseApp(app); }
+        }
+
+        void CloseApp(string app) {
+            StreamWriter appWriter;
+            appFailed.Add(app);
+            if (!appWriters.TryGetValue(app, out appWriter)) return;
+            appWriters.Remove(app);
+            try { appWriter.Dispose(); } catch (Exception) { }
+        }
+
+        public static string AppLogPath(string path, string package) {
+            StringBuilder folder = new StringBuilder();
+            foreach (char c in package) folder.Append(c < 32 || "<>:\"/\\|?*".IndexOf(c) >= 0 ? '_' : c);
+            string name = folder.ToString().Trim('.', ' ');
+            if (name.Length == 0) name = "_";
+            return System.IO.Path.Combine(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path), name), System.IO.Path.GetFileName(path));
+        }
+
+        static bool LooksLikePackage(string name) {
+            return name.IndexOf('.') >= 0 && name.IndexOfAny(new char[] { '/', '@', ' ' }) < 0;
+        }
+
+        public static string AppPackage(string name, HashSet<string> installed) {
+            if (string.IsNullOrEmpty(name)) return null;
+            int colon = name.IndexOf(':');
+            string package = (colon >= 0 ? name.Substring(0, colon) : name).Trim();
+            if (package.Length == 0) return null;
+            if (package == "system_process") return package;
+            if (installed.Count > 0) return installed.Contains(package) ? package : null;
+            return LooksLikePackage(package) ? package : null;
+        }
+
+        public static HashSet<string> ParsePackages(string text) {
+            HashSet<string> result = new HashSet<string>();
+            foreach (string raw in text.Split('\n')) {
+                string line = raw.Trim();
+                if (line.StartsWith("package:") && line.Length > 8) result.Add(line.Substring(8));
+            }
+            return result;
+        }
+
+        public static string LogApp(string name, HashSet<string> chosen) {
+            if (string.IsNullOrEmpty(name)) return null;
+            int colon = name.IndexOf(':');
+            string package = (colon >= 0 ? name.Substring(0, colon) : name).Trim();
+            if (package.Length == 0) return null;
+            return chosen.Contains(package) ? package : null;
+        }
+
+        public static string ForegroundApp(string text) {
+            foreach (string pattern in new string[] { @"mCurrentFocus=Window\{[^}]*?\s([\w.]+)/", @"mFocusedApp=\S*\{[^}]*?\s([\w.]+)/", @"mResumedActivity:? ActivityRecord\{[^}]*?\s([\w.]+)/" }) {
+                Match match = Regex.Match(text ?? "", pattern);
+                if (match.Success) return match.Groups[1].Value;
+            }
+            return null;
+        }
+
+        static string RunAdbOnce(string adbPath, string[] args, int timeout) {
+            ProcessStartInfo info = new ProcessStartInfo(adbPath, Join(args));
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            info.RedirectStandardOutput = true;
+            info.RedirectStandardError = true;
+            info.StandardOutputEncoding = new UTF8Encoding(false);
+            try {
+                using (Process process = Process.Start(info)) {
+                    process.ErrorDataReceived += delegate { };
+                    process.BeginErrorReadLine();
+                    System.Threading.Tasks.Task<string> output = process.StandardOutput.ReadToEndAsync();
+                    if (!process.WaitForExit(timeout)) {
+                        try { process.Kill(); } catch (Exception) { }
+                        return "";
+                    }
+                    return output.Wait(2000) ? output.Result : "";
+                }
+            } catch (Exception) {
+                return "";
+            }
+        }
+
+        public static AppScan ScanApps(string adbPath, string[] serials) {
+            HashSet<string> running = new HashSet<string>();
+            HashSet<string> opened = new HashSet<string>();
+            HashSet<string> userApps = new HashSet<string>();
+            foreach (string device in serials) {
+                HashSet<string> installed = ParsePackages(RunAdbOnce(adbPath, new string[] { "-s", device, "shell", "pm list packages" }, 15000));
+                userApps.UnionWith(ParsePackages(RunAdbOnce(adbPath, new string[] { "-s", device, "shell", "pm list packages -3" }, 15000)));
+                foreach (string package in new string[] { PaPackage, PiaPackage }) {
+                    if (installed.Contains(package)) userApps.Add(package);
+                }
+                string text = RunAdbOnce(adbPath, new string[] { "-s", device, "shell", "ps -A -o PID,NAME" }, 10000);
+                if (text.Split('\n').Length <= 3) text = RunAdbOnce(adbPath, new string[] { "-s", device, "shell", "ps" }, 10000);
+                foreach (string name in ParseProcessNames(text).Values) {
+                    string package = AppPackage(name, installed);
+                    if (package != null) running.Add(package);
+                }
+                string app = ForegroundApp(RunAdbOnce(adbPath, new string[] { "-s", device, "shell", "dumpsys window" }, 10000));
+                if (app != null) opened.Add(app);
+            }
+            running.UnionWith(opened);
+            AppScan scan = new AppScan();
+            scan.Running = new List<string>(running).ToArray();
+            scan.Opened = new List<string>(opened).ToArray();
+            scan.Installed = new List<string>(userApps).ToArray();
+            return scan;
+        }
+
+        public static System.Threading.Tasks.Task<AppScan> ScanAppsAsync(string adbPath, string[] serials) {
+            return System.Threading.Tasks.Task.Factory.StartNew(() => ScanApps(adbPath, serials ?? new string[0]));
+        }
+
+        public static Dictionary<string, string> ParseAppVersions(string text) {
+            Dictionary<string, string> versions = new Dictionary<string, string>();
+            HashSet<string> resolved = new HashSet<string>();
+            string current = null;
+            foreach (string raw in (text ?? "").Split('\n')) {
+                string line = raw.Trim();
+                if (line.StartsWith("@")) {
+                    current = line.Substring(1);
+                    if (!versions.ContainsKey(current)) versions[current] = "";
+                    continue;
+                }
+                if (current == null || versions[current].Length > 0) continue;
+                if (line.StartsWith("Unable to find")) {
+                    resolved.Add(current);
+                    continue;
+                }
+                Match match = VersionPattern.Match(line);
+                if (match.Success) {
+                    versions[current] = match.Groups[1].Value;
+                    resolved.Add(current);
+                }
+            }
+            if (!resolved.Contains(PaPackage) || !resolved.Contains(PiaPackage)) return null;
+            return versions;
+        }
+
+        static string VersionOf(Dictionary<string, string> versions, string package) {
+            string version;
+            return versions.TryGetValue(package, out version) && version.Length > 0 ? version : "Not installed";
+        }
+
+        public static string AppVersionText(Dictionary<string, string> versions) {
+            if (versions == null) return null;
+            return "PA (" + PaPackage + ") " + VersionOf(versions, PaPackage) + ", PIA (" + PiaPackage + ") " + VersionOf(versions, PiaPackage);
+        }
+
+        public static Dictionary<string, string> ReadAppVersions(string adbPath, string device) {
+            return ParseAppVersions(RunAdbOnce(adbPath, new string[] { "-s", device, "shell", VersionCommand }, 10000));
+        }
+
+        public static System.Threading.Tasks.Task<Dictionary<string, Dictionary<string, string>>> ScanVersionsAsync(string adbPath, string[] serials) {
+            return System.Threading.Tasks.Task.Factory.StartNew(() => {
+                Dictionary<string, Dictionary<string, string>> result = new Dictionary<string, Dictionary<string, string>>();
+                foreach (string device in serials ?? new string[0]) {
+                    Dictionary<string, string> versions = ReadAppVersions(adbPath, device);
+                    if (versions != null) result[device] = versions;
+                }
+                return result;
+            });
+        }
+
+        public void NoteVersions(Dictionary<string, string> versions, bool force) {
+            string text = AppVersionText(versions);
+            lock (versionLock) {
+                if (text == null) {
+                    if (force) versionPending = true;
+                    return;
+                }
+                if (!force && !versionPending && text == versionText) return;
+                versionPending = false;
+                versionText = text;
+                Marker("APP VERSIONS: " + text);
+            }
+        }
+
+        void Flush() {
+            lock (writeLock) {
+                if (writer == null) return;
+                try { writer.Flush(); } catch (Exception ex) { Fail(ex); }
+                foreach (KeyValuePair<string, StreamWriter> pair in new List<KeyValuePair<string, StreamWriter>>(appWriters)) {
+                    try { pair.Value.Flush(); } catch (Exception) { CloseApp(pair.Key); }
+                }
+            }
+        }
+
+        void Fail(Exception ex) {
+            if (error == null) error = ex.Message;
+            stopping = true;
+            stopEvent.Set();
+            KillChildren();
+        }
+
+        void KillChildren() {
+            lock (processLock) {
+                foreach (Process child in children) {
+                    try { if (!child.HasExited) child.Kill(); } catch (Exception) { }
+                }
+            }
+        }
+
+        static string Join(string[] args) {
+            StringBuilder text = new StringBuilder();
+            foreach (string arg in args) {
+                if (text.Length > 0) text.Append(' ');
+                if (arg.IndexOfAny(new char[] { ' ', '\t', '"' }) >= 0) text.Append('"').Append(arg.Replace("\"", "\\\"")).Append('"');
+                else text.Append(arg);
+            }
+            return text.ToString();
+        }
+
+        Process StartAdb(string[] args) {
+            ProcessStartInfo info = new ProcessStartInfo(adb, Join(args));
+            info.UseShellExecute = false;
+            info.CreateNoWindow = true;
+            info.RedirectStandardOutput = true;
+            info.RedirectStandardError = true;
+            info.StandardOutputEncoding = new UTF8Encoding(false);
+            lock (processLock) {
+                if (stopping) return null;
+                Process process = Process.Start(info);
+                process.ErrorDataReceived += delegate { };
+                process.BeginErrorReadLine();
+                children.Add(process);
+                return process;
+            }
+        }
+
+        void Release(Process process) {
+            lock (processLock) { children.Remove(process); }
+            try { if (!process.HasExited) process.Kill(); } catch (Exception) { }
+            try { process.WaitForExit(2000); } catch (Exception) { }
+            process.Dispose();
+        }
+
+        string RunAdb(string[] args, int timeout) {
+            Process process = null;
+            try {
+                process = StartAdb(args);
+                if (process == null) return "";
+                System.Threading.Tasks.Task<string> output = process.StandardOutput.ReadToEndAsync();
+                if (!process.WaitForExit(timeout)) return "";
+                return output.Wait(2000) ? output.Result : "";
+            } catch (Exception) {
+                return "";
+            } finally {
+                if (process != null) Release(process);
+            }
+        }
+
+        void Run() {
+            string lastBoot = null;
+            bool announced = false;
+            int quickExits = 0;
+            try {
+                while (!stopping) {
+                    state = "Waiting for device";
+                    string current = serial;
+                    if (RunAdb(new string[] { "-s", current, "get-state" }, 5000).Trim() != "device") {
+                        stopEvent.WaitOne(2000);
+                        continue;
+                    }
+                    string boot = RunAdb(new string[] { "-s", current, "shell", "cat /proc/sys/kernel/random/boot_id" }, 5000).Trim();
+                    if (stopping) break;
+                    if (!BootPattern.IsMatch(boot)) boot = "";
+                    bool sameBoot = lastBoot != null && (boot.Length == 0 || lastBoot.Length == 0 || boot == lastBoot);
+                    bool restarted = lastBoot != null && !sameBoot;
+                    if (restarted) Marker("DEVICE RESTARTED: " + current);
+                    else if (announced) Marker("DEVICE RECONNECTED: " + current);
+                    announced = false;
+                    Dictionary<string, string> versions = ParseAppVersions(RunAdb(new string[] { "-s", current, "shell", VersionCommand }, 10000));
+                    if (stopping) break;
+                    NoteVersions(versions, restarted);
+                    if (!sameBoot) {
+                        lastKey = DateTime.MinValue;
+                        lastKeyCount = 0;
+                        pids.Clear();
+                        missingPids.Clear();
+                        stoppedPids.Clear();
+                    }
+                    filtering = sameBoot && lastKey != DateTime.MinValue;
+                    seenAtLastKey = 0;
+                    lastBoot = boot;
+                    reading = current;
+                    statusTime = DeviceNow(current);
+                    if (stopping) break;
+                    Dictionary<int, string> running = RefreshPids();
+                    if (stopping) break;
+                    Marker("APP STATUS: " + (running.Count > 0 ? AppStatusText(running, apps) : "unknown (could not read the process list)"));
+                    state = "Logging";
+                    DateTime began = DateTime.Now;
+                    long before = Entries;
+                    ReadLogcat();
+                    if (stopping) break;
+                    state = "Waiting for device";
+                    if ((DateTime.Now - began).TotalSeconds >= 3 || Entries != before) {
+                        Marker("DEVICE DISCONNECTED: " + current);
+                        announced = true;
+                        quickExits = 0;
+                    } else {
+                        quickExits++;
+                    }
+                    stopEvent.WaitOne(Math.Min(1000 * (1 + quickExits), 10000));
+                }
+            } catch (Exception ex) {
+                if (!stopping) Fail(ex);
+            } finally {
+                state = "Stopped";
+            }
+        }
+
+        void ReadLogcat() {
+            Process process = StartAdb(new string[] { "-s", reading, "logcat", "-v", "long" });
+            if (process == null) return;
+            entryOpen = false;
+            pendingBlanks = 0;
+            try {
+                StreamReader reader = process.StandardOutput;
+                char[] buffer = new char[8192];
+                StringBuilder line = new StringBuilder();
+                int count;
+                while (!stopping && (count = reader.Read(buffer, 0, buffer.Length)) > 0) {
+                    int start = 0;
+                    for (int i = 0; i < count; i++) {
+                        if (buffer[i] != '\n') continue;
+                        line.Append(buffer, start, i - start);
+                        HandleLine(line.ToString().TrimEnd('\r'));
+                        line.Length = 0;
+                        start = i + 1;
+                    }
+                    line.Append(buffer, start, count - start);
+                }
+                if (line.Length > 0 && !stopping) HandleLine(line.ToString().TrimEnd('\r'));
+            } finally {
+                EndEntry();
+                Release(process);
+            }
+        }
+
+        void HandleLine(string line) {
+            Match match = line.StartsWith("[ ") ? HeaderPattern.Match(line) : Match.Empty;
+            if (match.Success) {
+                EndEntry();
+                entryTime = ParseTime(match);
+                entryPid = int.Parse(match.Groups[7].Value, CultureInfo.InvariantCulture);
+                entryTid = int.Parse(match.Groups[8].Value, CultureInfo.InvariantCulture);
+                entryLevel = match.Groups[9].Value;
+                entryTag = match.Groups[10].Value.Trim();
+                entryLines.Clear();
+                entryOpen = true;
+                entryEmitted = false;
+                entrySkipped = false;
+                pendingBlanks = 0;
+                return;
+            }
+            if (!entryOpen) return;
+            if (line.Length == 0) {
+                if (!entryEmitted) Emit();
+                pendingBlanks++;
+                return;
+            }
+            if (!entryEmitted) {
+                entryLines.Add(line);
+                return;
+            }
+            if (line.StartsWith("--------- beginning of ") || line.StartsWith("--------- switch to ")) {
+                pendingBlanks = 0;
+                return;
+            }
+            if (!entrySkipped) {
+                StringBuilder text = new StringBuilder();
+                for (int i = 0; i < pendingBlanks; i++) text.Append(Environment.NewLine);
+                text.Append(indent).Append(line);
+                Write(text.ToString(), entryApp);
+            }
+            pendingBlanks = 0;
+        }
+
+        void EndEntry() {
+            if (entryOpen && !entryEmitted) Emit();
+            entryOpen = false;
+            pendingBlanks = 0;
+        }
+
+        static DateTime ParseTime(Match match) {
+            DateTime now = DateTime.Now;
+            int month = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+            int year = month > now.Month + 1 ? now.Year - 1 : now.Year;
+            string fraction = (match.Groups[6].Value + "000").Substring(0, 3);
+            try {
+                return new DateTime(year, month,
+                    int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture),
+                    int.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture),
+                    int.Parse(match.Groups[4].Value, CultureInfo.InvariantCulture),
+                    int.Parse(match.Groups[5].Value, CultureInfo.InvariantCulture),
+                    int.Parse(fraction, CultureInfo.InvariantCulture));
+            } catch (ArgumentOutOfRangeException) {
+                return now;
+            }
+        }
+
+        void Emit() {
+            entryEmitted = true;
+            if (filtering) {
+                int order = entryTime.CompareTo(lastKey);
+                if (order < 0 || (order == 0 && seenAtLastKey < lastKeyCount)) {
+                    if (order == 0) seenAtLastKey++;
+                    entrySkipped = true;
+                    return;
+                }
+                filtering = false;
+            }
+            if (entryTime == lastKey) lastKeyCount++;
+            else {
+                lastKey = entryTime;
+                lastKeyCount = 1;
+            }
+            string name = AppName(entryPid);
+            entryApp = LogApp(name, apps);
+            string prefix = string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-dd HH:mm:ss.fff}  {1,5}-{2,-5}  {3,-23}  {4,-35}  {5}  ",
+                entryTime, entryPid, entryTid, entryTag, name, entryLevel);
+            indent = new string(' ', prefix.Length);
+            if (entryLines.Count == 0) {
+                Write(prefix.TrimEnd(), entryApp);
+            } else {
+                StringBuilder text = new StringBuilder(prefix).Append(entryLines[0]);
+                for (int i = 1; i < entryLines.Count; i++) text.Append(Environment.NewLine).Append(indent).Append(entryLines[i]);
+                Write(text.ToString(), entryApp);
+            }
+            Interlocked.Increment(ref entries);
+            NoteAppEvent(name);
+        }
+
+        string AppName(int pid) {
+            string name;
+            if (pids.TryGetValue(pid, out name)) return name;
+            if (missingPids.Contains(pid) || (DateTime.Now - pidsRefreshedAt).TotalSeconds < 2) return "";
+            RefreshPids();
+            if (pids.TryGetValue(pid, out name)) return name;
+            missingPids.Add(pid);
+            return "";
+        }
+
+        static bool IsStale(string name) {
+            return name.StartsWith("zygote") || name.StartsWith("usap") || name == "<pre-initialized>";
+        }
+
+        Dictionary<int, string> RefreshPids() {
+            pidsRefreshedAt = DateTime.Now;
+            string text = RunAdb(new string[] { "-s", reading, "shell", "ps -A -o PID,NAME" }, 10000);
+            if (text.Split('\n').Length <= 3) text = RunAdb(new string[] { "-s", reading, "shell", "ps" }, 10000);
+            Dictionary<int, string> names = ParseProcessNames(text);
+            foreach (KeyValuePair<int, string> pair in names) pids[pair.Key] = pair.Value;
+            if (names.Count > 0) missingPids.Clear();
+            pidsRefreshedAt = DateTime.Now;
+            return names;
+        }
+
+        static Dictionary<int, string> ParseProcessNames(string text) {
+            Dictionary<int, string> names = new Dictionary<int, string>();
+            int pidColumn = -1;
+            foreach (string raw in text.Split('\n')) {
+                string[] parts = raw.Split(new char[] { ' ', '\t', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2) continue;
+                if (pidColumn < 0) {
+                    pidColumn = Array.IndexOf(parts, "PID");
+                    continue;
+                }
+                int pid;
+                if (parts.Length <= pidColumn || !int.TryParse(parts[pidColumn], NumberStyles.None, CultureInfo.InvariantCulture, out pid)) continue;
+                string name = parts[parts.Length - 1];
+                if (name == "system_server") name = "system_process";
+                if (IsStale(name)) continue;
+                names[pid] = name;
+            }
+            return names;
+        }
+    }
+
+    public class AppScan {
+        public string[] Running;
+        public string[] Opened;
+        public string[] Installed;
+    }
+}
+'@
+}
+
+function Get-DeviceLogName($Session) {
+    $name = $Session.Name
+    if (-not $name -and $Session.LastState -eq 'device') { $name = Get-DeviceProp $Session.Serial 'ro.product.model' }
+    $safe = ConvertTo-SafeName $name
+    if ($safe) { $safe } else { $Session.SafeSerial }
+}
+
+function Get-DeviceHardwareSerial($Session) {
+    $id = $Session.Serial
+    if ((Get-ConnectionType $id) -eq 'Wi-Fi') {
+        $id = $script:WifiSerials[$Session.Serial]
+        if (-not $id -and $Session.LastState -eq 'device') {
+            $id = Get-DeviceProp $Session.Serial 'ro.serialno'
+            if ($id) { $script:WifiSerials[$Session.Serial] = $id }
+        }
+    }
+    $safe = ConvertTo-SafeName $id
+    if ($safe) { $safe } else { $Session.SafeSerial }
+}
+
+function Start-DeviceLog($Session) {
+    if ($Session.LogCapture -or $Session.UserClosed -or $script:Standby.ContainsKey($Session.Serial)) { return }
+    Initialize-LogcatCapture
+    $deviceName = Get-DeviceLogName $Session
+    $hardwareSerial = Get-DeviceHardwareSerial $Session
+    $folder = Join-Path $script:DeviceLogDir $deviceName
+    $stem = 'logs_{0}_{1}_{2:yyyyMMdd_HHmmss}' -f $deviceName, $hardwareSerial, (Get-Date)
+    $path = Join-Path $folder "$stem.txt"
+    $suffix = 2
+    while (Test-Path -LiteralPath $path) {
+        $path = Join-Path $folder "${stem}_$suffix.txt"
+        $suffix++
+    }
+    try {
+        $capture = New-Object ScrcpyMonitor.LogcatCapture($script:Adb, $Session.Serial, $path, "$deviceName, serial $hardwareSerial, adb $($Session.Serial)")
+        $capture.SetApps([string[]]@($script:LogApps))
+        $capture.Start()
+    } catch {
+        Show-Notification "Could not start device logs for $($Session.Title): $($_.Exception.Message)" 'Error'
+        return
+    }
+    $Session.LogCapture = $capture
+    Write-Log "[$($Session.Serial)] Device logs started: $path"
+    Show-Notification "Device logs started for $($Session.Title)."
+}
+
+function Complete-DeviceLogs($Captures, [switch]$Quiet) {
+    $Captures = @($Captures | Where-Object { $_ })
+    foreach ($capture in $Captures) { Invoke-Safely { $capture.RequestStop() } }
+    foreach ($capture in $Captures) {
+        Invoke-Safely {
+            $capture.Stop()
+            Write-Log "Device logs saved: $($capture.Path) ($($capture.Entries) entries)$(if ($capture.Failed) { "; stopped by an error: $($capture.Error)" })"
+        }
+    }
+    if ($Quiet -or -not $Captures.Count) { return }
+    $text = if ($Captures.Count -eq 1) { "Device logs saved: $($Captures[0].Path)" } else { "Device logs of $($Captures.Count) devices saved in $script:DeviceLogDir" }
+    Show-Notification $text
+}
+
+function Stop-DeviceLog($Sessions, [switch]$Quiet) {
+    $captures = @(foreach ($session in @($Sessions | Where-Object { $_ -and $_.LogCapture })) {
+        $session.LogCapture
+        $session.LogCapture = $null
+    })
+    Complete-DeviceLogs $captures -Quiet:$Quiet
+}
+
+function Stop-AllDeviceLogs {
+    $captures = @($script:Sessions.Values | Where-Object { $_.LogCapture } | ForEach-Object { $_.LogCapture; $_.LogCapture = $null }) + @($script:LogHandovers.Values | ForEach-Object { $_.Capture })
+    $script:LogHandovers.Clear()
+    Complete-DeviceLogs $captures -Quiet
+}
+
+function Stop-AllLogs($Serials) {
+    $Serials = @($Serials | Where-Object { $_ })
+    $keys = @($script:LogHandovers.Keys | Where-Object { -not $Serials.Count -or $Serials -contains $_ })
+    $captures = @($keys | ForEach-Object { $script:LogHandovers[$_].Capture })
+    foreach ($key in $keys) { $script:LogHandovers.Remove($key) }
+    $captures += @($script:Sessions.Values | Where-Object { $_.LogCapture -and (-not $Serials.Count -or $Serials -contains $_.Serial) } | ForEach-Object { $_.LogCapture; $_.LogCapture = $null })
+    Complete-DeviceLogs $captures
+}
+
+function Move-DeviceLog($Session) {
+    $capture = $Session.LogCapture
+    if (-not $capture) { return }
+    $Session.LogCapture = $null
+    $serial = $Session.Serial
+    $candidates = @()
+    if ($Session.MovedTo -and $Session.MoveAddress) { $candidates += $Session.MoveAddress }
+    if ($script:Standby.ContainsKey($serial)) { $candidates += $script:Standby[$serial] }
+    $candidates += @($script:Standby.Keys | Where-Object { $script:Standby[$_] -eq $serial })
+    foreach ($candidate in $candidates) {
+        $target = $script:Sessions[$candidate]
+        if (-not $target -or $target -eq $Session -or $target.UserClosed -or $target.LogCapture -or $script:ClosedSerials.ContainsKey($candidate)) { continue }
+        $capture.Serial = $candidate
+        $target.LogCapture = $capture
+        Write-Log "[$serial] Device logs continue over $candidate."
+        return
+    }
+    $key = if ($Session.MovedTo -and $Session.MoveAddress) { $Session.MoveAddress } else { $serial }
+    $capture.Serial = $key
+    $seconds = if ($Session.MovedTo) { 60 } else { 300 }
+    $script:LogHandovers[$key] = @{ Capture = $capture; Until = (Get-Date).AddSeconds($seconds) }
+    Write-Log "[$serial] Device logs wait up to $seconds seconds for $key."
+}
+
+function Update-DeviceLogs {
+    $now = Get-Date
+    foreach ($key in @($script:LogHandovers.Keys)) {
+        $entry = $script:LogHandovers[$key]
+        $session = $script:Sessions[$key]
+        if ($session -and -not $session.UserClosed -and -not $session.LogCapture) {
+            $script:LogHandovers.Remove($key)
+            $session.LogCapture = $entry.Capture
+            Write-Log "[$key] Device logs resumed."
+        } elseif ($now -ge $entry.Until -or $entry.Capture.Failed) {
+            $script:LogHandovers.Remove($key)
+            Write-Log "[$key] The device did not come back; saving its device logs."
+            Complete-DeviceLogs @($entry.Capture)
+        }
+    }
+    foreach ($session in @($script:Sessions.Values | Where-Object { $_.LogCapture })) {
+        $capture = $session.LogCapture
+        if ($capture.Failed) {
+            $session.LogCapture = $null
+            Complete-DeviceLogs @($capture) -Quiet
+            Show-Notification "Device logs of $($session.Title) stopped: $($capture.Error). The logs up to that point were saved in $($capture.Path)." 'Error'
+            continue
+        }
+        if (-not $script:Standby.ContainsKey($session.Serial)) { continue }
+        $active = $script:Sessions[$script:Standby[$session.Serial]]
+        if (-not $active -or $active.UserClosed -or $active.LogCapture) { continue }
+        $capture.Serial = $active.Serial
+        $active.LogCapture = $capture
+        $session.LogCapture = $null
+        Write-Log "[$($session.Serial)] Device logs continue over $($active.Serial)."
+    }
+}
+
+function Format-Elapsed([TimeSpan]$Span) {
+    if ($Span.Ticks -lt 0) { $Span = [TimeSpan]::Zero }
+    $hours = [long][Math]::Floor($Span.TotalHours)
+    '{0:00}:{1:00}:{2:00}' -f $hours, $Span.Minutes, $Span.Seconds
+}
+
+function Get-SessionLogText($Session) {
+    $capture = $Session.LogCapture
+    if (-not $capture) { return '' }
+    $text = 'Logging {0} - {1}' -f (Format-Elapsed ((Get-Date) - $capture.StartedAt)), (Format-ScreenBytes $capture.Size)
+    if ($capture.State -ne 'Logging') { $text += ' (waiting for device)' }
+    $text
+}
+
+function Start-VersionScan {
+    if ($script:VersionScan -or ((Get-Date) - $script:VersionScanAt).TotalSeconds -lt 30) { return }
+    $serials = [string[]]@($script:Sessions.Values | Where-Object { $_.LastState -eq 'device' -and -not $script:Standby.ContainsKey($_.Serial) } | ForEach-Object { $_.Serial })
+    if (-not $serials.Count) { return }
+    Initialize-LogcatCapture
+    $script:VersionScanAt = Get-Date
+    $script:VersionScan = [ScrcpyMonitor.LogcatCapture]::ScanVersionsAsync($script:Adb, $serials)
+}
+
+function Complete-VersionScan {
+    $task = $script:VersionScan
+    if (-not $task -or -not $task.IsCompleted) { return }
+    $script:VersionScan = $null
+    if ($task.IsFaulted) {
+        Write-Log "Reading PA and PIA versions failed: $($task.Exception.GetBaseException().Message)"
+        return
+    }
+    foreach ($pair in @($task.Result.GetEnumerator())) {
+        $text = [ScrcpyMonitor.LogcatCapture]::AppVersionText($pair.Value)
+        $old = if ($script:AppVersions.ContainsKey($pair.Key)) { [ScrcpyMonitor.LogcatCapture]::AppVersionText($script:AppVersions[$pair.Key]) } else { $null }
+        if ($text -ne $old) { Write-Log "[$($pair.Key)] App versions: $text" }
+        $script:AppVersions[$pair.Key] = $pair.Value
+        if ($script:Sessions.ContainsKey($pair.Key) -and $script:Sessions[$pair.Key].LogCapture) { $script:Sessions[$pair.Key].LogCapture.NoteVersions($pair.Value, $false) }
+    }
+}
+
+function Test-VersionMismatch([string]$Package) {
+    $found = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($session in @($script:Sessions.Values)) {
+        if ($session.LastState -ne 'device' -or $script:Standby.ContainsKey($session.Serial) -or -not $script:AppVersions.ContainsKey($session.Serial)) { continue }
+        $version = ''
+        if ($script:AppVersions[$session.Serial].TryGetValue($Package, [ref]$version) -and $version) { [void]$found.Add($version) }
+    }
+    $found.Count -gt 1
+}
+
+function Open-DeviceLogFolder {
+    [void](New-Item -ItemType Directory -Force -Path $script:DeviceLogDir)
+    Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$script:DeviceLogDir`""
+}
+
+function Open-DeviceLog($Sessions) {
+    foreach ($session in @($Sessions | Where-Object { $_ -and $_.LogCapture })) {
+        Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$($session.LogCapture.Path)`""
+    }
+}
+
+function Switch-DeviceLog($Sessions) {
+    $open = @($Sessions | Where-Object { $_ -and -not $_.UserClosed -and -not $script:Standby.ContainsKey($_.Serial) })
+    $toStart = @($open | Where-Object { -not $_.LogCapture })
+    if ($toStart.Count) { foreach ($session in $toStart) { Start-DeviceLog $session } }
+    else { Stop-DeviceLog $open }
 }
 
 function Invoke-Safely([scriptblock]$Action) {
@@ -2317,6 +5033,8 @@ function Stop-Monitor {
         Invoke-Safely { Stop-AdbJobs }
         foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-PowerWatch $session } }
         foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-Recording $session } }
+        Invoke-Safely { Stop-AllDeviceLogs }
+        Invoke-Safely { Close-ScreenRecorder }
         Invoke-Safely { Update-Stops 45000 }
         Invoke-Safely { Update-CombineHandovers -All }
         foreach ($session in @($script:Sessions.Values | Where-Object { $_.PendingAction })) {
@@ -2337,17 +5055,40 @@ function Stop-Monitor {
             }
         }
         Invoke-Safely { Update-Merges 600000 }
-        Invoke-Safely { Update-Combines 120000 }
+        if (-not $script:SessionEnding) { Invoke-Safely { Update-Combines 120000 } }
         Invoke-Safely { Stop-Combines }
-        Invoke-Safely { Update-Labels 120000 -Force }
+        if (-not $script:SessionEnding) { Invoke-Safely { Update-Labels 120000 -Force } }
         Invoke-Safely { Stop-Labels }
     } finally {
+        if ($script:ScreenKeys) { Invoke-Safely { $script:ScreenKeys.Dispose() } }
+        if ($script:MenuKey) { Invoke-Safely { $script:MenuKey.Dispose() } }
         if ($script:Tray) {
             $script:Tray.Visible = $false
             $script:Tray.Dispose()
         }
         if ($script:Panel) { $script:Panel.Dispose() }
         $script:AppContext.ExitThread()
+    }
+}
+
+function Save-RecordingsForSessionEnd([System.Windows.Forms.Form]$Form) {
+    $script:SessionEnding = $true
+    if (-not @($script:Sessions.Values | Where-Object { $_.Recording }).Count -and -not $script:Stops.Count -and -not $script:Merges.Count -and
+        -not $script:Combines.Count -and -not $script:CombineHandovers.Count -and -not $script:Labels.Count -and
+        -not ($script:ScreenRec -and $script:ScreenRec.Recording)) { return }
+    Write-Log 'Windows session is ending; saving recordings.'
+    $blocked = $false
+    try { $blocked = [ScrcpyMonitor.Window]::ShutdownBlockReasonCreate($Form.Handle, 'Saving screen recordings...') } catch { }
+    try {
+        foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-Recording $session } }
+        Invoke-Safely { Close-ScreenRecorder }
+        Invoke-Safely { Update-Stops 20000 }
+        Invoke-Safely { Update-CombineHandovers -All }
+        Invoke-Safely { Update-Merges 30000 }
+        Invoke-Safely { Stop-Combines }
+        Invoke-Safely { Stop-Labels }
+    } finally {
+        if ($blocked) { [void][ScrcpyMonitor.Window]::ShutdownBlockReasonDestroy($Form.Handle) }
     }
 }
 
@@ -2410,6 +5151,7 @@ function Close-Session($Session, [string]$Action) {
     $Session.UserClosed = $true
     $Session.PendingAction = $Action
     Stop-Recording $Session
+    if (-not $Session.MovedTo) { Stop-DeviceLog @($Session) }
     Stop-PowerWatch $Session
     if ($Session.Connector) {
         if (-not $Session.Connector.HasExited) { $Session.Connector.Kill() }
@@ -2489,6 +5231,7 @@ function Invoke-PendingAction($Session) {
 }
 
 function Remove-Session($Session) {
+    Move-DeviceLog $Session
     Close-Session $Session $null
     $script:Sessions.Remove($Session.Serial)
     [void]$script:RemovedSerials.Add($Session.Serial)
@@ -2501,6 +5244,7 @@ function Remove-Device($Session, [switch]$UserClosed) {
     if ($UserClosed) {
         $partners = @($script:Standby.Keys | Where-Object { $script:Standby[$_] -eq $serial }) + @($script:Standby[$serial] | Where-Object { $_ })
         foreach ($closed in @($serial) + $partners) { $script:ClosedSerials[$closed] = $false }
+        Stop-DeviceLog (@($Session) + @($partners | ForEach-Object { $script:Sessions[$_] }))
     }
     Remove-Session $Session
     foreach ($partner in $partners) {
@@ -2829,18 +5573,191 @@ function Set-AutoUpdateCheck([bool]$Enabled) {
 
 function Select-RecordFolder {
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $script:Prompts++
     try {
         $dialog.Description = 'Choose the folder where recordings are saved'
         if (Test-Path -LiteralPath $RecordDir) { $dialog.SelectedPath = $RecordDir }
         $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
-        if ($dialog.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        while ($true) {
+            if ($dialog.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $false }
+            $free = Get-DiskFreeBytes $dialog.SelectedPath
+            if ((Get-DiskLevel $free) -notin @('low', 'critical')) { break }
+            $answer = Show-Message "Only $(Format-ScreenBytes $free) is free on the drive of:`n$($dialog.SelectedPath)`n`nRecording needs at least 500 MB and stops automatically below that. Use this folder anyway?" 'YesNo' 'Warning'
+            if ($answer -eq 'Yes') { break }
+        }
         $script:RecordDir = $dialog.SelectedPath
     } finally {
+        $script:Prompts--
         $dialog.Dispose()
     }
     Set-Setting 'RecordDir' $RecordDir
     Write-Log "Recordings folder changed to $RecordDir"
     Update-Panel
+    $true
+}
+
+function Select-DeviceLogFolder {
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $script:Prompts++
+    try {
+        $dialog.Description = 'Choose the folder where device logs are saved'
+        if (Test-Path -LiteralPath $script:DeviceLogDir) { $dialog.SelectedPath = $script:DeviceLogDir }
+        $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
+        if ($dialog.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $false }
+        $script:DeviceLogDir = $dialog.SelectedPath
+    } finally {
+        $script:Prompts--
+        $dialog.Dispose()
+    }
+    Set-Setting 'DeviceLogDir' $script:DeviceLogDir
+    Write-Log "Device logs folder changed to $script:DeviceLogDir (used by device logs started from now on)"
+    Update-Panel
+    $true
+}
+
+function ConvertTo-LogApps($Value) {
+    $apps = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        foreach ($part in ([string]$item -split ',')) {
+            $app = $part.Trim()
+            if ($app) { [void]$apps.Add($app) }
+        }
+    }
+    , [string[]]@($apps)
+}
+
+function Get-LogAppChoices($Running, $Opened, $Installed, $Chosen) {
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $result = New-Object 'System.Collections.Generic.List[string]'
+    $all = @(@($Opened) + @($Running) + @($Installed) + @($Chosen))
+    foreach ($app in $script:PaPackage, $script:PiaPackage) {
+        if ($all -contains $app -and $seen.Add($app)) { $result.Add($app) }
+    }
+    foreach ($group in $Opened, $Running, $Installed, $Chosen) {
+        $items = [string[]]@($group | Where-Object { $_ })
+        [Array]::Sort($items, [StringComparer]::Ordinal)
+        foreach ($item in $items) { if ($seen.Add($item)) { $result.Add($item) } }
+    }
+    , $result.ToArray()
+}
+
+function Set-LogApps($Apps) {
+    $script:LogApps = ConvertTo-LogApps $Apps
+    $captures = @($script:Sessions.Values | ForEach-Object { $_.LogCapture }) + @($script:LogHandovers.Values | ForEach-Object { $_.Capture })
+    foreach ($capture in @($captures | Where-Object { $_ })) { $capture.SetApps($script:LogApps) }
+    Set-Setting 'LogApps' $script:LogApps
+    Write-Log "Apps for per-app logs: $(if ($script:LogApps.Count) { $script:LogApps -join ', ' } else { 'none' })"
+}
+
+function Select-LogApps {
+    if ($script:AppsScan) { return }
+    Initialize-LogcatCapture
+    $serials = [string[]]@($script:Sessions.Values | Where-Object { $_.LastState -eq 'device' -and -not $script:Standby.ContainsKey($_.Serial) } | ForEach-Object { $_.Serial })
+    $script:AppsScan = @{ Task = [ScrcpyMonitor.LogcatCapture]::ScanAppsAsync($script:Adb, $serials); Connected = $serials.Count -gt 0 }
+    [System.Windows.Forms.Application]::UseWaitCursor = $true
+}
+
+function Complete-LogAppsScan {
+    $scan = $script:AppsScan
+    if (-not $scan -or -not $scan.Task.IsCompleted -or $script:ConnectPrompting -or $script:DiskPrompting -or $script:Prompts -gt 0) { return }
+    if (@([System.Windows.Forms.Application]::OpenForms | Where-Object { $_.Modal }).Count) { return }
+    $script:AppsScan = $null
+    [System.Windows.Forms.Application]::UseWaitCursor = $false
+    $running = @()
+    $opened = @()
+    $installed = @()
+    if ($scan.Task.IsFaulted) {
+        Write-Log "Listing running apps failed: $($scan.Task.Exception.GetBaseException().Message)"
+    } else {
+        $running = @($scan.Task.Result.Running)
+        $opened = @($scan.Task.Result.Opened)
+        $installed = @($scan.Task.Result.Installed)
+    }
+    $script:ConnectPrompting = $true
+    try {
+        $chosen = Show-LogAppsDialog $running $opened $installed @($script:LogApps) $scan.Connected
+    } finally {
+        $script:ConnectPrompting = $false
+    }
+    if ($chosen) { Set-LogApps $chosen.Apps }
+}
+
+function Show-LogAppsDialog($Running, $Opened, $Installed, $Chosen, [bool]$Connected) {
+    $openSet = New-Object 'System.Collections.Generic.HashSet[string]' (, [string[]]@($Opened | Where-Object { $_ }))
+    $runningSet = New-Object 'System.Collections.Generic.HashSet[string]' (, [string[]]@($Running | Where-Object { $_ }))
+    $chosenSet = New-Object 'System.Collections.Generic.HashSet[string]' (, [string[]]@($Chosen | Where-Object { $_ }))
+    $apps = Get-LogAppChoices $Running $Opened $Installed $Chosen
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Apps for per-app logs'
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $false
+    $form.AutoSize = $true
+    $form.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $form.Padding = New-Object System.Windows.Forms.Padding(10)
+    if ($script:Icon) { $form.Icon = $script:Icon }
+    $layout = New-Object System.Windows.Forms.FlowLayoutPanel
+    $layout.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+    $layout.AutoSize = $true
+    $layout.WrapContents = $false
+    $form.Controls.Add($layout)
+    $label = New-Object System.Windows.Forms.Label
+    $label.AutoSize = $true
+    $label.MaximumSize = New-Object System.Drawing.Size(460, 0)
+    $label.Text = 'The full device log is always saved. Check the apps whose lines are also saved to their own file in a subfolder of the device log folder, like the Logcat package filter. PA and PIA are listed first, then the open, running and installed apps. Without a checked app, only the full device log is saved.'
+    if (-not $Connected) { $label.Text += "`n`nNo device is connected, so only the apps chosen before are listed." }
+    $layout.Controls.Add($label)
+    $list = New-Object System.Windows.Forms.CheckedListBox
+    $list.CheckOnClick = $true
+    $list.IntegralHeight = $false
+    $list.Size = New-Object System.Drawing.Size(460, 320)
+    foreach ($app in $apps) {
+        $tag = if ($app -eq $script:PaPackage) { ' (PA)' } elseif ($app -eq $script:PiaPackage) { ' (PIA)' } else { '' }
+        $suffix = if ($openSet.Contains($app)) { ' (open)' } elseif ($runningSet.Contains($app)) { '' } else { ' (not running)' }
+        [void]$list.Items.Add("$app$tag$suffix", $chosenSet.Contains($app))
+    }
+    $layout.Controls.Add($list)
+    $buttons = New-Object System.Windows.Forms.TableLayoutPanel
+    $buttons.ColumnCount = 4
+    $buttons.RowCount = 1
+    $buttons.Size = New-Object System.Drawing.Size(466, 32)
+    [void]$buttons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$buttons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$buttons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$buttons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    $clear = New-Object System.Windows.Forms.Button
+    $clear.Text = 'Clear all'
+    $clear.add_Click({ for ($i = 0; $i -lt $list.Items.Count; $i++) { $list.SetItemChecked($i, $false) } }.GetNewClosure())
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $buttons.Controls.Add($clear, 0, 0)
+    $buttons.Controls.Add($ok, 2, 0)
+    $buttons.Controls.Add($cancel, 3, 0)
+    $layout.Controls.Add($buttons)
+    $form.AcceptButton = $ok
+    $form.CancelButton = $cancel
+    try {
+        $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
+        if ($owner) {
+            $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+            $result = $form.ShowDialog($owner)
+        } else {
+            $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+            $form.TopMost = $true
+            $result = $form.ShowDialog()
+        }
+        $checked = [string[]]@(for ($i = 0; $i -lt $apps.Count; $i++) { if ($list.GetItemChecked($i)) { $apps[$i] } })
+    } finally {
+        $form.Dispose()
+    }
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    @{ Apps = $checked }
 }
 
 function Get-RepoUpdateConfig {
@@ -2919,8 +5836,13 @@ function Get-UpdateConfig {
 
 function Show-Message([string]$Text, [string]$Buttons = 'OK', [string]$Icon = 'Information') {
     $owner = if ($script:Panel -and $script:Panel.Visible) { $script:Panel } else { $null }
-    if ($owner) { return [System.Windows.Forms.MessageBox]::Show($owner, $Text, 'Scrcpy Monitor', $Buttons, $Icon) }
-    [System.Windows.Forms.MessageBox]::Show($Text, 'Scrcpy Monitor', $Buttons, $Icon)
+    $script:Prompts++
+    try {
+        if ($owner) { return [System.Windows.Forms.MessageBox]::Show($owner, $Text, 'Scrcpy Monitor', $Buttons, $Icon) }
+        [System.Windows.Forms.MessageBox]::Show($Text, 'Scrcpy Monitor', $Buttons, $Icon)
+    } finally {
+        $script:Prompts--
+    }
 }
 
 function Start-UpdateCheck([bool]$Manual) {
@@ -3065,7 +5987,7 @@ function Get-SessionStatus($Session) {
 
 function Get-SessionRecordingText($Session) {
     if (-not $Session.Recording) { return $(if ($Session.Stopping) { 'Saving...' } else { '' }) }
-    $text = 'REC {0:hh\:mm\:ss}' -f ((Get-Date) - $Session.RecordingStartedAt)
+    $text = 'REC {0}' -f (Format-Elapsed ((Get-Date) - $Session.RecordingStartedAt))
     if ($Session.CombineMember) { $text = "REC combined $($text.Substring(4))" }
     if ($Session.Stopping) { $text += ' (saving previous)' }
     elseif (-not $Session.Recorder) { $text += ' (waiting for device)' }
@@ -3086,6 +6008,9 @@ function Update-PanelButtons {
     $script:PanelToggle.Text = if ($toStart.Count -gt 0 -or $open.Count -eq 0) { 'Start recording' } else { 'Stop recording' }
     $script:PanelToggle.Enabled = $open.Count -gt 0
     $script:PanelCombine.Enabled = $open.Count -ge 2 -and -not @($open | Where-Object { $_.Recording -or $_.Stopping }).Count
+    $script:PanelLogs.Text = if (@($open | Where-Object { -not $_.LogCapture }).Count -gt 0 -or $open.Count -eq 0) { 'Start device logs' } else { 'Stop device logs' }
+    $script:PanelLogs.Enabled = $open.Count -gt 0
+    $script:PanelOpenDeviceLog.Enabled = @($selected | Where-Object { $_.LogCapture }).Count -gt 0
     $closed = @($selected | Where-Object { $_.UserClosed })
     $openText = if ($closed.Count -and -not @($closed | Where-Object { -not $_.Disconnected }).Count) { 'Reconnect' } else { 'Open window' }
     if ($script:PanelOpen.Text -ne $openText) { $script:PanelOpen.Text = $openText }
@@ -3100,6 +6025,8 @@ function Update-PanelButtons {
     $active = @(Get-TargetSessions @())
     $script:PanelStartAll.Enabled = @($active | Where-Object { -not $_.Recording }).Count -gt 0
     $script:PanelStopAll.Enabled = @($active | Where-Object { $_.Recording }).Count -gt 0
+    $script:PanelLogsStartAll.Enabled = @($active | Where-Object { -not $_.LogCapture }).Count -gt 0
+    $script:PanelLogsStopAll.Enabled = @($script:Sessions.Values | Where-Object { $_.LogCapture }).Count -gt 0 -or $script:LogHandovers.Count -gt 0
 }
 
 function Update-SortHeaders($List) {
@@ -3116,6 +6043,8 @@ function Update-Panel {
     $list = $script:PanelList
     $sortColumn = $list.ListViewItemSorter.Column
     $resort = $false
+    $paMismatch = Test-VersionMismatch $script:PaPackage
+    $piaMismatch = Test-VersionMismatch $script:PiaPackage
     $list.BeginUpdate()
     try {
         foreach ($session in @($script:Sessions.Values)) {
@@ -3125,10 +6054,11 @@ function Update-Panel {
                 [void]$item.SubItems.Add('')
                 [void]$item.SubItems.Add('')
                 [void]$item.SubItems.Add('')
+                [void]$item.SubItems.Add('')
             } else {
                 $item = $list.Items[$index]
             }
-            $texts = @($session.Title, $session.Connection, (Get-SessionStatus $session), (Get-SessionRecordingText $session))
+            $texts = @($session.Title, $session.Connection, (Get-SessionStatus $session), (Get-SessionRecordingText $session), (Get-SessionLogText $session))
             for ($i = 0; $i -lt $texts.Count; $i++) {
                 if ($item.SubItems[$i].Text -ne $texts[$i]) {
                     $item.SubItems[$i].Text = $texts[$i]
@@ -3142,7 +6072,19 @@ function Update-Panel {
     } finally {
         $list.EndUpdate()
     }
+    $free = Get-RecordFreeSpace
+    $level = Get-DiskLevel $free
     $status = "Recordings: $RecordDir"
+    if ($level -ne 'unknown') { $status += "  ($(Format-ScreenBytes $free) free$(if ($level -ne 'ok') { ' - low disk space' }))" }
+    $statusColor = if ($level -eq 'low' -or $level -eq 'critical') { [System.Drawing.Color]::Firebrick } else { [System.Drawing.SystemColors]::ControlText }
+    $mismatched = @()
+    if ($paMismatch) { $mismatched += 'PA' }
+    if ($piaMismatch) { $mismatched += 'PIA' }
+    if ($mismatched.Count) {
+        $status = "$($mismatched -join ' and ') version mismatch between devices  |  $status"
+        $statusColor = [System.Drawing.Color]::Firebrick
+    }
+    if ($script:PanelStatus.ForeColor -ne $statusColor) { $script:PanelStatus.ForeColor = $statusColor }
     $connecting = @($script:Connects | Where-Object { $_.Manual } | ForEach-Object { $_.Address })
     if ($connecting.Count) { $status = "Connecting to $($connecting -join ', ')...  $status" }
     if ($script:Merges.Count -gt 0) { $status = "Joining $($script:Merges.Count) recording(s)...  $status" }
@@ -3165,6 +6107,63 @@ function Show-Panel {
     }
     $script:Panel.Activate()
     Update-Panel
+}
+
+function New-MenuHotKey {
+    if (-not ('ScrcpyMonitor.MenuHotKey' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+namespace ScrcpyMonitor {
+    using System;
+    using System.Runtime.InteropServices;
+    using System.Windows.Forms;
+
+    public class MenuHotKey : NativeWindow, IDisposable {
+        [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint key);
+        [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        public event EventHandler Pressed;
+        public bool Registered { get; private set; }
+
+        public MenuHotKey() {
+            var parameters = new CreateParams();
+            parameters.Parent = new IntPtr(-3);
+            CreateHandle(parameters);
+            Registered = RegisterHotKey(Handle, 1, 0x4003, 0x4D);
+        }
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x312) {
+                var handler = Pressed;
+                if (handler != null) handler(this, EventArgs.Empty);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        public void Dispose() {
+            if (Registered) UnregisterHotKey(Handle, 1);
+            Registered = false;
+            DestroyHandle();
+        }
+    }
+}
+'@
+    }
+    $key = New-Object ScrcpyMonitor.MenuHotKey
+    if (-not $key.Registered) {
+        $key.Dispose()
+        Write-Log 'Could not register Ctrl+Alt+M to show the tray menu; another application may be using it.'
+        return $null
+    }
+    $key.add_Pressed({ Invoke-Safely { Show-TrayMenu } })
+    return $key
+}
+
+function Show-TrayMenu {
+    if (-not $script:Tray) { Show-Panel; return }
+    $method = [System.Windows.Forms.NotifyIcon].GetMethod('ShowContextMenu', [System.Reflection.BindingFlags]'Instance, NonPublic')
+    if ($method) { [void]$method.Invoke($script:Tray, $null) }
+    else { $script:Tray.ContextMenuStrip.Show([System.Windows.Forms.Cursor]::Position) }
 }
 
 function New-PanelButton([System.Windows.Forms.Control]$Parent, [string]$Text, [scriptblock]$OnClick) {
@@ -3192,10 +6191,20 @@ function New-PanelMenuItem([System.Windows.Forms.ToolStripMenuItem]$Parent, [str
 }
 
 function New-Panel {
-    Add-Type -Namespace ScrcpyMonitor -Name Window -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
+    Add-Type -Namespace ScrcpyMonitor -Name Window -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool ShutdownBlockReasonCreate(System.IntPtr hWnd, string reason);
+[DllImport("user32.dll")] public static extern bool ShutdownBlockReasonDestroy(System.IntPtr hWnd);
+[DllImport("kernel32.dll")] public static extern bool SetProcessShutdownParameters(uint level, uint flags);
+[DllImport("kernel32.dll")] public static extern bool FreeConsole();
+[DllImport("kernel32.dll")] public static extern bool AttachConsole(uint processId);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(System.IntPtr handler, bool add);
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);
+'@
+    [void][ScrcpyMonitor.Window]::SetProcessShutdownParameters(0x3FF, 0)
     $form = New-Object System.Windows.Forms.Form
     $form.Text = if ($script:UpdateConfig) { "Scrcpy Monitor $($script:UpdateConfig.Display)" } else { 'Scrcpy Monitor' }
-    $form.Size = New-Object System.Drawing.Size(720, 380)
+    $form.Size = New-Object System.Drawing.Size(950, 380)
     $form.MinimumSize = New-Object System.Drawing.Size(560, 260)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     if ($script:Icon) { $form.Icon = $script:Icon }
@@ -3240,6 +6249,7 @@ namespace ScrcpyMonitor {
     [void]$list.Columns.Add('Connection', 85)
     [void]$list.Columns.Add('Status', 170)
     [void]$list.Columns.Add('Recording', 165)
+    [void]$list.Columns.Add('Device logs', 230)
     foreach ($column in $list.Columns) { $column.Tag = $column.Text }
     Update-SortHeaders $list
     $list.add_SelectedIndexChanged({ Invoke-Safely { Update-PanelButtons } })
@@ -3259,9 +6269,12 @@ namespace ScrcpyMonitor {
 
     $statusStrip = New-Object System.Windows.Forms.StatusStrip
     $statusStrip.SizingGrip = $false
+    $statusStrip.ShowItemToolTips = $true
     $status = New-Object System.Windows.Forms.ToolStripStatusLabel
     $status.Spring = $true
     $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $status.ToolTipText = 'Click to change the recordings folder'
+    $status.add_Click({ Invoke-Safely { [void](Select-RecordFolder) } })
     [void]$statusStrip.Items.Add($status)
     $scan = New-Object System.Windows.Forms.ToolStripStatusLabel
     $scan.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
@@ -3274,12 +6287,13 @@ namespace ScrcpyMonitor {
     $script:PanelToggle = New-PanelButton $deviceButtons 'Start recording' {
         $selected = Get-SelectedSessions | Where-Object { -not $_.UserClosed }
         $toStart = @($selected | Where-Object { -not $_.Recording })
-        if ($toStart.Count -gt 0) { foreach ($s in $toStart) { Start-Recording $s } }
+        if ($toStart.Count -gt 0) { if (Confirm-RecordSpace) { foreach ($s in $toStart) { Start-Recording $s } } }
         else { foreach ($s in $selected) { Stop-Recording $s } }
     }
     $script:PanelCombine = New-PanelButton $deviceButtons 'Record combined' {
-        Start-CombinedRecording @(Get-SelectedSessions | Where-Object { -not $_.UserClosed -and -not $script:Standby.ContainsKey($_.Serial) })
+        if (Confirm-RecordSpace) { Start-CombinedRecording @(Get-SelectedSessions | Where-Object { -not $_.UserClosed -and -not $script:Standby.ContainsKey($_.Serial) }) }
     }
+    $script:PanelLogs = New-PanelButton $deviceButtons 'Start device logs' { Switch-DeviceLog @(Get-SelectedSessions) }
     $script:PanelOpen = New-PanelButton $deviceButtons 'Open window' { Open-Window @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
     $script:PanelClose = New-PanelButton $deviceButtons 'Stop and close' { Close-Device @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
     $script:PanelDisconnect = New-PanelButton $deviceButtons 'Disconnect' { Disconnect-Device @(Get-SelectedSessions | ForEach-Object { $_.Serial }) }
@@ -3290,17 +6304,29 @@ namespace ScrcpyMonitor {
 
     $fileMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&File'
     $recordingMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Recording'
+    $logsMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Logs'
     $helpMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Help'
     $windowMenu = New-Object System.Windows.Forms.ToolStripMenuItem '&Window'
-    [void]$menuBar.Items.AddRange([System.Windows.Forms.ToolStripItem[]]@($fileMenu, $recordingMenu, $windowMenu, $helpMenu))
+    [void]$menuBar.Items.AddRange([System.Windows.Forms.ToolStripItem[]]@($fileMenu, $recordingMenu, $logsMenu, $windowMenu, $helpMenu))
+    $script:PanelLogsStartAll = New-PanelMenuItem $logsMenu 'Start device logs on all devices' { foreach ($s in (Get-TargetSessions @())) { Start-DeviceLog $s } }
+    $script:PanelLogsStopAll = New-PanelMenuItem $logsMenu 'Stop device logs on all devices' { Stop-AllLogs @() }
+    [void]$logsMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $script:PanelOpenDeviceLog = New-PanelMenuItem $logsMenu 'Open device log of selected device' { Open-DeviceLog @(Get-SelectedSessions) }
+    [void](New-PanelMenuItem $logsMenu 'Open device logs folder' { Open-DeviceLogFolder })
+    [void](New-PanelMenuItem $logsMenu 'Change device logs folder...' { [void](Select-DeviceLogFolder) })
+    [void](New-PanelMenuItem $logsMenu 'Choose apps for per-app logs...' { Select-LogApps })
     [void](New-PanelMenuItem $windowMenu 'Arrange windows' { Invoke-ArrangeWindows })
+    $script:PanelTrayMenuItem = New-PanelMenuItem $windowMenu 'Show tray menu' { [void]$script:Panel.BeginInvoke([System.Windows.Forms.MethodInvoker]{ Invoke-Safely { Show-TrayMenu } }) }
+    $script:PanelTrayMenuItem.Visible = $false
     [void](New-PanelMenuItem $fileMenu 'Open recordings folder' { Open-RecordFolder })
-    [void](New-PanelMenuItem $fileMenu 'Change recordings folder...' { Select-RecordFolder })
+    [void](New-PanelMenuItem $fileMenu 'Change recordings folder...' { [void](Select-RecordFolder) })
     [void](New-PanelMenuItem $fileMenu 'Open log' { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$script:LogPath`"" })
     [void]$fileMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void](New-PanelMenuItem $fileMenu 'Exit' { $script:ExitRequested = $true })
-    $script:PanelStartAll = New-PanelMenuItem $recordingMenu 'Start all' { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } }
+    $script:PanelStartAll = New-PanelMenuItem $recordingMenu 'Start all' { if (Confirm-RecordSpace) { foreach ($s in (Get-TargetSessions @())) { Start-Recording $s } } }
     $script:PanelStopAll = New-PanelMenuItem $recordingMenu 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } }
+    [void]$recordingMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void](Add-ScreenRecordMenu $recordingMenu.DropDownItems)
     [void](New-PanelMenuItem $helpMenu 'User guide' { Show-Guide })
     [void]$helpMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     if ($script:UpdateConfig) {
@@ -3317,6 +6343,11 @@ namespace ScrcpyMonitor {
     $form.add_FormClosing({
         param($sender, $e)
         if ($script:Exiting) { return }
+        if ($e.CloseReason -eq [System.Windows.Forms.CloseReason]::WindowsShutDown) {
+            Invoke-Safely { Save-RecordingsForSessionEnd $sender }
+            $script:ExitRequested = $true
+            return
+        }
         $e.Cancel = $true
         $script:ExitRequested = $true
     })
@@ -3371,6 +6402,17 @@ if (-not $RecordDir) {
         $RecordDir = if ($portable) { Join-Path ([Environment]::GetFolderPath('MyVideos')) 'scrcpy Recordings' } else { 'D:\Charles Manalo\Recordings' }
     }
 }
+$script:DeviceLogDir = [string](Get-Setting 'DeviceLogDir')
+if (-not $script:DeviceLogDir) {
+    $script:DeviceLogDir = if ($portable) { Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'scrcpy Logs' } else { 'D:\Charles Manalo\Logs' }
+}
+$script:LogApps = ConvertTo-LogApps (Get-Setting 'LogApps')
+$script:AppsScan = $null
+$script:PaPackage = 'com.global.wwca'
+$script:PiaPackage = 'com.global.integrated'
+$script:AppVersions = @{}
+$script:VersionScan = $null
+$script:VersionScanAt = [datetime]::MinValue
 
 [void](Invoke-Hidden $script:Adb @('start-server') 15000)
 
@@ -3388,7 +6430,7 @@ $createdMutex = $false
 $script:Mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdMutex)
 if (-not $createdMutex) {
     if ($NoPanel) {
-        Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording, ShowPanel or Exit to control it.'
+        Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording, StartLogs, StopLogs, ShowPanel or Exit to control it.'
         exit 1
     }
     $request = Send-MonitorRequest 'OpenWindows' @()
@@ -3414,6 +6456,21 @@ $script:CombineHandovers = New-Object System.Collections.ArrayList
 $script:CombineEncoderArgs = $null
 $script:FpsPassthroughArgs = $null
 $script:Stops = New-Object System.Collections.ArrayList
+$script:LogHandovers = @{}
+$script:ScreenRec = $null
+$script:ScreenKeys = $null
+$script:ScreenTimer = $null
+$script:ScreenDda = $null
+$script:DiskLow = 2GB
+$script:DiskCritical = 500MB
+$script:DiskFree = -1L
+$script:DiskCheckedDir = $null
+$script:DiskNextCheck = [datetime]::MinValue
+$script:DiskWarned = $false
+$script:DiskPrompting = $false
+$script:DiskConfirmedAt = [datetime]::MinValue
+$script:DiskRefusedAt = [datetime]::MinValue
+$script:Fso = $null
 $script:Connects = New-Object System.Collections.ArrayList
 $script:ConnectFailures = New-Object System.Collections.ArrayList
 $script:ConnectPrompting = $false
@@ -3439,6 +6496,7 @@ $script:Standby = @{}
 $script:WifiSerials = @{}
 $script:Exiting = $false
 $script:ExitRequested = $false
+$script:SessionEnding = $false
 $script:ArrangeRequestedAt = $null
 $script:ArrangeFollowUp = $false
 $script:ArrangeArea = $null
@@ -3473,10 +6531,19 @@ if (-not $NoTray) {
     $script:Tray = New-Object System.Windows.Forms.NotifyIcon
     $script:Tray.Icon = if ($script:Icon) { $script:Icon } else { [System.Drawing.SystemIcons]::Application }
     $script:Tray.ContextMenuStrip = New-Object System.Windows.Forms.ContextMenuStrip
-    $script:Tray.ContextMenuStrip.add_Opening({ Invoke-Safely { Update-TrayMenu } })
+    $script:Tray.ContextMenuStrip.add_Opening({ param($sender, $e) Invoke-Safely { Update-TrayMenu }; $e.Cancel = $sender.Items.Count -eq 0 })
     $script:Tray.add_DoubleClick({ Invoke-Safely { if ($script:Panel) { Show-Panel } else { Open-RecordFolder } } })
     $script:Tray.Text = 'Scrcpy Monitor'
     $script:Tray.Visible = $true
+}
+
+$script:MenuKey = $null
+if ($script:Tray -or $script:Panel) {
+    try { $script:MenuKey = New-MenuHotKey } catch { Write-Log "Could not set up Ctrl+Alt+M to show the tray menu: $($_.Exception.Message)" }
+}
+if ($script:Panel -and $script:Tray) {
+    if ($script:MenuKey) { $script:PanelTrayMenuItem.ShortcutKeyDisplayString = 'Ctrl+Alt+M' }
+    $script:PanelTrayMenuItem.Visible = $true
 }
 
 $script:AppContext = New-Object System.Windows.Forms.ApplicationContext
@@ -3499,9 +6566,13 @@ $script:FastTimer.add_Tick({
     if ($script:Exiting) { $script:FastTimer.Stop(); return }
     if ($script:ExitRequested) { Invoke-Safely { Stop-Monitor }; return }
     Invoke-Safely { Invoke-ControlRequests }
+    Invoke-Safely { Update-DiskSpace }
     Invoke-Safely { Update-Stops }
     Invoke-Safely { Update-PartStarts }
     Invoke-Safely { Complete-UpdateCheck }
+    Invoke-Safely { Complete-LogAppsScan }
+    Invoke-Safely { Complete-VersionScan }
+    Invoke-Safely { Start-VersionScan }
     Invoke-Safely { Update-UpdaterState }
     Invoke-Safely { Show-ConnectFailures }
     $script:FastTimerTicks++

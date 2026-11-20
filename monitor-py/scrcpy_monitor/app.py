@@ -13,7 +13,7 @@ from .system import (FROZEN, IS_LINUX, IS_MAC, IS_WINDOWS, Paths, bin_dirs, find
                      find_resource, find_server, find_tool, get_setting, log, run_hidden, set_log_path)
 
 COMMANDS = {'exit': 'exit', 'showpanel': 'show-panel', 'startrecording': 'start-recording',
-            'stoprecording': 'stop-recording'}
+            'stoprecording': 'stop-recording', 'startlogs': 'start-logs', 'stoplogs': 'stop-logs'}
 
 
 def server_name():
@@ -42,8 +42,8 @@ def parse_args(argv):
     parser.add_argument('--record-encoder', default='auto', help='video encoder for recordings (default: auto)')
     parser.add_argument('--record-arg', action='append', default=[], help='extra scrcpy argument for recordings')
     parser.add_argument('--keep-parts', action='store_true', help='keep the recording parts after joining them')
-    parser.add_argument('--command', help='send a command to the running monitor: '
-                                          'start-recording, stop-recording, show-panel or exit')
+    parser.add_argument('--command', help='send a command to the running monitor: start-recording, '
+                                          'stop-recording, start-logs, stop-logs, show-panel or exit')
     parser.add_argument('--list', action='store_true', help='list the connected devices and exit')
     parser.add_argument('--no-tray', action='store_true', help='do not show the tray icon')
     parser.add_argument('--no-panel', action='store_true', help='do not create the control panel')
@@ -157,8 +157,18 @@ def main(argv=None):
 
     app = None
     if not args.list:
+        from PySide6.QtCore import QEvent
         from PySide6.QtWidgets import QApplication
-        app = QApplication(sys.argv[:1])
+
+        class MonitorApplication(QApplication):
+            quit_handler = None
+
+            def event(self, event):
+                if event.type() == QEvent.Type.Quit and self.quit_handler and self.quit_handler(event.ignore):
+                    return True
+                return super().event(event)
+
+        app = MonitorApplication(sys.argv[:1])
         app.setApplicationName('Scrcpy Monitor')
         app.setQuitOnLastWindowClosed(False)
 
@@ -196,7 +206,7 @@ def main(argv=None):
     if send_request('ping', reply_timeout=2000) is not None:
         if args.no_panel:
             return fail('scrcpy monitor is already running. Use --command start-recording, stop-recording, '
-                        'show-panel or exit to control it.')
+                        'start-logs, stop-logs, show-panel or exit to control it.')
         reply = send_request('open-windows')
         if reply != 'exiting':
             return 0
@@ -215,6 +225,8 @@ def main(argv=None):
     if not record_dir:
         record_dir = get_setting(paths.settings, 'RecordDir')
     record_dir = str(Path(record_dir or paths.default_record_dir).expanduser())
+    device_log_dir = str(Path(get_setting(paths.settings, 'DeviceLogDir') or paths.default_log_dir).expanduser())
+    log_apps = logic.parse_log_apps(get_setting(paths.settings, 'LogApps'))
 
     for item in paths.control.glob('*'):
         try:
@@ -223,6 +235,7 @@ def main(argv=None):
             pass
 
     options = Options(serials=args.serials, record=args.record, record_dir=record_dir,
+                      device_log_dir=device_log_dir, log_apps=log_apps,
                       record_encoder=args.record_encoder, record_args=args.record_arg, keep_parts=args.keep_parts,
                       no_discovery=args.no_discovery, scrcpy_args=args.scrcpy_args, port_base=args.port_base,
                       poll_seconds=args.poll_seconds)
@@ -268,12 +281,15 @@ def main(argv=None):
     server_socket.newConnection.connect(on_connection)
 
     if not IS_WINDOWS:
-        signal.signal(signal.SIGTERM, lambda *_: controller.request_exit())
+        signal.signal(signal.SIGTERM, lambda *_: controller.terminate())
     signal.signal(signal.SIGINT, lambda *_: controller.request_exit())
+    app.quit_handler = controller.system_quit
+    if not IS_LINUX:
+        app.commitDataRequest.connect(lambda manager: controller.system_quit(manager.cancel))
 
     devices = ', '.join(args.serials) if args.serials else 'all connected'
     log(f'Monitor started (scrcpy: {scrcpy}, adb: {adb}, devices: {devices}, recordings: {record_dir}, '
-        f'version: {version.version})')
+        f'device logs: {device_log_dir}, version: {version.version})')
     engine.start()
     controller.start()
     try:
