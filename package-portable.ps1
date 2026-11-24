@@ -227,6 +227,17 @@ SCREEN RECORDING
     <Recordings folder>\Screen Recordings\Screen_Capture_<yyyyMMdd_HHmmss>.mp4
     <Recordings folder>\Screen Recordings\Screenshot_<yyyyMMdd_HHmmss_fff>.png
 
+SNIP
+  Print Screen, Recording > "Snip" in the control panel, "Snip" in the tray menu or -Command Snip works
+  like the Snipping Tool: the screen freezes; drag to snip an area, or use the toolbar at the top for
+  Window, Screen or All screens (Esc cancels). The snip is copied to the clipboard and opened in a markup
+  editor: Pen (P), Highlighter (H), Rectangle (R), Arrow (A), Eraser (E), Crop (X), Undo (Ctrl+Z), Redo
+  (Ctrl+Y), Copy (Ctrl+C), Save (Ctrl+S), Save as (Ctrl+Shift+S, PNG or JPEG) and New snip (Ctrl+N).
+  The Snip menu chooses PNG or JPEG, turns the markup editor and the Print Screen key on or off and opens
+  the snips folder. If Windows still opens its own Snipping Tool, turn off Settings > Accessibility >
+  Keyboard > "Use the Print screen key to open screen capture". Snips are saved as:
+    <Recordings folder>\Screenshots\Snip_<yyyyMMdd_HHmmss_fff>.png
+
 DISK SPACE
   Recordings have no time limit; they run until you stop them or the disk is almost full. The control
   panel status bar shows the free space of the recordings folder, and turns red below 2 GB. Click it to

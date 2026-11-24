@@ -971,6 +971,60 @@ class SessionEndTest(unittest.TestCase):
         self.assertEqual(quit(True, False, finishing=True), (False, []))
         self.assertEqual(quit(False, True, session_ended=True), (False, []))
 
+    def test_snip_file_names_and_status(self):
+        moment = datetime(2026, 10, 9, 8, 5, 3, 45678)
+        self.assertEqual(logic.snip_file_name(moment, 'png'), 'Snip_20261009_080503_045.png')
+        self.assertEqual(logic.snip_file_name(moment, 'jpg'), 'Snip_20261009_080503_045.jpg')
+        self.assertEqual(logic.snip_format('bmp'), 'png')
+        self.assertEqual(logic.snip_status('a.png', True, True), 'Copied to the clipboard and saved: a.png')
+        self.assertEqual(logic.snip_status('a.png', True, False), 'Saved: a.png (could not copy to the clipboard)')
+        self.assertEqual(logic.snip_status('a.png', False, True), 'Copied to the clipboard (could not save the file)')
+        self.assertEqual(logic.snip_status('a.png', False, False), 'Could not copy or save the snip')
+        self.assertEqual(logic.snip_save_path('/x/a', True), '/x/a.jpg')
+        self.assertEqual(logic.snip_save_path('/x/a', False), '/x/a.png')
+        self.assertEqual(logic.snip_save_path('/x/a.JPEG', False), '/x/a.JPEG')
+        self.assertTrue(logic.is_jpeg('a.JPG'))
+        self.assertFalse(logic.is_jpeg('a.png'))
+
+    def test_snip_targets_prefer_topmost_window_then_screen(self):
+        windows = [(10, 10, 100, 100), (0, 0, 500, 500)]
+        screens = [(0, 0, 1920, 1080), (1920, 0, 1280, 1024)]
+        self.assertEqual(logic.snip_target(windows, screens, 50, 50), (10, 10, 100, 100))
+        self.assertEqual(logic.snip_target(windows, screens, 300, 300), (0, 0, 500, 500))
+        self.assertEqual(logic.snip_target(windows, screens, 2000, 10), (1920, 0, 1280, 1024))
+        self.assertIsNone(logic.snip_target(windows, screens, 2000, 1050))
+        self.assertEqual(logic.snip_window_rects([(-50, 10, 100, 100), (5000, 0, 10, 10), None, (0, 0, 0, 5)],
+                                                 (0, 0, 3200, 1080)), [(0, 10, 50, 100)])
+
+    def test_snip_native_rects_scale_per_display(self):
+        displays = [((0, 0, 3840, 2160), 2.0), ((1920, 0, 1280, 1024), 1.0)]
+        self.assertEqual(logic.snip_native_to_logical((200, 100, 800, 600), displays), (100, 50, 400, 300))
+        self.assertEqual(logic.snip_native_to_logical((5000, 100, 100, 100), displays), (5000, 100, 100, 100))
+
+    def test_snip_editor_geometry(self):
+        self.assertEqual(logic.fit_zoom(1016, 516, 2000, 1000), 0.5)
+        self.assertEqual(logic.fit_zoom(4000, 4000, 100, 100), 1.0)
+        self.assertEqual(logic.fit_zoom(0, 100, 100, 100), 1.0)
+        self.assertAlmostEqual(logic.segment_distance((5, 5), (0, 0), (10, 0)), 5.0)
+        self.assertAlmostEqual(logic.segment_distance((-3, 4), (0, 0), (10, 0)), 5.0)
+        self.assertTrue(logic.shape_hit('pen', [(0, 0), (10, 0)], 4, (5, 3), 2))
+        self.assertFalse(logic.shape_hit('pen', [(0, 0), (10, 0)], 4, (5, 6), 2))
+        self.assertTrue(logic.shape_hit('rect', [(0, 0), (20, 20)], 2, (20, 10), 1))
+        self.assertFalse(logic.shape_hit('rect', [(0, 0), (20, 20)], 2, (10, 10), 1))
+        self.assertTrue(logic.shape_hit('pen', [(3, 3)], 4, (4, 4), 1))
+        self.assertIsNone(logic.arrow_geometry((0, 0), (0.5, 0), 4))
+        shaft, head = logic.arrow_geometry((0, 0), (100, 0), 4)
+        self.assertEqual(head[0], (100, 0))
+        self.assertAlmostEqual(shaft[0], 100 - 16 * 0.7)
+        self.assertIsNone(logic.arrow_geometry((0, 0), (10, 0), 4)[0])
+
+    def test_snip_crop_area(self):
+        self.assertEqual(logic.crop_area((50.4, 80), (10, 20.2), 100, 100), (10, 20, 40, 60))
+        self.assertEqual(logic.crop_area((-10, -10), (50, 50), 100, 100), (0, 0, 50, 50))
+        self.assertIsNone(logic.crop_area((0, 0), (3, 50), 100, 100))
+        self.assertIsNone(logic.crop_area((-5, -5), (200, 200), 100, 100))
+        self.assertIsNone(logic.crop_area((150, 150), (200, 200), 100, 100))
+
 
 if __name__ == '__main__':
     unittest.main()

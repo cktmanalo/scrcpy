@@ -24,7 +24,7 @@ Options:
 | `--record`, `--record-dir`, `--record-encoder`, `--record-arg`, `--keep-parts` | Recording options. `--record` starts recording every device right away. |
 | `--port-base N` | First local port for scrcpy sessions. Each session uses a block of 4 ports: the window uses `N:N+1` and the recorder `N+2:N+3`. |
 | `--poll-seconds`, `--no-discovery`, `--no-update-check`, `--no-tray`, `--no-panel`, `--list` | See `--help`. |
-| `--command start-recording\|stop-recording\|start-logs\|stop-logs\|show-panel\|exit` | Sends a command to the running instance. |
+| `--command start-recording\|stop-recording\|start-logs\|stop-logs\|show-panel\|snip\|exit` | Sends a command to the running instance. |
 
 Options the monitor does not recognize, and everything after `--`, are passed to scrcpy.
 
@@ -34,7 +34,7 @@ When you log out or shut down (macOS, Linux desktops with session management, or
 
 ## Control panel and device list
 
-Global actions are in the panel's menu bar: **File** (Open recordings folder, Change recordings folder, Open log, Exit), **Recording** (Start all, Stop all, Screen recording), **Logs** (Start or stop device logs on all devices, Open device log of selected device, Open device logs folder, Change device logs folder, Choose apps for per-app logs), **Window** (Arrange windows, Show tray menu) and **Help** (User guide, Check for updates, Check for updates automatically, About). **Help > User guide** shows the how-to guide for the current OS inside the app (`scrcpy-monitor-guide.html` on Windows, `scrcpy-monitor-guide-macos-linux.html` on macOS and Linux, bundled with the packaged app). On macOS these menus appear in the top screen menu bar, and Qt moves About and Exit (as Quit) into the application menu. Click a column header to sort the list.
+Global actions are in the panel's menu bar: **File** (Open recordings folder, Change recordings folder, Open log, Exit), **Recording** (Start all, Stop all, Screen recording, Snip), **Logs** (Start or stop device logs on all devices, Open device log of selected device, Open device logs folder, Change device logs folder, Choose apps for per-app logs), **Window** (Arrange windows, Show tray menu) and **Help** (User guide, Check for updates, Check for updates automatically, About). **Help > User guide** shows the how-to guide for the current OS inside the app (`scrcpy-monitor-guide.html` on Windows, `scrcpy-monitor-guide-macos-linux.html` on macOS and Linux, bundled with the packaged app). On macOS these menus appear in the top screen menu bar, and Qt moves About and Exit (as Quit) into the application menu. Click a column header to sort the list.
 
 **Ctrl+Alt+M** (Control+Option+M on macOS) opens the tray menu at the mouse pointer from any application, the same as **Window > Show tray menu**. On Linux it is grabbed with `XGrabKey` on an X11 session; on macOS it uses Carbon `RegisterEventHotKey`. If another application already uses the combination, the log says so and the Window item still works. The Python build on Windows has only the Window item.
 
@@ -98,6 +98,21 @@ Capture works differently on each platform:
 - **Linux:** ffmpeg `x11grab`, on an X11 session only. While the toolbar would be in the recorded area (full screen, window and mouse modes), it is hidden during the recording; use F12 or the menu to stop. The hotkeys are grabbed with `XGrabKey`.
 - **macOS:** ffmpeg `avfoundation`. Allow Scrcpy Monitor in **System Settings > Privacy & Security > Screen Recording**. As on Linux, the toolbar is hidden during the recording while it would be in the recorded area; use F12 or the menu to stop. The hotkeys use Carbon `RegisterEventHotKey`, and on some keyboards they need Fn.
 - **Windows:** ffmpeg `gdigrab`. The frame and toolbar are excluded from capture. The PowerShell monitor also supports this feature, and uses `ddagrab` when it is available.
+
+## Snip
+
+**Recording > Snip** in the panel, **Snip** in the tray menu, `--command snip`, or the snip key (**Print Screen** on Linux, **Control+Option+S** on macOS) works like the Windows Snipping Tool. It does not need ffmpeg.
+
+- The screen freezes and you drag to snip an area. The toolbar at the top switches to **Window** (click a window), **Screen** (click a screen) or **All screens**. Esc or a right-click cancels.
+- The snip is copied to the clipboard and saved as `Screenshots/Snip_<yyyyMMdd_HHmmss_fff>.png` (or `.jpg`) under the recordings folder.
+- The markup editor then opens with Pen (P), Highlighter (H), Rectangle (R), Arrow (A), Eraser (E) and Crop (X), a color and a width, Undo (Ctrl+Z), Redo (Ctrl+Y), Fit to window (Ctrl+0), Copy (Ctrl+C), Save (Ctrl+S), Save as (Ctrl+Shift+S, PNG or JPEG) and New snip (Ctrl+N). On macOS these use Command.
+- The Snip menu chooses PNG or JPEG, turns the markup editor on or off (when it is off, a notification shows the file name), turns the snip key on or off and opens the snips folder.
+
+Capture works differently on each platform:
+
+- **Linux:** an X11 session only (not native Wayland). Print Screen is grabbed with `XGrabKey`; if the desktop already owns it, the log says so and the menu still works. **Use Print Screen to snip** is then unchecked; turn off the desktop's own Print Screen shortcut and choose it to try again.
+- **macOS:** allow Scrcpy Monitor in **System Settings > Privacy & Security > Screen Recording**. The key uses Carbon `RegisterEventHotKey`.
+- **Windows:** the PowerShell monitor has the same feature and opens it with Print Screen instead of the Windows Snipping Tool.
 
 ## Tool lookup
 

@@ -13,7 +13,7 @@ from .system import (FROZEN, IS_LINUX, IS_MAC, IS_WINDOWS, Paths, bin_dirs, find
                      find_resource, find_server, find_tool, get_setting, log, run_hidden, set_log_path)
 
 COMMANDS = {'exit': 'exit', 'showpanel': 'show-panel', 'startrecording': 'start-recording',
-            'stoprecording': 'stop-recording', 'startlogs': 'start-logs', 'stoplogs': 'stop-logs'}
+            'stoprecording': 'stop-recording', 'startlogs': 'start-logs', 'stoplogs': 'stop-logs', 'snip': 'snip'}
 
 
 def server_name():
@@ -43,7 +43,7 @@ def parse_args(argv):
     parser.add_argument('--record-arg', action='append', default=[], help='extra scrcpy argument for recordings')
     parser.add_argument('--keep-parts', action='store_true', help='keep the recording parts after joining them')
     parser.add_argument('--command', help='send a command to the running monitor: start-recording, '
-                                          'stop-recording, start-logs, stop-logs, show-panel or exit')
+                                          'stop-recording, start-logs, stop-logs, show-panel, snip or exit')
     parser.add_argument('--list', action='store_true', help='list the connected devices and exit')
     parser.add_argument('--no-tray', action='store_true', help='do not show the tray icon')
     parser.add_argument('--no-panel', action='store_true', help='do not create the control panel')
@@ -206,7 +206,7 @@ def main(argv=None):
     if send_request('ping', reply_timeout=2000) is not None:
         if args.no_panel:
             return fail('scrcpy monitor is already running. Use --command start-recording, stop-recording, '
-                        'start-logs, stop-logs, show-panel or exit to control it.')
+                        'start-logs, stop-logs, show-panel, snip or exit to control it.')
         reply = send_request('open-windows')
         if reply != 'exiting':
             return 0

@@ -44,6 +44,14 @@
         <RecordDir>\Screen Recordings\Screen_Capture_<yyyyMMdd_HHmmss>.mp4
         <RecordDir>\Screen Recordings\Screenshot_<yyyyMMdd_HHmmss_fff>.png
 
+    Print Screen, Recording > "Snip" in the control panel, the tray icon or -Command Snip works like the
+    Snipping Tool at any time: it freezes the screen and snips an area, a window, one screen or all screens.
+    The snip is copied to the clipboard, saved as PNG or JPEG (Snip > "Save snips as ...") and opened in a
+    markup editor (pen, highlighter, rectangle, arrow, eraser, crop, undo and redo, copy, save, save as)
+    unless Snip > "Open markup editor after snipping" is turned off. Snip > "Use Print Screen to snip" turns
+    the Print Screen key on or off:
+        <RecordDir>\Screenshots\Snip_<yyyyMMdd_HHmmss_fff>.png
+
     The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
     default. When scrcpy.exe is next to this script (portable package), scrcpy, adb and ffmpeg are used from
     this folder.
@@ -95,6 +103,8 @@
     .\scrcpy-monitor.ps1 -Command StopRecording
 .EXAMPLE
     .\scrcpy-monitor.ps1 -Command StartLogs -Serial 192.168.68.100:5555
+.EXAMPLE
+    .\scrcpy-monitor.ps1 -Command Snip
 #>
 [CmdletBinding()]
 param(
@@ -107,7 +117,7 @@ param(
     [string]$RecordEncoder = 'auto',
     [string[]]$RecordArgs,
     [switch]$KeepParts,
-    [ValidateSet('StartRecording', 'StopRecording', 'StartLogs', 'StopLogs', 'ShowPanel', 'Exit')]
+    [ValidateSet('StartRecording', 'StopRecording', 'StartLogs', 'StopLogs', 'ShowPanel', 'Snip', 'Exit')]
     [string]$Command,
     [switch]$List,
     [switch]$NoTray,
@@ -1772,6 +1782,7 @@ function Invoke-Requests {
                 else { Show-Notification 'scrcpy monitor is already running (see the tray icon).' }
             }
             'OpenWindows' { $script:OpenWindowsRequested = $true }
+            'Snip' { Request-Snip 'rect' $null 100 }
             'Exit' { Stop-Monitor; return }
         }
     }
@@ -2310,6 +2321,7 @@ function Update-TrayMenu {
     $stopLogs.Enabled = @($script:Sessions.Values | Where-Object { $_.LogCapture }).Count -gt 0 -or $script:LogHandovers.Count -gt 0
     $stopLogs.add_Click({ Invoke-Safely { Stop-AllLogs @(); Update-TrayText } })
     [void](Add-ScreenRecordMenu $menu.Items)
+    [void](Add-SnipMenu $menu.Items)
     $connectWifi = $menu.Items.Add('Connect Wi-Fi device...')
     $connectWifi.add_Click({ Invoke-Safely { Show-ConnectDialog } })
     $refresh = $menu.Items.Add('Refresh devices')
@@ -2406,6 +2418,7 @@ function Show-About {
         "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device with the device name as a header above the screen.`n" +
         "- Record combined also joins the recordings of the selected devices into one video laid out like the arranged device windows, with each device name above its screen; each device keeps its real size and proportions.`n" +
         "- Screen recording (Recording menu or tray icon) records the desktop: a movable, resizable rectangle, a selected area, one or all screens (listed from the screens connected to this computer), a window or the area around the mouse, with pause and screenshots (F12 record, Shift+F12 pause, F11 screenshot).`n" +
+        "- Snip (Print Screen, Recording > Snip or the tray icon) captures an area, a window, a screen or all screens like the Snipping Tool, copies it to the clipboard, saves it as PNG or JPEG and opens a markup editor (pen, highlighter, rectangle, arrow, eraser, crop, undo, copy, save as).`n" +
         "- The status bar shows the recordings folder and its free space; recordings have no time limit and are stopped and saved automatically when the disk is almost full.`n" +
         "- Device logs (Logs menu, Start device logs or the tray icon) save each device's logcat in the Android Studio Logcat format to a text file, one folder per device, with a copy per checked app (Logs > Choose apps for per-app logs..., which lists PA and PIA first, then the open, running and installed apps, none checked by default) in a subfolder named after the app package; logging continues across restarts and reconnections in the same file.`n" +
         "- The device log records whether PA, PIA and the checked apps are running (APP STATUS) at the start and after every restart or reconnection, with APP STARTED, APP STOPPED, APP CRASHED and APP NOT RESPONDING lines as they happen; the control panel shows the elapsed time and size of each device log.`n" +
@@ -4076,6 +4089,152 @@ function Update-ScreenRecordMenu([System.Windows.Forms.ToolStripMenuItem]$Root) 
     [void](Add-ScreenMenuItem $items 'Open screen recordings folder' @('folder'))
 }
 
+function Get-SnipFolder {
+    $folder = Join-Path $RecordDir 'Screenshots'
+    [void](New-Item -ItemType Directory -Force -Path $folder)
+    $folder
+}
+
+function Open-SnipFolder {
+    Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$(Get-SnipFolder)`""
+}
+
+function Get-SnipFormat {
+    if ((Get-Setting 'SnipFormat') -eq 'jpg') { 'jpg' } else { 'png' }
+}
+
+function Test-SnipEditor { (Get-Setting 'SnipEditor') -ne $false }
+
+function Test-SnipPrintScreen { (Get-Setting 'SnipPrintScreen') -ne $false }
+
+function Enable-SnipKey {
+    if ($script:SnipKey -and $script:SnipKey.Enabled) { return $true }
+    Initialize-DesktopTools
+    if (-not $script:SnipKey) {
+        $script:SnipKey = New-Object ScrcpyMonitor.SnipKey
+        $script:SnipKey.add_Pressed({ Invoke-Safely { Request-Snip 'rect' $null 1 } })
+    }
+    if ($script:SnipKey.Enable()) { return $true }
+    Write-Log 'Could not hook the Print Screen key for snipping.'
+    $false
+}
+
+function Set-SnipPrintScreen([bool]$Enabled) {
+    Set-Setting 'SnipPrintScreen' $Enabled
+    if ($Enabled) { [void](Enable-SnipKey) }
+    elseif ($script:SnipKey) { $script:SnipKey.Disable() }
+}
+
+function Request-Snip([string]$Mode = 'rect', $Editor = $null, [int]$Delay = 250) {
+    if ($script:Snipping -or $script:Exiting) { return }
+    if ($Editor) {
+        if (-not $Editor.ConfirmDiscard()) { return }
+        $Editor.Hide()
+    }
+    $script:Snipping = $true
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = [Math]::Max(1, $Delay)
+    $timer.Tag = @($Mode, $Editor)
+    $timer.add_Tick({
+        param($sender, $e)
+        $sender.Stop()
+        $request = $sender.Tag
+        $sender.Dispose()
+        try { Invoke-Safely { Invoke-Snip $request[0] $request[1] } } finally { $script:Snipping = $false }
+    })
+    $timer.Start()
+}
+
+function Invoke-Snip([string]$Mode, $Editor) {
+    $image = $null
+    try {
+        Initialize-DesktopTools
+        $image = [ScrcpyMonitor.SnipPicker]::Snip($Mode)
+    } finally {
+        if (-not $image -and $Editor -and -not $Editor.IsDisposed -and -not $script:Exiting) { $Editor.ShowEditor() }
+    }
+    if (-not $image) { return }
+    if ($script:Exiting) { $image.Dispose(); return }
+    $path = [System.IO.Path]::Combine($RecordDir, 'Screenshots', ('Snip_{0:yyyyMMdd_HHmmss_fff}.{1}' -f (Get-Date), (Get-SnipFormat)))
+    $saved = $true
+    try { [void](Get-SnipFolder); [ScrcpyMonitor.SnipImage]::Save($image, $path) } catch { $saved = $false; Write-Log "Could not save the snip to ${path}: $($_.Exception.Message)" }
+    $copied = [ScrcpyMonitor.SnipImage]::Copy($image)
+    $status = if ($saved -and $copied) { "Copied to the clipboard and saved: $path" }
+              elseif ($saved) { "Saved: $path (could not copy to the clipboard)" }
+              elseif ($copied) { 'Copied to the clipboard (could not save the file)' }
+              else { 'Could not copy or save the snip' }
+    Write-Log "Snip: $status"
+    if ($Editor -and -not $Editor.IsDisposed) {
+        $Editor.LoadImage($image, $path, $status)
+        $Editor.ShowEditor()
+    } elseif (Test-SnipEditor) {
+        Show-SnipEditor $image $path $status
+    } else {
+        $image.Dispose()
+        Show-Notification "Snip: $status" $(if ($saved -or $copied) { 'Info' } else { 'Warning' })
+    }
+}
+
+function Show-SnipEditor($Image, [string]$Path, [string]$Status) {
+    $editor = New-Object ScrcpyMonitor.SnipEditor -ArgumentList $Image, $Path, $Status
+    if ($script:Icon) { $editor.Icon = $script:Icon }
+    $editor.add_NewSnip({ param($sender, $e) Invoke-Safely { Request-Snip $sender.RequestedMode $sender 150 } })
+    $editor.add_FormClosed({ param($sender, $e) [void]$script:SnipEditors.Remove($sender) })
+    [void]$script:SnipEditors.Add($editor)
+    $editor.ShowEditor()
+}
+
+function Close-SnipEditors {
+    foreach ($editor in @($script:SnipEditors)) {
+        Invoke-Safely {
+            $editor.Prompt = $false
+            $editor.Close()
+            $editor.Dispose()
+        }
+    }
+    $script:SnipEditors.Clear()
+}
+
+function Add-SnipMenuItem([System.Windows.Forms.ToolStripItemCollection]$Items, [string]$Text, [scriptblock]$Action, [bool]$Checked = $false, [string]$Shortcut = '') {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem $Text
+    $item.Tag = $Action
+    $item.Checked = $Checked
+    if ($Shortcut) { $item.ShortcutKeyDisplayString = $Shortcut }
+    $item.add_Click({ param($sender, $e) Invoke-Safely { & $sender.Tag } })
+    [void]$Items.Add($item)
+    $item
+}
+
+function Add-SnipMenu([System.Windows.Forms.ToolStripItemCollection]$Items) {
+    $root = New-Object System.Windows.Forms.ToolStripMenuItem 'Snip'
+    [void]$root.DropDownItems.Add('...')
+    $root.add_DropDownOpening({ param($sender, $e) Invoke-Safely { Update-SnipMenu $sender } })
+    [void]$Items.Add($root)
+    $root
+}
+
+function Update-SnipMenu([System.Windows.Forms.ToolStripMenuItem]$Root) {
+    $items = $Root.DropDownItems
+    $items.Clear()
+    $keyText = if ($script:SnipKey -and $script:SnipKey.Enabled) { 'Print Screen' } else { '' }
+    [void](Add-SnipMenuItem $items 'Snip an area' { Request-Snip 'rect' } $false $keyText)
+    [void](Add-SnipMenuItem $items 'Snip a window' { Request-Snip 'window' })
+    if (@([System.Windows.Forms.Screen]::AllScreens).Count -gt 1) {
+        [void](Add-SnipMenuItem $items 'Snip a screen' { Request-Snip 'screen' })
+        [void](Add-SnipMenuItem $items 'Snip all screens' { Request-Snip 'all' })
+    } else {
+        [void](Add-SnipMenuItem $items 'Snip full screen' { Request-Snip 'all' })
+    }
+    [void]$items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $format = Get-SnipFormat
+    [void](Add-SnipMenuItem $items 'Save snips as PNG' { Set-Setting 'SnipFormat' 'png' } ($format -eq 'png'))
+    [void](Add-SnipMenuItem $items 'Save snips as JPEG' { Set-Setting 'SnipFormat' 'jpg' } ($format -eq 'jpg'))
+    [void](Add-SnipMenuItem $items 'Open markup editor after snipping' { Set-Setting 'SnipEditor' (-not (Test-SnipEditor)) } (Test-SnipEditor))
+    [void](Add-SnipMenuItem $items 'Use Print Screen to snip' { Set-SnipPrintScreen (-not ($script:SnipKey -and $script:SnipKey.Enabled)) } ([bool]($script:SnipKey -and $script:SnipKey.Enabled)))
+    [void]$items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void](Add-SnipMenuItem $items 'Open snips folder' { Open-SnipFolder })
+}
+
 function Open-RecordFolder {
     [void](New-Item -ItemType Directory -Force -Path $RecordDir)
     Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$RecordDir`""
@@ -5035,6 +5194,8 @@ function Stop-Monitor {
         foreach ($session in @($script:Sessions.Values)) { Invoke-Safely { Stop-Recording $session } }
         Invoke-Safely { Stop-AllDeviceLogs }
         Invoke-Safely { Close-ScreenRecorder }
+        if ('ScrcpyMonitor.SnipPicker' -as [type]) { Invoke-Safely { [ScrcpyMonitor.SnipPicker]::CancelOpen() } }
+        Invoke-Safely { Close-SnipEditors }
         Invoke-Safely { Update-Stops 45000 }
         Invoke-Safely { Update-CombineHandovers -All }
         foreach ($session in @($script:Sessions.Values | Where-Object { $_.PendingAction })) {
@@ -5062,6 +5223,7 @@ function Stop-Monitor {
     } finally {
         if ($script:ScreenKeys) { Invoke-Safely { $script:ScreenKeys.Dispose() } }
         if ($script:MenuKey) { Invoke-Safely { $script:MenuKey.Dispose() } }
+        if ($script:SnipKey) { Invoke-Safely { $script:SnipKey.Dispose() } }
         if ($script:Tray) {
             $script:Tray.Visible = $false
             $script:Tray.Dispose()
@@ -6109,11 +6271,16 @@ function Show-Panel {
     Update-Panel
 }
 
-function New-MenuHotKey {
-    if (-not ('ScrcpyMonitor.MenuHotKey' -as [type])) {
-        Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+function Initialize-DesktopTools {
+    if (-not ('ScrcpyMonitor.SnipEditor' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 namespace ScrcpyMonitor {
     using System;
+    using System.Collections.Generic;
+    using System.Drawing;
+    using System.Drawing.Drawing2D;
+    using System.Drawing.Imaging;
+    using System.IO;
     using System.Runtime.InteropServices;
     using System.Windows.Forms;
 
@@ -6146,9 +6313,1251 @@ namespace ScrcpyMonitor {
             DestroyHandle();
         }
     }
+
+    public static class SnipNative {
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Monitor; public RECT Work; public uint Flags; }
+        delegate bool MonitorEnumProc(IntPtr monitor, IntPtr hdc, IntPtr rect, IntPtr data);
+        delegate bool WindowEnumProc(IntPtr hWnd, IntPtr data);
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+        [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")] static extern bool GetPhysicalCursorPos(out POINT point);
+        [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool EnumWindows(WindowEnumProc proc, IntPtr data);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr hWnd, int index);
+        [DllImport("user32.dll", EntryPoint = "GetWindowTextLengthW")] static extern int GetWindowTextLength(IntPtr hWnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int size);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+        [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out RECT value, int size);
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out int value, int size);
+
+        public static IntPtr EnterPerMonitor() {
+            try { return SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { return IntPtr.Zero; }
+        }
+
+        public static void Leave(IntPtr previous) {
+            if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+        }
+
+        public static float Scale(IntPtr hWnd) {
+            try { uint dpi = GetDpiForWindow(hWnd); return dpi > 0 ? dpi / 96f : 1f; } catch (EntryPointNotFoundException) { return 1f; }
+        }
+
+        public static Point Cursor() {
+            POINT point;
+            if (GetPhysicalCursorPos(out point)) return new Point(point.X, point.Y);
+            return System.Windows.Forms.Cursor.Position;
+        }
+
+        public static void Foreground(IntPtr hWnd) {
+            IntPtr current = GetForegroundWindow();
+            uint other = current == IntPtr.Zero ? 0 : GetWindowThreadProcessId(current, IntPtr.Zero);
+            uint self = GetCurrentThreadId();
+            if (other != 0 && other != self && AttachThreadInput(self, other, true)) {
+                try { BringWindowToTop(hWnd); SetForegroundWindow(hWnd); } finally { AttachThreadInput(self, other, false); }
+            } else {
+                SetForegroundWindow(hWnd);
+            }
+        }
+
+        public static Rectangle[] Screens() {
+            var list = new List<Rectangle>();
+            IntPtr previous = EnterPerMonitor();
+            try {
+                MonitorEnumProc proc = delegate(IntPtr monitor, IntPtr hdc, IntPtr rect, IntPtr data) {
+                    var info = new MONITORINFO();
+                    info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+                    if (GetMonitorInfo(monitor, ref info)) list.Add(Rectangle.FromLTRB(info.Monitor.Left, info.Monitor.Top, info.Monitor.Right, info.Monitor.Bottom));
+                    return true;
+                };
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+                GC.KeepAlive(proc);
+            } finally {
+                Leave(previous);
+            }
+            return list.ToArray();
+        }
+
+        public static Rectangle Union(Rectangle[] rects) {
+            Rectangle all = Rectangle.Empty;
+            foreach (var rect in rects) all = all.IsEmpty ? rect : Rectangle.Union(all, rect);
+            return all;
+        }
+
+        static bool Cloaked(IntPtr hWnd) {
+            int value;
+            try { return DwmGetWindowAttribute(hWnd, 14, out value, 4) == 0 && value != 0; } catch (Exception) { return false; }
+        }
+
+        public static List<Rectangle> Windows() {
+            var list = new List<Rectangle>();
+            IntPtr previous = EnterPerMonitor();
+            try {
+                var name = new System.Text.StringBuilder(256);
+                WindowEnumProc proc = delegate(IntPtr hWnd, IntPtr data) {
+                    if (!IsWindowVisible(hWnd) || IsIconic(hWnd) || Cloaked(hWnd)) return true;
+                    if ((GetWindowLong(hWnd, -20) & 0x20) != 0) return true;
+                    name.Length = 0;
+                    GetClassName(hWnd, name, name.Capacity);
+                    string kind = name.ToString();
+                    if (kind == "Progman" || kind == "WorkerW") return true;
+                    if (GetWindowTextLength(hWnd) == 0 && kind != "Shell_TrayWnd" && kind != "Shell_SecondaryTrayWnd") return true;
+                    RECT rect;
+                    bool found;
+                    try { found = DwmGetWindowAttribute(hWnd, 9, out rect, Marshal.SizeOf(typeof(RECT))) == 0; } catch (Exception) { found = false; rect = new RECT(); }
+                    if (!found && !GetWindowRect(hWnd, out rect)) return true;
+                    var bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+                    if (bounds.Width >= 8 && bounds.Height >= 8) list.Add(bounds);
+                    return true;
+                };
+                EnumWindows(proc, IntPtr.Zero);
+                GC.KeepAlive(proc);
+            } finally {
+                Leave(previous);
+            }
+            return list;
+        }
+
+        public static Bitmap Capture(Rectangle area) {
+            IntPtr previous = EnterPerMonitor();
+            try {
+                var bitmap = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+                try {
+                    using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen(area.Location, Point.Empty, area.Size);
+                } catch {
+                    bitmap.Dispose();
+                    throw;
+                }
+                return bitmap;
+            } finally {
+                Leave(previous);
+            }
+        }
+    }
+
+    public static class SnipImage {
+        public static Bitmap Crop(Bitmap source, Rectangle area) {
+            area.Intersect(new Rectangle(Point.Empty, source.Size));
+            if (area.Width < 1 || area.Height < 1) return null;
+            var bitmap = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+            using (var graphics = Graphics.FromImage(bitmap)) {
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.DrawImage(source, new Rectangle(Point.Empty, area.Size), area, GraphicsUnit.Pixel);
+            }
+            return bitmap;
+        }
+
+        public static bool IsJpeg(string path) {
+            string extension = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+            return extension == ".jpg" || extension == ".jpeg";
+        }
+
+        public static void Save(Image image, string path) {
+            if (!IsJpeg(path)) {
+                image.Save(path, ImageFormat.Png);
+                return;
+            }
+            ImageCodecInfo codec = null;
+            foreach (var info in ImageCodecInfo.GetImageEncoders()) if (info.FormatID == ImageFormat.Jpeg.Guid) codec = info;
+            if (codec == null) {
+                image.Save(path, ImageFormat.Jpeg);
+                return;
+            }
+            using (var parameters = new EncoderParameters(1)) {
+                parameters.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 92L);
+                image.Save(path, codec, parameters);
+            }
+        }
+
+        static void SetClipboard(Image image) {
+            var data = new DataObject();
+            data.SetData(DataFormats.Bitmap, true, image);
+            var png = new MemoryStream();
+            image.Save(png, ImageFormat.Png);
+            data.SetData("PNG", false, png);
+            Clipboard.SetDataObject(data, true, 10, 100);
+        }
+
+        public static bool Copy(Image image) {
+            try {
+                if (System.Threading.Thread.CurrentThread.GetApartmentState() == System.Threading.ApartmentState.STA) {
+                    SetClipboard(image);
+                    return true;
+                }
+                bool copied = false;
+                var thread = new System.Threading.Thread(delegate() {
+                    try { SetClipboard(image); copied = true; } catch (Exception) { }
+                });
+                thread.SetApartmentState(System.Threading.ApartmentState.STA);
+                thread.Start();
+                thread.Join(5000);
+                return copied;
+            } catch (Exception) {
+                return false;
+            }
+        }
+    }
+
+    public class SnipKey : NativeWindow, IDisposable {
+        delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+        [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr Hwnd; public int Message; public IntPtr WParam; public IntPtr LParam; public uint Time; public int X; public int Y; }
+        [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hWnd, uint min, uint max);
+        [DllImport("user32.dll")] static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
+        [DllImport("user32.dll")] static extern bool PostThreadMessage(uint thread, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+        public event EventHandler Pressed;
+        HookProc proc;
+        IntPtr hook;
+        IntPtr target;
+        System.Threading.Thread thread;
+        uint threadId;
+        bool down;
+        bool passed;
+
+        public SnipKey() {
+            var parameters = new CreateParams();
+            parameters.Parent = new IntPtr(-3);
+            CreateHandle(parameters);
+            target = Handle;
+        }
+
+        public bool Enabled { get { return thread != null; } }
+
+        public bool Enable() {
+            if (thread != null) return true;
+            bool installed = false;
+            using (var ready = new System.Threading.ManualResetEvent(false)) {
+                var worker = new System.Threading.Thread(delegate() {
+                    MSG msg;
+                    threadId = GetCurrentThreadId();
+                    PeekMessage(out msg, IntPtr.Zero, 0, 0, 0);
+                    proc = Hook;
+                    hook = SetWindowsHookEx(13, proc, GetModuleHandle(null), 0);
+                    installed = hook != IntPtr.Zero;
+                    ready.Set();
+                    if (!installed) return;
+                    while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+                    UnhookWindowsHookEx(hook);
+                    hook = IntPtr.Zero;
+                });
+                worker.IsBackground = true;
+                worker.Name = "Snip hotkey";
+                worker.Start();
+                if (!ready.WaitOne(5000) || !installed) return false;
+                thread = worker;
+            }
+            return true;
+        }
+
+        public void Disable() {
+            if (thread == null) return;
+            PostThreadMessage(threadId, 0x12, IntPtr.Zero, IntPtr.Zero);
+            thread.Join(2000);
+            thread = null;
+            down = passed = false;
+        }
+
+        static bool Held(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+
+        IntPtr Hook(int code, IntPtr wParam, IntPtr lParam) {
+            if (code >= 0 && Marshal.ReadInt32(lParam) == 0x2C) {
+                int message = wParam.ToInt32();
+                bool isDown = message == 0x100 || message == 0x104;
+                bool isUp = message == 0x101 || message == 0x105;
+                bool modified = Held(0x10) || Held(0x11) || Held(0x12) || Held(0x5B) || Held(0x5C);
+                if (isDown) {
+                    if (passed || modified) {
+                        passed = true;
+                    } else {
+                        if (!down) PostMessage(target, 0x8002, IntPtr.Zero, IntPtr.Zero);
+                        down = true;
+                        return new IntPtr(1);
+                    }
+                } else if (isUp) {
+                    if (down) {
+                        down = false;
+                        return new IntPtr(1);
+                    }
+                    if (passed) {
+                        passed = false;
+                    } else if (!modified) {
+                        PostMessage(target, 0x8002, IntPtr.Zero, IntPtr.Zero);
+                        return new IntPtr(1);
+                    }
+                }
+            }
+            return CallNextHookEx(hook, code, wParam, lParam);
+        }
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x8002) {
+                var handler = Pressed;
+                if (handler != null) handler(this, EventArgs.Empty);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        public void Dispose() {
+            Disable();
+            DestroyHandle();
+        }
+    }
+
+    public class SnipPicker : Form {
+        static readonly string[] ButtonIds = { "rect", "window", "screen", "all", "cancel" };
+        static SnipPicker open;
+        Bitmap shot;
+        Rectangle[] screens;
+        List<Rectangle> windows;
+        string mode;
+        Point start;
+        Rectangle selection;
+        bool dragging;
+        Rectangle hover;
+        Rectangle[] buttons = new Rectangle[5];
+        string[] labels;
+        Rectangle bar;
+        Rectangle hint;
+        int hot = -1;
+        float scale = 1f;
+        Font font;
+        Rectangle result = Rectangle.Empty;
+
+        SnipPicker(Bitmap shot, Rectangle bounds, Rectangle[] screens, List<Rectangle> windows, string mode) {
+            this.shot = shot;
+            this.mode = mode == "window" || mode == "screen" ? mode : "rect";
+            this.screens = new Rectangle[screens.Length];
+            for (int i = 0; i < screens.Length; i++) { this.screens[i] = screens[i]; this.screens[i].Offset(-bounds.X, -bounds.Y); }
+            this.windows = new List<Rectangle>();
+            if (windows != null) {
+                foreach (var window in windows) {
+                    var local = window;
+                    local.Offset(-bounds.X, -bounds.Y);
+                    local.Intersect(new Rectangle(Point.Empty, bounds.Size));
+                    if (local.Width > 0 && local.Height > 0) this.windows.Add(local);
+                }
+            }
+            labels = new[] { "Rectangle", "Window", screens.Length > 1 ? "Screen" : "Full screen", screens.Length > 1 ? "All screens" : "", "Cancel" };
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            DoubleBuffered = true;
+            Cursor = Cursors.Cross;
+            KeyPreview = true;
+            Text = "Snip";
+        }
+
+        public static void CancelOpen() {
+            if (open != null && !open.IsDisposed) open.Close();
+        }
+
+        public static Bitmap Snip(string mode) {
+            Rectangle[] screens;
+            Rectangle bounds;
+            List<Rectangle> windows = null;
+            Bitmap shot;
+            IntPtr previous = SnipNative.EnterPerMonitor();
+            try {
+                screens = SnipNative.Screens();
+                bounds = SnipNative.Union(screens);
+                if (bounds.Width < 1 || bounds.Height < 1) return null;
+                if (mode != "all") windows = SnipNative.Windows();
+                shot = SnipNative.Capture(bounds);
+            } finally {
+                SnipNative.Leave(previous);
+            }
+            if (mode == "all" || (mode == "screen" && screens.Length == 1)) return shot;
+            using (shot) {
+                Rectangle area;
+                SnipPicker picker;
+                previous = SnipNative.EnterPerMonitor();
+                try {
+                    picker = new SnipPicker(shot, bounds, screens, windows, mode);
+                    picker.CreateControl();
+                    picker.scale = SnipNative.Scale(picker.Handle);
+                    picker.SetBounds(bounds.X, bounds.Y, bounds.Width, bounds.Height);
+                    var cursor = SnipNative.Cursor();
+                    picker.Arrange(new Point(cursor.X - bounds.X, cursor.Y - bounds.Y));
+                } finally {
+                    SnipNative.Leave(previous);
+                }
+                using (picker) {
+                    open = picker;
+                    try { picker.ShowDialog(); } finally { open = null; }
+                    area = picker.result;
+                }
+                if (area.Width < 1 || area.Height < 1) return null;
+                return SnipImage.Crop(shot, area);
+            }
+        }
+
+        void Arrange(Point cursor) {
+            Rectangle monitor = screens.Length > 0 ? screens[0] : ClientRectangle;
+            foreach (var screen in screens) if (screen.Contains(cursor)) monitor = screen;
+            font = new Font("Segoe UI", 14f * scale, GraphicsUnit.Pixel);
+            int pad = (int)(12 * scale), height = (int)(font.Height + 16 * scale), x = 0;
+            var widths = new int[labels.Length];
+            for (int i = 0; i < labels.Length; i++) {
+                widths[i] = labels[i].Length == 0 ? 0 : TextRenderer.MeasureText(labels[i], font).Width + 2 * pad;
+                x += widths[i];
+            }
+            int left = monitor.Left + (monitor.Width - x) / 2, top = monitor.Top + (int)(16 * scale);
+            for (int i = 0; i < labels.Length; i++) {
+                buttons[i] = widths[i] == 0 ? Rectangle.Empty : new Rectangle(left, top, widths[i], height);
+                left += widths[i];
+            }
+            bar = Rectangle.Union(buttons[0], buttons[4]);
+            var hintSize = TextRenderer.MeasureText(HintText(), font);
+            hint = new Rectangle(monitor.Left + (monitor.Width - hintSize.Width) / 2 - pad, bar.Bottom + (int)(8 * scale), hintSize.Width + 2 * pad, hintSize.Height + pad);
+            if (mode != "rect") hover = Target(cursor);
+        }
+
+        string HintText() {
+            if (mode == "window") return "Click a window to snip it. Esc cancels.";
+            if (mode == "screen") return "Click a screen to snip it. Esc cancels.";
+            return "Drag to snip an area. Esc cancels.";
+        }
+
+        protected override CreateParams CreateParams {
+            get {
+                var parameters = base.CreateParams;
+                parameters.ExStyle |= 0x80;
+                return parameters;
+            }
+        }
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == 0x02E0) return;
+            base.WndProc(ref m);
+        }
+
+        protected override void OnShown(EventArgs e) {
+            base.OnShown(e);
+            SnipNative.Foreground(Handle);
+            Activate();
+        }
+
+        protected override void Dispose(bool disposing) {
+            if (disposing && font != null) font.Dispose();
+            base.Dispose(disposing);
+        }
+
+        int ButtonAt(Point point) {
+            for (int i = 0; i < buttons.Length; i++) if (buttons[i].Contains(point)) return i;
+            return -1;
+        }
+
+        Rectangle Target(Point point) {
+            if (mode == "window") foreach (var window in windows) if (window.Contains(point)) return window;
+            foreach (var screen in screens) if (screen.Contains(point)) return screen;
+            return Rectangle.Empty;
+        }
+
+        Rectangle Highlight() {
+            if (mode == "rect") return dragging ? selection : Rectangle.Empty;
+            return hover;
+        }
+
+        void Repaint(Rectangle area) {
+            if (area.Width <= 0 || area.Height <= 0) return;
+            area.Inflate((int)(4 * scale), (int)(4 * scale));
+            Invalidate(area);
+        }
+
+        void Choose(int button) {
+            string id = ButtonIds[button];
+            if (id == "cancel") { Close(); return; }
+            if (id == "all") { Finish(ClientRectangle); return; }
+            if (screens.Length == 1 && id == "screen") { Finish(screens[0]); return; }
+            mode = id;
+            dragging = false;
+            selection = Rectangle.Empty;
+            hover = mode == "rect" ? Rectangle.Empty : Target(PointToClient(System.Windows.Forms.Cursor.Position));
+            var hintSize = TextRenderer.MeasureText(HintText(), font);
+            int pad = (int)(12 * scale);
+            hint = new Rectangle(bar.Left + (bar.Width - hintSize.Width) / 2 - pad, hint.Top, hintSize.Width + 2 * pad, hintSize.Height + pad);
+            Invalidate();
+        }
+
+        void Finish(Rectangle area) {
+            result = area;
+            Close();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e) {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Escape) {
+                if (dragging) {
+                    dragging = false;
+                    Repaint(Rectangle.Inflate(selection, (int)(200 * scale), (int)(60 * scale)));
+                    Repaint(bar);
+                    Repaint(hint);
+                    selection = Rectangle.Empty;
+                } else {
+                    Close();
+                }
+            } else if (e.KeyCode == Keys.Enter && mode != "rect" && hover.Width > 0) {
+                Finish(hover);
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e) {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Right) { Close(); return; }
+            if (e.Button != MouseButtons.Left) return;
+            int button = ButtonAt(e.Location);
+            if (button >= 0) { Choose(button); return; }
+            if (mode != "rect") return;
+            start = e.Location;
+            selection = new Rectangle(start, Size.Empty);
+            dragging = true;
+            Repaint(bar);
+            Repaint(hint);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e) {
+            base.OnMouseMove(e);
+            int button = dragging ? -1 : ButtonAt(e.Location);
+            if (button != hot) {
+                hot = button;
+                Repaint(bar);
+            }
+            if (dragging) {
+                var previous = selection;
+                selection = Rectangle.FromLTRB(Math.Min(start.X, e.X), Math.Min(start.Y, e.Y), Math.Max(start.X, e.X), Math.Max(start.Y, e.Y));
+                var dirty = Rectangle.Union(previous, selection);
+                dirty.Inflate((int)(200 * scale), (int)(60 * scale));
+                Invalidate(dirty);
+            } else if (mode != "rect") {
+                var target = button >= 0 ? hover : Target(e.Location);
+                if (target != hover) {
+                    Repaint(hover);
+                    hover = target;
+                    Repaint(hover);
+                }
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e) {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Left) return;
+            if (dragging) {
+                dragging = false;
+                if (selection.Width >= 4 && selection.Height >= 4) { Finish(selection); return; }
+                Repaint(Rectangle.Inflate(selection, (int)(200 * scale), (int)(60 * scale)));
+                Repaint(bar);
+                Repaint(hint);
+                selection = Rectangle.Empty;
+                return;
+            }
+            if (mode != "rect" && hover.Width > 0 && ButtonAt(e.Location) < 0) Finish(hover);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+
+        protected override void OnPaint(PaintEventArgs e) {
+            var graphics = e.Graphics;
+            graphics.CompositingMode = CompositingMode.SourceCopy;
+            graphics.DrawImage(shot, e.ClipRectangle, e.ClipRectangle, GraphicsUnit.Pixel);
+            graphics.CompositingMode = CompositingMode.SourceOver;
+            var focus = Highlight();
+            using (var dim = new SolidBrush(Color.FromArgb(110, 0, 0, 0))) {
+                using (var region = new Region(e.ClipRectangle)) {
+                    if (focus.Width > 0 && focus.Height > 0) region.Exclude(focus);
+                    graphics.FillRegion(dim, region);
+                }
+            }
+            if (focus.Width > 0 && focus.Height > 0) {
+                using (var pen = new Pen(Color.FromArgb(230, 30, 30), Math.Max(1f, 2f * scale))) {
+                    pen.Alignment = PenAlignment.Inset;
+                    graphics.DrawRectangle(pen, focus);
+                }
+                if (mode == "rect") {
+                    string label = string.Format("{0} \u00D7 {1}", focus.Width, focus.Height);
+                    var labelSize = TextRenderer.MeasureText(label, font);
+                    var labelRect = new Rectangle(focus.Left, Math.Max(0, focus.Top - labelSize.Height - 4), labelSize.Width + 8, labelSize.Height + 2);
+                    using (var back = new SolidBrush(Color.FromArgb(200, 30, 30, 30))) graphics.FillRectangle(back, labelRect);
+                    TextRenderer.DrawText(graphics, label, font, labelRect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+            }
+            if (dragging) return;
+            using (var back = new SolidBrush(Color.FromArgb(235, 38, 38, 42))) {
+                graphics.FillRectangle(back, bar);
+                if (!(mode == "rect" && dragging)) {
+                    graphics.FillRectangle(back, hint);
+                    TextRenderer.DrawText(graphics, HintText(), font, hint, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+            }
+            for (int i = 0; i < buttons.Length; i++) {
+                if (buttons[i].Width == 0) continue;
+                bool selected = ButtonIds[i] == mode;
+                if (selected || i == hot) {
+                    using (var brush = new SolidBrush(selected ? Color.FromArgb(30, 144, 255) : Color.FromArgb(70, 70, 78))) graphics.FillRectangle(brush, buttons[i]);
+                }
+                TextRenderer.DrawText(graphics, labels[i], font, buttons[i], Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            }
+        }
+    }
+
+    public class SnipEditor : Form {
+        class Shape { public string Kind; public Color Color; public float Width; public List<PointF> Points; }
+        class State { public Bitmap Image; public List<Shape> Shapes; }
+
+        class Canvas : Control {
+            public SnipEditor Editor;
+            public Canvas() {
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                Cursor = Cursors.Cross;
+            }
+            protected override void OnPaint(PaintEventArgs e) { Editor.PaintCanvas(e); }
+            protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); Editor.CanvasDown(e); }
+            protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); Editor.CanvasMove(e); }
+            protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); Editor.CanvasUp(e); }
+        }
+
+        static readonly Color[] Colors = { Color.FromArgb(230, 30, 30), Color.FromArgb(255, 214, 0), Color.FromArgb(40, 180, 70), Color.FromArgb(30, 120, 255), Color.Black, Color.White };
+        static readonly string[] ColorNames = { "Red", "Yellow", "Green", "Blue", "Black", "White" };
+        static readonly string[] ToolIds = { "pen", "highlighter", "rect", "arrow", "eraser", "crop" };
+        static readonly string[] ToolNames = { "Pen", "Highlighter", "Rectangle", "Arrow", "Eraser", "Crop" };
+        static readonly Keys[] ToolKeys = { Keys.P, Keys.H, Keys.R, Keys.A, Keys.E, Keys.X };
+        static readonly float[] Widths = { 2f, 4f, 8f };
+        static readonly string[] WidthNames = { "Thin", "Medium", "Thick" };
+
+        public event EventHandler NewSnip;
+        public string RequestedMode = "rect";
+        public bool Prompt = true;
+        public string FilePath { get; private set; }
+
+        Panel host;
+        Canvas canvas;
+        ToolStrip bar;
+        ToolStripStatusLabel message;
+        ToolStripStatusLabel sizeLabel;
+        ToolStripButton[] toolButtons = new ToolStripButton[6];
+        ToolStripDropDownButton colorButton;
+        ToolStripDropDownButton widthButton;
+        ToolStripButton undoButton;
+        ToolStripButton redoButton;
+        ToolStripButton fitButton;
+        List<Bitmap> swatches = new List<Bitmap>();
+        HashSet<Bitmap> images = new HashSet<Bitmap>();
+        List<State> undo = new List<State>();
+        List<State> redo = new List<State>();
+        State current;
+        State saved;
+        Bitmap rendered;
+        Bitmap view;
+        string tool = "pen";
+        Color penColor = Colors[0];
+        Color highlightColor = Colors[1];
+        int widthIndex = 1;
+        float zoom = 1f;
+        bool fit = true;
+        Shape drawing;
+        bool erasing;
+        bool erased;
+        bool cropping;
+        PointF cropStart;
+        PointF cropEnd;
+
+        public SnipEditor(Bitmap image, string path, string status) {
+            Text = "Snip";
+            KeyPreview = true;
+            StartPosition = FormStartPosition.Manual;
+            MinimumSize = new Size(640, 400);
+            Font = SystemFonts.MessageBoxFont;
+
+            host = new Panel();
+            host.Dock = DockStyle.Fill;
+            host.AutoScroll = true;
+            host.BackColor = Color.FromArgb(64, 64, 68);
+            host.Resize += delegate { UpdateLayout(); };
+            canvas = new Canvas();
+            canvas.Editor = this;
+            host.Controls.Add(canvas);
+
+            var status_ = new StatusStrip();
+            status_.SizingGrip = true;
+            message = new ToolStripStatusLabel();
+            message.Spring = true;
+            message.TextAlign = ContentAlignment.MiddleLeft;
+            sizeLabel = new ToolStripStatusLabel();
+            status_.Items.Add(message);
+            status_.Items.Add(sizeLabel);
+
+            bar = new ToolStrip();
+            bar.GripStyle = ToolStripGripStyle.Hidden;
+            bar.ImageScalingSize = new Size(16, 16);
+            var newSnip = new ToolStripSplitButton("New snip");
+            newSnip.ToolTipText = "New snip (Ctrl+N)";
+            newSnip.ButtonClick += delegate { RequestSnip("rect"); };
+            AddMenu(newSnip.DropDownItems, "Rectangle", delegate { RequestSnip("rect"); });
+            AddMenu(newSnip.DropDownItems, "Window", delegate { RequestSnip("window"); });
+            AddMenu(newSnip.DropDownItems, "Screen", delegate { RequestSnip("screen"); });
+            AddMenu(newSnip.DropDownItems, "All screens", delegate { RequestSnip("all"); });
+            bar.Items.Add(newSnip);
+            bar.Items.Add(new ToolStripSeparator());
+            for (int i = 0; i < ToolIds.Length; i++) {
+                string id = ToolIds[i];
+                var button = new ToolStripButton(ToolNames[i]);
+                button.ToolTipText = ToolNames[i] + " (" + ToolKeys[i] + ")";
+                button.Click += delegate { SelectTool(id); };
+                toolButtons[i] = button;
+                bar.Items.Add(button);
+            }
+            bar.Items.Add(new ToolStripSeparator());
+            colorButton = new ToolStripDropDownButton("Color");
+            colorButton.DisplayStyle = ToolStripItemDisplayStyle.ImageAndText;
+            for (int i = 0; i < Colors.Length; i++) {
+                var chosen = Colors[i];
+                var item = AddMenu(colorButton.DropDownItems, ColorNames[i], delegate { SetColor(chosen); });
+                item.Image = Swatch(chosen);
+            }
+            bar.Items.Add(colorButton);
+            widthButton = new ToolStripDropDownButton();
+            for (int i = 0; i < Widths.Length; i++) {
+                int index = i;
+                AddMenu(widthButton.DropDownItems, WidthNames[i], delegate { widthIndex = index; UpdateState(); });
+            }
+            bar.Items.Add(widthButton);
+            bar.Items.Add(new ToolStripSeparator());
+            undoButton = AddButton("Undo", "Undo (Ctrl+Z)", delegate { Undo(); });
+            redoButton = AddButton("Redo", "Redo (Ctrl+Y)", delegate { Redo(); });
+            bar.Items.Add(new ToolStripSeparator());
+            fitButton = AddButton("Fit to window", "Fit to window or show at 100% (Ctrl+0)", delegate { SetFit(!fit); });
+            bar.Items.Add(new ToolStripSeparator());
+            AddButton("Copy", "Copy to the clipboard (Ctrl+C)", delegate { CopyImage(); });
+            AddButton("Save", "Save (Ctrl+S)", delegate { Save(); });
+            AddButton("Save as...", "Save as PNG or JPEG (Ctrl+Shift+S)", delegate { SaveAs(); });
+
+            Controls.Add(host);
+            Controls.Add(status_);
+            Controls.Add(bar);
+
+            LoadImage(image, path, status);
+            var area = Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea;
+            int chromeWidth = Width - ClientSize.Width + 40, chromeHeight = Height - ClientSize.Height + bar.PreferredSize.Height + status_.PreferredSize.Height + 40;
+            int width = Math.Max(MinimumSize.Width, Math.Min(area.Width * 9 / 10, image.Width + chromeWidth));
+            int height = Math.Max(MinimumSize.Height, Math.Min(area.Height * 9 / 10, image.Height + chromeHeight));
+            width = Math.Max(width, Math.Min(area.Width * 9 / 10, bar.PreferredSize.Width + Width - ClientSize.Width));
+            SetBounds(area.Left + (area.Width - width) / 2, area.Top + (area.Height - height) / 2, width, height);
+        }
+
+        ToolStripMenuItem AddMenu(ToolStripItemCollection items, string text, EventHandler click) {
+            var item = new ToolStripMenuItem(text);
+            item.Click += click;
+            items.Add(item);
+            return item;
+        }
+
+        ToolStripButton AddButton(string text, string tip, EventHandler click) {
+            var button = new ToolStripButton(text);
+            button.ToolTipText = tip;
+            button.Click += click;
+            bar.Items.Add(button);
+            return button;
+        }
+
+        Bitmap Swatch(Color color) {
+            var bitmap = new Bitmap(16, 16);
+            using (var graphics = Graphics.FromImage(bitmap)) {
+                using (var brush = new SolidBrush(color)) graphics.FillRectangle(brush, 1, 1, 14, 14);
+                graphics.DrawRectangle(Pens.Gray, 1, 1, 13, 13);
+            }
+            swatches.Add(bitmap);
+            return bitmap;
+        }
+
+        public void LoadImage(Bitmap image, string path, string status) {
+            drawing = null;
+            erasing = cropping = false;
+            undo.Clear();
+            redo.Clear();
+            DropCache();
+            foreach (var old in images) old.Dispose();
+            images.Clear();
+            images.Add(image);
+            current = saved = new State { Image = image, Shapes = new List<Shape>() };
+            FilePath = path;
+            fit = true;
+            SetMessage(status);
+            UpdateLayout();
+            UpdateState();
+        }
+
+        public void ShowEditor() {
+            if (!Visible) Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            SnipNative.Foreground(Handle);
+            Activate();
+        }
+
+        public bool Modified { get { return current != saved; } }
+
+        void SetMessage(string text) { message.Text = text ?? ""; }
+
+        void RequestSnip(string mode) {
+            RequestedMode = mode;
+            var handler = NewSnip;
+            if (handler != null) handler(this, EventArgs.Empty);
+        }
+
+        void SelectTool(string id) {
+            if (cropping || drawing != null) return;
+            tool = id;
+            UpdateState();
+        }
+
+        void SetColor(Color color) {
+            if (tool == "highlighter") highlightColor = color; else penColor = color;
+            UpdateState();
+        }
+
+        void SetFit(bool value) {
+            fit = value;
+            if (!fit) zoom = 1f;
+            UpdateLayout();
+            UpdateState();
+        }
+
+        void UpdateState() {
+            if (current == null) return;
+            string name = Path.GetFileName(FilePath);
+            Text = name + (Modified ? " *" : "") + " - Snip";
+            for (int i = 0; i < ToolIds.Length; i++) toolButtons[i].Checked = ToolIds[i] == tool;
+            bool colored = tool == "pen" || tool == "highlighter" || tool == "rect" || tool == "arrow";
+            colorButton.Enabled = widthButton.Enabled = colored;
+            var swatchColor = tool == "highlighter" ? highlightColor : penColor;
+            var previous = colorButton.Image;
+            colorButton.Image = Swatch(swatchColor);
+            if (previous != null) { swatches.Remove((Bitmap)previous); previous.Dispose(); }
+            widthButton.Text = WidthNames[widthIndex];
+            undoButton.Enabled = undo.Count > 0;
+            redoButton.Enabled = redo.Count > 0;
+            fitButton.Checked = fit;
+            sizeLabel.Text = string.Format("{0} \u00D7 {1}   {2}%", current.Image.Width, current.Image.Height, (int)Math.Round(zoom * 100));
+        }
+
+        void UpdateLayout() {
+            if (current == null || canvas == null) return;
+            var image = current.Image;
+            var area = host.ClientSize;
+            float previous = zoom;
+            if (fit && area.Width > 0 && area.Height > 0) zoom = Math.Max(0.05f, Math.Min(1f, Math.Min((area.Width - 16f) / image.Width, (area.Height - 16f) / image.Height)));
+            var size = new Size(Math.Max(1, (int)Math.Round(image.Width * zoom)), Math.Max(1, (int)Math.Round(image.Height * zoom)));
+            if (zoom != previous || canvas.Size != size) DropView();
+            canvas.Size = size;
+            var scroll = host.AutoScrollPosition;
+            canvas.Location = new Point(Math.Max(0, (area.Width - size.Width) / 2) + scroll.X, Math.Max(0, (area.Height - size.Height) / 2) + scroll.Y);
+            canvas.Invalidate();
+            UpdateState();
+        }
+
+        void DropView() {
+            if (view != null) { view.Dispose(); view = null; }
+        }
+
+        void DropCache() {
+            DropView();
+            if (rendered != null) { rendered.Dispose(); rendered = null; }
+        }
+
+        void Changed() {
+            DropCache();
+            canvas.Invalidate();
+            UpdateState();
+        }
+
+        void Push(State next) {
+            undo.Add(current);
+            if (undo.Count > 100) undo.RemoveAt(0);
+            redo.Clear();
+            current = next;
+            Changed();
+        }
+
+        void Undo() {
+            if (undo.Count == 0 || drawing != null || cropping) return;
+            redo.Add(current);
+            current = undo[undo.Count - 1];
+            undo.RemoveAt(undo.Count - 1);
+            Changed();
+            UpdateLayout();
+        }
+
+        void Redo() {
+            if (redo.Count == 0 || drawing != null || cropping) return;
+            undo.Add(current);
+            current = redo[redo.Count - 1];
+            redo.RemoveAt(redo.Count - 1);
+            Changed();
+            UpdateLayout();
+        }
+
+        Bitmap Rendered() {
+            if (rendered == null) {
+                var image = current.Image;
+                rendered = new Bitmap(image.Width, image.Height, PixelFormat.Format32bppRgb);
+                using (var graphics = Graphics.FromImage(rendered)) {
+                    graphics.CompositingMode = CompositingMode.SourceCopy;
+                    graphics.DrawImage(image, new Rectangle(0, 0, image.Width, image.Height), new Rectangle(0, 0, image.Width, image.Height), GraphicsUnit.Pixel);
+                    graphics.CompositingMode = CompositingMode.SourceOver;
+                    graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    foreach (var shape in current.Shapes) Draw(graphics, shape);
+                }
+            }
+            return rendered;
+        }
+
+        Bitmap View() {
+            var source = Rendered();
+            if (zoom == 1f && canvas.Width == source.Width && canvas.Height == source.Height) return source;
+            if (view == null) {
+                view = new Bitmap(canvas.Width, canvas.Height, PixelFormat.Format32bppRgb);
+                using (var graphics = Graphics.FromImage(view)) {
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    using (var attributes = new ImageAttributes()) {
+                        attributes.SetWrapMode(WrapMode.TileFlipXY);
+                        graphics.DrawImage(source, new Rectangle(0, 0, view.Width, view.Height), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel, attributes);
+                    }
+                }
+            }
+            return view;
+        }
+
+        public Bitmap Flatten() {
+            return SnipImage.Crop(Rendered(), new Rectangle(0, 0, current.Image.Width, current.Image.Height));
+        }
+
+        static RectangleF Normalize(PointF a, PointF b) {
+            return RectangleF.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+        }
+
+        static void Draw(Graphics graphics, Shape shape) {
+            var points = shape.Points;
+            using (var pen = new Pen(shape.Color, shape.Width)) {
+                pen.LineJoin = LineJoin.Round;
+                pen.StartCap = pen.EndCap = shape.Kind == "highlighter" ? LineCap.Square : LineCap.Round;
+                if (shape.Kind == "rect") {
+                    pen.LineJoin = LineJoin.Miter;
+                    var rect = Normalize(points[0], points[1]);
+                    graphics.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
+                } else if (shape.Kind == "arrow") {
+                    DrawArrow(graphics, pen, shape);
+                } else if (points.Count == 1) {
+                    using (var brush = new SolidBrush(shape.Color)) graphics.FillEllipse(brush, points[0].X - shape.Width / 2, points[0].Y - shape.Width / 2, shape.Width, shape.Width);
+                } else {
+                    graphics.DrawLines(pen, points.ToArray());
+                }
+            }
+        }
+
+        static void DrawArrow(Graphics graphics, Pen pen, Shape shape) {
+            PointF a = shape.Points[0], b = shape.Points[1];
+            float dx = b.X - a.X, dy = b.Y - a.Y, length = (float)Math.Sqrt(dx * dx + dy * dy);
+            if (length < 1f) return;
+            float head = Math.Min(length, Math.Max(12f, shape.Width * 4f)), ux = dx / length, uy = dy / length;
+            var bottom = new PointF(b.X - ux * head, b.Y - uy * head);
+            float half = head * 0.55f;
+            var left = new PointF(bottom.X - uy * half, bottom.Y + ux * half);
+            var right = new PointF(bottom.X + uy * half, bottom.Y - ux * half);
+            if (length > head) graphics.DrawLine(pen, a, new PointF(b.X - ux * head * 0.7f, b.Y - uy * head * 0.7f));
+            using (var brush = new SolidBrush(shape.Color)) graphics.FillPolygon(brush, new[] { b, left, right });
+        }
+
+        static float SegmentDistance(PointF p, PointF a, PointF b) {
+            float dx = b.X - a.X, dy = b.Y - a.Y, length = dx * dx + dy * dy;
+            float t = length <= 0f ? 0f : Math.Max(0f, Math.Min(1f, ((p.X - a.X) * dx + (p.Y - a.Y) * dy) / length));
+            float x = a.X + t * dx - p.X, y = a.Y + t * dy - p.Y;
+            return (float)Math.Sqrt(x * x + y * y);
+        }
+
+        static bool Hit(Shape shape, PointF point, float tolerance) {
+            float limit = shape.Width / 2f + tolerance;
+            var points = shape.Points;
+            if (shape.Kind == "rect") {
+                var rect = Normalize(points[0], points[1]);
+                var corners = new[] { new PointF(rect.Left, rect.Top), new PointF(rect.Right, rect.Top), new PointF(rect.Right, rect.Bottom), new PointF(rect.Left, rect.Bottom) };
+                for (int i = 0; i < 4; i++) if (SegmentDistance(point, corners[i], corners[(i + 1) % 4]) <= limit) return true;
+                return false;
+            }
+            if (points.Count == 1) return SegmentDistance(point, points[0], points[0]) <= limit;
+            for (int i = 1; i < points.Count; i++) if (SegmentDistance(point, points[i - 1], points[i]) <= limit) return true;
+            return false;
+        }
+
+        PointF ToImage(Point point) {
+            return new PointF(point.X / zoom, point.Y / zoom);
+        }
+
+        Rectangle ToCanvas(RectangleF rect, float margin) {
+            var result = Rectangle.FromLTRB((int)Math.Floor(rect.Left * zoom), (int)Math.Floor(rect.Top * zoom), (int)Math.Ceiling(rect.Right * zoom), (int)Math.Ceiling(rect.Bottom * zoom));
+            int inflate = (int)Math.Ceiling(margin * zoom) + 4;
+            result.Inflate(inflate, inflate);
+            return result;
+        }
+
+        RectangleF ShapeBounds(Shape shape) {
+            float left = float.MaxValue, top = float.MaxValue, right = float.MinValue, bottom = float.MinValue;
+            foreach (var point in shape.Points) {
+                left = Math.Min(left, point.X); top = Math.Min(top, point.Y);
+                right = Math.Max(right, point.X); bottom = Math.Max(bottom, point.Y);
+            }
+            return RectangleF.FromLTRB(left, top, right, bottom);
+        }
+
+        void InvalidateShape(Shape shape) {
+            float margin = shape.Width + (shape.Kind == "arrow" ? Math.Max(12f, shape.Width * 4f) : 0f);
+            canvas.Invalidate(ToCanvas(ShapeBounds(shape), margin));
+        }
+
+        RectangleF CropRect() {
+            var rect = Normalize(cropStart, cropEnd);
+            rect.Intersect(new RectangleF(0, 0, current.Image.Width, current.Image.Height));
+            return rect;
+        }
+
+        void CanvasDown(MouseEventArgs e) {
+            if (e.Button != MouseButtons.Left || current == null) return;
+            var point = ToImage(e.Location);
+            if (tool == "eraser") {
+                erasing = true;
+                erased = false;
+                EraseAt(point);
+            } else if (tool == "crop") {
+                cropping = true;
+                cropStart = cropEnd = point;
+                canvas.Invalidate();
+            } else {
+                drawing = new Shape();
+                drawing.Kind = tool;
+                drawing.Color = tool == "highlighter" ? Color.FromArgb(110, highlightColor) : penColor;
+                drawing.Width = Widths[widthIndex] * (tool == "highlighter" ? 4f : 1f);
+                drawing.Points = new List<PointF>();
+                drawing.Points.Add(point);
+                if (tool == "rect" || tool == "arrow") drawing.Points.Add(point);
+                InvalidateShape(drawing);
+            }
+        }
+
+        void CanvasMove(MouseEventArgs e) {
+            if (current == null) return;
+            var point = ToImage(e.Location);
+            if (drawing != null) {
+                var points = drawing.Points;
+                if (drawing.Kind == "rect" || drawing.Kind == "arrow") {
+                    InvalidateShape(drawing);
+                    points[1] = point;
+                    InvalidateShape(drawing);
+                } else {
+                    var last = points[points.Count - 1];
+                    if (Math.Abs(point.X - last.X) * zoom < 1f && Math.Abs(point.Y - last.Y) * zoom < 1f) return;
+                    points.Add(point);
+                    float margin = drawing.Width;
+                    canvas.Invalidate(ToCanvas(Normalize(last, point), margin));
+                }
+            } else if (erasing) {
+                EraseAt(point);
+            } else if (cropping) {
+                cropEnd = point;
+                canvas.Invalidate();
+            }
+        }
+
+        void CanvasUp(MouseEventArgs e) {
+            if (e.Button != MouseButtons.Left || current == null) return;
+            if (drawing != null) {
+                var shape = drawing;
+                drawing = null;
+                bool tiny = (shape.Kind == "rect" || shape.Kind == "arrow") && SegmentDistance(shape.Points[0], shape.Points[1], shape.Points[1]) * zoom < 3f;
+                if (tiny) { InvalidateShape(shape); return; }
+                var shapes = new List<Shape>(current.Shapes);
+                shapes.Add(shape);
+                Push(new State { Image = current.Image, Shapes = shapes });
+            } else if (erasing) {
+                erasing = false;
+            } else if (cropping) {
+                cropping = false;
+                var rect = CropRect();
+                var area = Rectangle.FromLTRB((int)Math.Round(rect.Left), (int)Math.Round(rect.Top), (int)Math.Round(rect.Right), (int)Math.Round(rect.Bottom));
+                if (area.Width >= 4 && area.Height >= 4 && area.Size != current.Image.Size) ApplyCrop(area);
+                else canvas.Invalidate();
+            }
+        }
+
+        void EraseAt(PointF point) {
+            var shapes = current.Shapes;
+            for (int i = shapes.Count - 1; i >= 0; i--) {
+                if (!Hit(shapes[i], point, 6f / zoom)) continue;
+                var remaining = new List<Shape>(shapes);
+                remaining.RemoveAt(i);
+                var next = new State { Image = current.Image, Shapes = remaining };
+                if (erased) {
+                    current = next;
+                    Changed();
+                } else {
+                    erased = true;
+                    Push(next);
+                }
+                return;
+            }
+        }
+
+        void ApplyCrop(Rectangle area) {
+            var image = SnipImage.Crop(current.Image, area);
+            if (image == null) { canvas.Invalidate(); return; }
+            images.Add(image);
+            var shapes = new List<Shape>();
+            foreach (var shape in current.Shapes) {
+                var moved = new Shape { Kind = shape.Kind, Color = shape.Color, Width = shape.Width, Points = new List<PointF>() };
+                foreach (var point in shape.Points) moved.Points.Add(new PointF(point.X - area.X, point.Y - area.Y));
+                shapes.Add(moved);
+            }
+            Push(new State { Image = image, Shapes = shapes });
+            UpdateLayout();
+        }
+
+        void PaintCanvas(PaintEventArgs e) {
+            if (current == null) return;
+            var graphics = e.Graphics;
+            graphics.DrawImage(View(), e.ClipRectangle, e.ClipRectangle, GraphicsUnit.Pixel);
+            if (drawing != null) {
+                var state = graphics.Save();
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                graphics.ScaleTransform(zoom, zoom);
+                Draw(graphics, drawing);
+                graphics.Restore(state);
+            }
+            if (cropping) {
+                var rect = CropRect();
+                var area = new RectangleF(rect.X * zoom, rect.Y * zoom, rect.Width * zoom, rect.Height * zoom);
+                using (var region = new Region(new Rectangle(Point.Empty, canvas.Size))) {
+                    region.Exclude(area);
+                    using (var dim = new SolidBrush(Color.FromArgb(120, 0, 0, 0))) graphics.FillRegion(dim, region);
+                }
+                using (var pen = new Pen(Color.White, 1f)) {
+                    pen.DashStyle = DashStyle.Dash;
+                    graphics.DrawRectangle(pen, area.X, area.Y, Math.Max(0f, area.Width - 1), Math.Max(0f, area.Height - 1));
+                }
+            }
+        }
+
+        public bool Save() {
+            return SaveTo(FilePath);
+        }
+
+        bool SaveTo(string path) {
+            try {
+                var folder = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(folder)) Directory.CreateDirectory(folder);
+                using (var flat = Flatten()) SnipImage.Save(flat, path);
+            } catch (Exception error) {
+                MessageBox.Show(this, "Could not save the snip:\n" + error.Message, "Snip", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            FilePath = path;
+            saved = current;
+            SetMessage("Saved: " + path);
+            UpdateState();
+            return true;
+        }
+
+        void SaveAs() {
+            using (var dialog = new SaveFileDialog()) {
+                dialog.Title = "Save snip as";
+                dialog.Filter = "PNG image (*.png)|*.png|JPEG image (*.jpg)|*.jpg";
+                dialog.FilterIndex = SnipImage.IsJpeg(FilePath) ? 2 : 1;
+                dialog.AddExtension = true;
+                dialog.OverwritePrompt = true;
+                try { dialog.InitialDirectory = Path.GetDirectoryName(FilePath); } catch (Exception) { }
+                dialog.FileName = Path.GetFileNameWithoutExtension(FilePath);
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                string path = dialog.FileName;
+                string extension = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+                if (extension != ".png" && extension != ".jpg" && extension != ".jpeg") path += dialog.FilterIndex == 2 ? ".jpg" : ".png";
+                SaveTo(path);
+            }
+        }
+
+        void CopyImage() {
+            bool copied;
+            using (var flat = Flatten()) copied = SnipImage.Copy(flat);
+            SetMessage(copied ? "Copied to the clipboard." : "Could not copy to the clipboard; another application may be using it.");
+        }
+
+        public bool ConfirmDiscard() {
+            if (!Modified) return true;
+            if (!Visible) ShowEditor();
+            var answer = MessageBox.Show(this, "Save the changes to " + Path.GetFileName(FilePath) + "?", "Snip", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel) return false;
+            return answer == DialogResult.No || Save();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e) {
+            base.OnFormClosing(e);
+            if (Prompt && e.CloseReason == CloseReason.UserClosing && !ConfirmDiscard()) e.Cancel = true;
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData) {
+            switch (keyData) {
+                case Keys.Control | Keys.C: CopyImage(); return true;
+                case Keys.Control | Keys.S: Save(); return true;
+                case Keys.Control | Keys.Shift | Keys.S: SaveAs(); return true;
+                case Keys.Control | Keys.Z: Undo(); return true;
+                case Keys.Control | Keys.Y:
+                case Keys.Control | Keys.Shift | Keys.Z: Redo(); return true;
+                case Keys.Control | Keys.N: RequestSnip("rect"); return true;
+                case Keys.Control | Keys.D0: SetFit(!fit); return true;
+                case Keys.Escape:
+                    if (cropping) { cropping = false; canvas.Invalidate(); return true; }
+                    if (drawing != null) { InvalidateShape(drawing); drawing = null; return true; }
+                    break;
+            }
+            for (int i = 0; i < ToolKeys.Length; i++) {
+                if (keyData == ToolKeys[i]) { SelectTool(ToolIds[i]); return true; }
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        protected override void Dispose(bool disposing) {
+            if (disposing) {
+                DropCache();
+                foreach (var image in images) image.Dispose();
+                images.Clear();
+                foreach (var swatch in swatches) swatch.Dispose();
+                swatches.Clear();
+            }
+            base.Dispose(disposing);
+        }
+    }
 }
 '@
     }
+}
+
+function New-MenuHotKey {
+    Initialize-DesktopTools
     $key = New-Object ScrcpyMonitor.MenuHotKey
     if (-not $key.Registered) {
         $key.Dispose()
@@ -6327,6 +7736,7 @@ namespace ScrcpyMonitor {
     $script:PanelStopAll = New-PanelMenuItem $recordingMenu 'Stop all' { foreach ($s in (Get-TargetSessions @())) { Stop-Recording $s } }
     [void]$recordingMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void](Add-ScreenRecordMenu $recordingMenu.DropDownItems)
+    [void](Add-SnipMenu $recordingMenu.DropDownItems)
     [void](New-PanelMenuItem $helpMenu 'User guide' { Show-Guide })
     [void]$helpMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     if ($script:UpdateConfig) {
@@ -6430,7 +7840,7 @@ $createdMutex = $false
 $script:Mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdMutex)
 if (-not $createdMutex) {
     if ($NoPanel) {
-        Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording, StartLogs, StopLogs, ShowPanel or Exit to control it.'
+        Show-Error 'scrcpy monitor is already running. Use -Command StartRecording, StopRecording, StartLogs, StopLogs, ShowPanel, Snip or Exit to control it.'
         exit 1
     }
     $request = Send-MonitorRequest 'OpenWindows' @()
@@ -6538,8 +7948,14 @@ if (-not $NoTray) {
 }
 
 $script:MenuKey = $null
+$script:SnipKey = $null
+$script:Snipping = $false
+$script:SnipEditors = New-Object System.Collections.ArrayList
 if ($script:Tray -or $script:Panel) {
     try { $script:MenuKey = New-MenuHotKey } catch { Write-Log "Could not set up Ctrl+Alt+M to show the tray menu: $($_.Exception.Message)" }
+    if (Test-SnipPrintScreen) {
+        try { [void](Enable-SnipKey) } catch { Write-Log "Could not set up Print Screen to snip: $($_.Exception.Message)" }
+    }
 }
 if ($script:Panel -and $script:Tray) {
     if ($script:MenuKey) { $script:PanelTrayMenuItem.ShortcutKeyDisplayString = 'Ctrl+Alt+M' }
