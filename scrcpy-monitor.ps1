@@ -44,12 +44,12 @@
         <RecordDir>\Screen Recordings\Screen_Capture_<yyyyMMdd_HHmmss>.mp4
         <RecordDir>\Screen Recordings\Screenshot_<yyyyMMdd_HHmmss_fff>.png
 
-    Print Screen, Recording > "Snip" in the control panel, the tray icon or -Command Snip works like the
+    Win+Shift+S, Print Screen, Recording > "Snip" in the control panel, the tray icon or -Command Snip works like the
     Snipping Tool at any time: it freezes the screen and snips an area, a window, one screen or all screens.
     The snip is copied to the clipboard, saved as PNG or JPEG (Snip > "Save snips as ...") and opened in a
     markup editor (pen, highlighter, rectangle, arrow, eraser, crop, undo and redo, copy, save, save as)
-    unless Snip > "Open markup editor after snipping" is turned off. Snip > "Use Print Screen to snip" turns
-    the Print Screen key on or off:
+    unless Snip > "Open markup editor after snipping" is turned off. Snip > "Use Win+Shift+S and Print Screen to
+    snip" turns both keys on or off; while it is on, they open this snip instead of the Windows Snipping Tool:
         <RecordDir>\Screenshots\Snip_<yyyyMMdd_HHmmss_fff>.png
 
     The recordings folder is -RecordDir if given, else the folder chosen from the tray icon, else the
@@ -2418,7 +2418,7 @@ function Show-About {
         "- Record per device or all devices from the window button (Alt+E), this panel or the tray icon; recordings continue across restarts and are saved as one MP4 per device with the device name as a header above the screen.`n" +
         "- Record combined also joins the recordings of the selected devices into one video laid out like the arranged device windows, with each device name above its screen; each device keeps its real size and proportions.`n" +
         "- Screen recording (Recording menu or tray icon) records the desktop: a movable, resizable rectangle, a selected area, one or all screens (listed from the screens connected to this computer), a window or the area around the mouse, with pause and screenshots (F12 record, Shift+F12 pause, F11 screenshot).`n" +
-        "- Snip (Print Screen, Recording > Snip or the tray icon) captures an area, a window, a screen or all screens like the Snipping Tool, copies it to the clipboard, saves it as PNG or JPEG and opens a markup editor (pen, highlighter, rectangle, arrow, eraser, crop, undo, copy, save as).`n" +
+        "- Snip (Win+Shift+S, Print Screen, Recording > Snip or the tray icon) captures an area, a window, a screen or all screens like the Snipping Tool, copies it to the clipboard, saves it as PNG or JPEG and opens a markup editor (pen, highlighter, rectangle, arrow, eraser, crop, undo, copy, save as).`n" +
         "- The status bar shows the recordings folder and its free space; recordings have no time limit and are stopped and saved automatically when the disk is almost full.`n" +
         "- Device logs (Logs menu, Start device logs or the tray icon) save each device's logcat in the Android Studio Logcat format to a text file, one folder per device, with a copy per checked app (Logs > Choose apps for per-app logs..., which lists PA and PIA first, then the open, running and installed apps, none checked by default) in a subfolder named after the app package; logging continues across restarts and reconnections in the same file.`n" +
         "- The device log records whether PA, PIA and the checked apps are running (APP STATUS) at the start and after every restart or reconnection, with APP STARTED, APP STOPPED, APP CRASHED and APP NOT RESPONDING lines as they happen; the control panel shows the elapsed time and size of each device log.`n" +
@@ -4115,7 +4115,7 @@ function Enable-SnipKey {
         $script:SnipKey.add_Pressed({ Invoke-Safely { Request-Snip 'rect' $null 1 } })
     }
     if ($script:SnipKey.Enable()) { return $true }
-    Write-Log 'Could not hook the Print Screen key for snipping.'
+    Write-Log 'Could not hook Win+Shift+S and Print Screen for snipping.'
     $false
 }
 
@@ -4216,7 +4216,7 @@ function Add-SnipMenu([System.Windows.Forms.ToolStripItemCollection]$Items) {
 function Update-SnipMenu([System.Windows.Forms.ToolStripMenuItem]$Root) {
     $items = $Root.DropDownItems
     $items.Clear()
-    $keyText = if ($script:SnipKey -and $script:SnipKey.Enabled) { 'Print Screen' } else { '' }
+    $keyText = if ($script:SnipKey -and $script:SnipKey.Enabled) { 'Win+Shift+S' } else { '' }
     [void](Add-SnipMenuItem $items 'Snip an area' { Request-Snip 'rect' } $false $keyText)
     [void](Add-SnipMenuItem $items 'Snip a window' { Request-Snip 'window' })
     if (@([System.Windows.Forms.Screen]::AllScreens).Count -gt 1) {
@@ -4230,7 +4230,7 @@ function Update-SnipMenu([System.Windows.Forms.ToolStripMenuItem]$Root) {
     [void](Add-SnipMenuItem $items 'Save snips as PNG' { Set-Setting 'SnipFormat' 'png' } ($format -eq 'png'))
     [void](Add-SnipMenuItem $items 'Save snips as JPEG' { Set-Setting 'SnipFormat' 'jpg' } ($format -eq 'jpg'))
     [void](Add-SnipMenuItem $items 'Open markup editor after snipping' { Set-Setting 'SnipEditor' (-not (Test-SnipEditor)) } (Test-SnipEditor))
-    [void](Add-SnipMenuItem $items 'Use Print Screen to snip' { Set-SnipPrintScreen (-not ($script:SnipKey -and $script:SnipKey.Enabled)) } ([bool]($script:SnipKey -and $script:SnipKey.Enabled)))
+    [void](Add-SnipMenuItem $items 'Use Win+Shift+S and Print Screen to snip' { Set-SnipPrintScreen (-not ($script:SnipKey -and $script:SnipKey.Enabled)) } ([bool]($script:SnipKey -and $script:SnipKey.Enabled)))
     [void]$items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void](Add-SnipMenuItem $items 'Open snips folder' { Open-SnipFolder })
 }
@@ -6521,7 +6521,14 @@ namespace ScrcpyMonitor {
         [DllImport("user32.dll")] static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
         [DllImport("user32.dll")] static extern bool PostThreadMessage(uint thread, int msg, IntPtr wParam, IntPtr lParam);
         [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+        [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int X; public int Y; public uint Data; public uint Flags; public uint Time; public IntPtr ExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort Vk; public ushort Scan; public uint Flags; public uint Time; public IntPtr ExtraInfo; }
+        [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT Mouse; [FieldOffset(0)] public KEYBDINPUT Keyboard; }
+        [StructLayout(LayoutKind.Sequential)] struct INPUT { public int Type; public INPUTUNION Data; }
+        [DllImport("user32.dll")] static extern uint SendInput(uint count, INPUT[] inputs, int size);
 
+        const int ShiftKey = 1, ControlKey = 2, AltKey = 4, WinKey = 8;
+        const int Pass = 0, Swallow = 1, Snip = 2, WinSnip = 3;
         public event EventHandler Pressed;
         HookProc proc;
         IntPtr hook;
@@ -6530,6 +6537,7 @@ namespace ScrcpyMonitor {
         uint threadId;
         bool down;
         bool passed;
+        bool sDown;
 
         public SnipKey() {
             var parameters = new CreateParams();
@@ -6571,36 +6579,76 @@ namespace ScrcpyMonitor {
             PostThreadMessage(threadId, 0x12, IntPtr.Zero, IntPtr.Zero);
             thread.Join(2000);
             thread = null;
-            down = passed = false;
+            down = passed = sDown = false;
         }
 
         static bool Held(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 
-        IntPtr Hook(int code, IntPtr wParam, IntPtr lParam) {
-            if (code >= 0 && Marshal.ReadInt32(lParam) == 0x2C) {
-                int message = wParam.ToInt32();
-                bool isDown = message == 0x100 || message == 0x104;
-                bool isUp = message == 0x101 || message == 0x105;
-                bool modified = Held(0x10) || Held(0x11) || Held(0x12) || Held(0x5B) || Held(0x5C);
+        static int Modifiers() {
+            return (Held(0x10) ? ShiftKey : 0) | (Held(0x11) ? ControlKey : 0) | (Held(0x12) ? AltKey : 0) | (Held(0x5B) || Held(0x5C) ? WinKey : 0);
+        }
+
+        static void SendNoOp() {
+            var inputs = new INPUT[2];
+            for (int i = 0; i < 2; i++) {
+                inputs[i].Type = 1;
+                inputs[i].Data.Keyboard.Vk = 0xFF;
+                inputs[i].Data.Keyboard.Flags = i == 0 ? 0u : 2u;
+                inputs[i].Data.Keyboard.ExtraInfo = new IntPtr(0x5343524D);
+            }
+            SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
+        }
+
+        int Decide(int vk, int message, int modifiers) {
+            bool isDown = message == 0x100 || message == 0x104;
+            bool isUp = message == 0x101 || message == 0x105;
+            if (vk == 0x53) {
                 if (isDown) {
-                    if (passed || modified) {
-                        passed = true;
-                    } else {
-                        if (!down) PostMessage(target, 0x8002, IntPtr.Zero, IntPtr.Zero);
-                        down = true;
-                        return new IntPtr(1);
+                    if (sDown && (modifiers & WinKey) != 0) return Swallow;
+                    sDown = false;
+                    if (modifiers == (WinKey | ShiftKey)) {
+                        sDown = true;
+                        return WinSnip;
                     }
-                } else if (isUp) {
-                    if (down) {
-                        down = false;
-                        return new IntPtr(1);
-                    }
-                    if (passed) {
-                        passed = false;
-                    } else if (!modified) {
-                        PostMessage(target, 0x8002, IntPtr.Zero, IntPtr.Zero);
-                        return new IntPtr(1);
-                    }
+                } else if (isUp && sDown) {
+                    sDown = false;
+                    return Swallow;
+                }
+                return Pass;
+            }
+            if (vk != 0x2C) return Pass;
+            bool modified = modifiers != 0;
+            if (isDown) {
+                if (passed || modified) {
+                    passed = true;
+                    return Pass;
+                }
+                bool first = !down;
+                down = true;
+                return first ? Snip : Swallow;
+            }
+            if (isUp) {
+                if (down) {
+                    down = false;
+                    return Swallow;
+                }
+                if (passed) {
+                    passed = false;
+                    return Pass;
+                }
+                if (!modified) return Snip;
+            }
+            return Pass;
+        }
+
+        IntPtr Hook(int code, IntPtr wParam, IntPtr lParam) {
+            if (code >= 0) {
+                int vk = Marshal.ReadInt32(lParam);
+                if (vk == 0x2C || vk == 0x53) {
+                    int action = Decide(vk, wParam.ToInt32(), Modifiers());
+                    if (action == WinSnip) SendNoOp();
+                    if (action == Snip || action == WinSnip) PostMessage(target, 0x8002, IntPtr.Zero, IntPtr.Zero);
+                    if (action != Pass) return new IntPtr(1);
                 }
             }
             return CallNextHookEx(hook, code, wParam, lParam);
@@ -7954,7 +8002,7 @@ $script:SnipEditors = New-Object System.Collections.ArrayList
 if ($script:Tray -or $script:Panel) {
     try { $script:MenuKey = New-MenuHotKey } catch { Write-Log "Could not set up Ctrl+Alt+M to show the tray menu: $($_.Exception.Message)" }
     if (Test-SnipPrintScreen) {
-        try { [void](Enable-SnipKey) } catch { Write-Log "Could not set up Print Screen to snip: $($_.Exception.Message)" }
+        try { [void](Enable-SnipKey) } catch { Write-Log "Could not set up Win+Shift+S and Print Screen to snip: $($_.Exception.Message)" }
     }
 }
 if ($script:Panel -and $script:Tray) {

@@ -29,7 +29,8 @@ TOOLS = (('pen', 'Pen', 'P'), ('highlighter', 'Highlighter', 'H'), ('rect', 'Rec
 COLORED_TOOLS = ('pen', 'highlighter', 'rect', 'arrow')
 WIDTHS = ((2.0, 'Thin'), (4.0, 'Medium'), (8.0, 'Thick'))
 BUTTONS = ('rect', 'window', 'screen', 'all', 'cancel')
-KEY_TEXT = 'Control+Option+S' if IS_MAC else 'Print Screen'
+KEY_NAMES = ('Control+Option+S',) if IS_MAC else ('Super+Shift+S', 'Print Screen')
+KEY_TEXT = ' and '.join(KEY_NAMES)
 UNDO_LIMIT = 100
 
 
@@ -944,12 +945,14 @@ class SnipTool(QObject):
         self.editors = []
         self.windows = None
         self.last_hotkey = 0.0
-        self.key_enabled = False
-        self.keys = None
+        self.active = []
+        self.keys = []
         if IS_LINUX:
-            self.keys = X11HotKeys(self.hotkey.emit, ((0xFF61, 0, 'snip'),), 'snip hotkey', True)
+            self.keys = [(name, X11HotKeys(self.hotkey.emit, ((keysym, modifiers, 'snip'),), f'{name} snip hotkey', True,
+                                           0x4D))
+                         for name, keysym, modifiers in zip(KEY_NAMES, (0x73, 0xFF61), (0x41, 0))]
         elif IS_MAC:
-            self.keys = MacHotKeys(self.hotkey.emit, ((5, 1, 0x1800, 'snip'),), 'snip hotkey')
+            self.keys = [(KEY_NAMES[0], MacHotKeys(self.hotkey.emit, ((5, 1, 0x1800, 'snip'),), 'snip hotkey'))]
         self.hotkey.connect(self._hotkey)
 
     def unavailable(self):
@@ -977,36 +980,48 @@ class SnipTool(QObject):
     def key_wanted(self):
         return get_setting(self.paths.settings, 'SnipPrintScreen') is not False
 
+    @property
+    def key_enabled(self):
+        return bool(self.active)
+
     def enable_key(self):
-        if self.key_enabled:
-            return True
         if not self.keys or self.unavailable():
-            return False
-        if self.keys.enable():
-            self.key_enabled = True
-            return True
-        try:
-            self.keys.disable()
-        except Exception:
-            pass
-        log(f'Could not register {KEY_TEXT} to snip; the desktop or another application may be using it.')
-        return False
+            return []
+        failed = []
+        for name, keys in self.keys:
+            if name in self.active:
+                continue
+            if keys.enable():
+                self.active.append(name)
+                continue
+            try:
+                keys.disable()
+            except Exception:
+                pass
+            failed.append(name)
+        self.active.sort(key=KEY_NAMES.index)
+        if failed:
+            log(f'Could not register {" and ".join(failed)} to snip; the desktop or another application may be '
+                'using it.')
+        return failed
 
     def disable_key(self):
-        self.key_enabled = False
-        if self.keys:
+        self.active = []
+        for name, keys in self.keys:
             try:
-                self.keys.disable()
+                keys.disable()
             except Exception as error:
-                log(f'Could not release {KEY_TEXT}: {error!r}')
+                log(f'Could not release {name}: {error!r}')
 
     def set_key(self, enabled):
         set_setting(self.paths.settings, 'SnipPrintScreen', bool(enabled))
         if not enabled:
             self.disable_key()
-        elif not self.enable_key():
-            self.controller.notify(f'Could not use {KEY_TEXT} to snip; the desktop or another application may be '
-                                   'using it.', 'warning')
+            return
+        failed = self.enable_key()
+        if failed:
+            self.controller.notify(f'Could not use {" and ".join(failed)} to snip; the desktop or another application '
+                                   'may be using it.', 'warning')
 
     def _hotkey(self, name):
         now = time.monotonic()
@@ -1175,7 +1190,7 @@ class SnipTool(QObject):
         if reason:
             add(reason, lambda: None, enabled=False)
             return
-        add('Snip an area' + (f'\t{KEY_TEXT}' if self.key_enabled else ''), lambda: self.request('rect'))
+        add('Snip an area' + (f'\t{self.active[0]}' if self.active else ''), lambda: self.request('rect'))
         add('Snip a window', lambda: self.request('window'))
         if len(QGuiApplication.screens()) > 1:
             add('Snip a screen', lambda: self.request('screen'))

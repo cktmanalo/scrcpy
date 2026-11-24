@@ -101,18 +101,18 @@ Capture works differently on each platform:
 
 ## Snip
 
-**Recording > Snip** in the panel, **Snip** in the tray menu, `--command snip`, or the snip key (**Print Screen** on Linux, **Control+Option+S** on macOS) works like the Windows Snipping Tool. It does not need ffmpeg.
+**Recording > Snip** in the panel, **Snip** in the tray menu, `--command snip`, or the snip keys (**Super+Shift+S** and **Print Screen** on Linux, **Control+Option+S** on macOS) works like the Windows Snipping Tool. It does not need ffmpeg.
 
 - The screen freezes and you drag to snip an area. The toolbar at the top switches to **Window** (click a window), **Screen** (click a screen) or **All screens**. Esc or a right-click cancels.
 - The snip is copied to the clipboard and saved as `Screenshots/Snip_<yyyyMMdd_HHmmss_fff>.png` (or `.jpg`) under the recordings folder.
 - The markup editor then opens with Pen (P), Highlighter (H), Rectangle (R), Arrow (A), Eraser (E) and Crop (X), a color and a width, Undo (Ctrl+Z), Redo (Ctrl+Y), Fit to window (Ctrl+0), Copy (Ctrl+C), Save (Ctrl+S), Save as (Ctrl+Shift+S, PNG or JPEG) and New snip (Ctrl+N). On macOS these use Command.
-- The Snip menu chooses PNG or JPEG, turns the markup editor on or off (when it is off, a notification shows the file name), turns the snip key on or off and opens the snips folder.
+- The Snip menu chooses PNG or JPEG, turns the markup editor on or off (when it is off, a notification shows the file name), turns the snip keys on or off and opens the snips folder.
 
 Capture works differently on each platform:
 
-- **Linux:** an X11 session only (not native Wayland). Print Screen is grabbed with `XGrabKey`; if the desktop already owns it, the log says so and the menu still works. **Use Print Screen to snip** is then unchecked; turn off the desktop's own Print Screen shortcut and choose it to try again.
+- **Linux:** an X11 session only (not native Wayland). Super+Shift+S and Print Screen are grabbed with `XGrabKey`; if the desktop already owns one of them, the log and a notification say so, the other key and the menu still work. **Use Super+Shift+S and Print Screen to snip** is unchecked only when neither key could be grabbed; turn off the desktop's own shortcut (for example Spectacle on KDE) and choose the item again.
 - **macOS:** allow Scrcpy Monitor in **System Settings > Privacy & Security > Screen Recording**. The key uses Carbon `RegisterEventHotKey`.
-- **Windows:** the PowerShell monitor has the same feature and opens it with Print Screen instead of the Windows Snipping Tool.
+- **Windows:** the PowerShell monitor has the same feature and opens it with Win+Shift+S and Print Screen instead of the Windows Snipping Tool.
 
 ## Tool lookup
 
