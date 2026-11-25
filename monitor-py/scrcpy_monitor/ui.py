@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
                                QMessageBox, QPushButton, QStatusBar, QStyle, QSystemTrayIcon, QTextBrowser,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from . import logic, screenrec, updater
+from . import logic, screenrec, snip, updater
 from .system import (IS_LINUX, IS_MAC, IS_WINDOWS, SOURCE_DIR, find_resource, get_setting, log, mac_session_ending,
                      open_path, set_setting)
 
@@ -171,6 +171,9 @@ class AboutDialog(QDialog):
             '- Screen recording (Recording menu or tray icon) records the desktop: a movable, resizable rectangle, a '
             'selected area, one or all screens (listed from the screens connected to this computer), a window or the '
             'area around the mouse, with pause and screenshots (F12 record, Shift+F12 pause, F11 screenshot).\n'
+            f'- Snip ({snip.KEY_TEXT}, Recording > Snip or the tray icon) captures an area, a window, a screen or all '
+            'screens like the Snipping Tool, copies it to the clipboard, saves it as PNG or JPEG and opens a markup '
+            'editor (pen, highlighter, rectangle, arrow, eraser, crop, undo, copy, save as).\n'
             '- The status bar shows the recordings folder and its free space; recordings have no time limit and are '
             'stopped and saved automatically when the disk is almost full.\n'
             '- Device logs (Logs menu, Start device logs or the tray icon) save each device\'s logcat in the Android '
@@ -346,6 +349,9 @@ class Panel(QWidget):
         screen_menu = recording_menu.addMenu('Screen recording')
         screen_menu.addAction('...')
         screen_menu.aboutToShow.connect(safely(lambda: controller.screen.build_menu(screen_menu)))
+        snip_menu = recording_menu.addMenu('Snip')
+        snip_menu.addAction('...')
+        snip_menu.aboutToShow.connect(safely(lambda: controller.snip.build_menu(snip_menu)))
         self.logs_start_all = self._menu_item(logs_menu, 'Start device logs on all devices',
                                               controller.start_all_logs)
         self.logs_stop_all = self._menu_item(logs_menu, 'Stop device logs on all devices', controller.stop_all_logs)
@@ -529,6 +535,7 @@ class Controller(QObject):
         self.icon = self._load_icon(options.icon_path)
         app.setWindowIcon(self.icon)
         self.screen = screenrec.ScreenRecorder(self)
+        self.snip = snip.SnipTool(self)
         self.panel = None
         if not options.no_panel:
             title = f'{TITLE} {version.display}' if version.enabled else TITLE
@@ -588,6 +595,8 @@ class Controller(QObject):
             if self.panel:
                 self.panel.tray_menu_item.setShortcut(QKeySequence())
             log(f'Could not register {MENU_SHORTCUT} to show the tray menu; another application may be using it.')
+        if (self.tray or self.panel) and self.snip.key_wanted():
+            safely(self.snip.enable_key)()
         if self.no_tray_fallback and self.panel:
             self.show_panel()
         if not self.options.no_update_check and self.auto_update_check:
@@ -711,6 +720,7 @@ class Controller(QObject):
         if self.menu_keys:
             safely(self.menu_keys.disable)()
         self.screen.shutdown()
+        safely(self.snip.shutdown)()
         if self.tray:
             self.tray.hide()
         for widget in QApplication.topLevelWidgets():
@@ -725,6 +735,7 @@ class Controller(QObject):
             return
         self.exit_requested = True
         safely(self.screen.close)()
+        safely(self.snip.shutdown)()
         if self.panel and self.panel.isVisible():
             self.panel.status.setText('Stopping: finishing recordings and closing windows...')
             self.panel.setCursor(Qt.CursorShape.WaitCursor)
@@ -880,6 +891,9 @@ class Controller(QObject):
         screen_menu = menu.addMenu('Screen recording')
         screen_menu.addAction('...')
         screen_menu.aboutToShow.connect(safely(lambda: self.screen.build_menu(screen_menu)))
+        snip_menu = menu.addMenu('Snip')
+        snip_menu.addAction('...')
+        snip_menu.aboutToShow.connect(safely(lambda: self.snip.build_menu(snip_menu)))
         self._action(menu, 'Start device logs on all devices', self.start_all_logs,
                      enabled=any(not v.logging for v in targets))
         self._action(menu, 'Stop device logs on all devices', self.stop_all_logs,
@@ -1209,6 +1223,8 @@ class Controller(QObject):
         elif command == 'open-windows':
             self.engine.post(lambda: setattr(self.engine, 'open_windows_requested', True))
             self.engine.post_tick()
+        elif command == 'snip':
+            self.snip.request('rect', delay=100)
         elif command == 'exit':
             self.request_exit()
 

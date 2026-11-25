@@ -669,8 +669,9 @@ class X11HotKeys:
     MODIFIERS = 0x0D
     KEYS = ((0xFFC9, 0, 'rec'), (0xFFC9, 1, 'pause'), (0xFFC8, 0, 'shot'))
 
-    def __init__(self, emit, keys=None, label='screen recorder hotkeys', ungrab=False):
+    def __init__(self, emit, keys=None, label='screen recorder hotkeys', ungrab=False, mask=None):
         self.emit = emit
+        self.mask = mask or self.MODIFIERS
         self.keys = keys or self.KEYS
         self.label = label
         self.ungrab = ungrab
@@ -745,7 +746,7 @@ class X11HotKeys:
                     if event.xkey.type != 2:
                         continue
                     for code, modifiers, name in keys:
-                        if code and event.xkey.keycode == code and event.xkey.state & self.MODIFIERS == modifiers:
+                        if code and event.xkey.keycode == code and event.xkey.state & self.mask == modifiers:
                             if self.ungrab:
                                 lib.XUngrabKeyboard(display, event.xkey.time)
                                 lib.XFlush(display)

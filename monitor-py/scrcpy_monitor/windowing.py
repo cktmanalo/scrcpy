@@ -293,6 +293,29 @@ class X11Mover:
             found.append((window, title, pid[0] if pid else 0))
         return found
 
+    def stacked_windows(self):
+        self._open()
+        stack = self._cardinals(self.root, '_NET_CLIENT_LIST_STACKING') or self._client_windows()
+        desktop = self._atom('_NET_WM_WINDOW_TYPE_DESKTOP')
+        found = []
+        for window in reversed(stack):
+            if desktop in self._cardinals(window, '_NET_WM_WINDOW_TYPE'):
+                continue
+            rect = self.window_rect(window)
+            if not rect:
+                continue
+            frame = self._cardinals(window, '_NET_FRAME_EXTENTS')
+            if len(frame) == 4:
+                rect = (rect[0] - frame[0], rect[1] - frame[2], rect[2] + frame[0] + frame[1],
+                        rect[3] + frame[2] + frame[3])
+            shadow = self._cardinals(window, '_GTK_FRAME_EXTENTS')
+            if len(shadow) == 4:
+                rect = (rect[0] + shadow[0], rect[1] + shadow[2], rect[2] - shadow[0] - shadow[1],
+                        rect[3] - shadow[2] - shadow[3])
+            if rect[2] > 0 and rect[3] > 0:
+                found.append(rect)
+        return found
+
 
 class CGPoint(ctypes.Structure):
     _fields_ = [('x', c_double), ('y', c_double)]
@@ -548,3 +571,8 @@ class MacWindowList:
                 info['title'] or info['owner'])
             found.append((info['id'], title, info['pid']))
         return found
+
+    def stacked_windows(self):
+        return [info['rect'] for info in self._windows(1 | 16)
+                if info['layer'] == 0 and info['onscreen'] and info['rect'] and info['rect'][2] >= 8
+                and info['rect'][3] >= 8]

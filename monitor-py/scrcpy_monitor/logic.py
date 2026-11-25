@@ -869,3 +869,130 @@ def screen_capture_base(folder, moment, exists):
         base = os.path.join(folder, f'{stem}_{suffix}')
         suffix += 1
     return base
+
+def snip_format(value):
+    return 'jpg' if value == 'jpg' else 'png'
+
+
+def snip_file_name(moment, file_format):
+    return f'Snip_{moment:%Y%m%d_%H%M%S}_{moment.microsecond // 1000:03d}.{snip_format(file_format)}'
+
+
+def snip_status(path, saved, copied):
+    if saved and copied:
+        return f'Copied to the clipboard and saved: {path}'
+    if saved:
+        return f'Saved: {path} (could not copy to the clipboard)'
+    if copied:
+        return 'Copied to the clipboard (could not save the file)'
+    return 'Could not copy or save the snip'
+
+
+def snip_save_path(path, jpeg_filter):
+    if os.path.splitext(path)[1].lower() in ('.png', '.jpg', '.jpeg'):
+        return path
+    return path + ('.jpg' if jpeg_filter else '.png')
+
+
+def is_jpeg(path):
+    return os.path.splitext(str(path))[1].lower() in ('.jpg', '.jpeg')
+
+
+def rect_from_points(a, b):
+    left, top = min(a[0], b[0]), min(a[1], b[1])
+    return (left, top, max(a[0], b[0]) - left, max(a[1], b[1]) - top)
+
+
+def rect_intersection(a, b):
+    left, top = max(a[0], b[0]), max(a[1], b[1])
+    right, bottom = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right - left, bottom - top)
+
+
+def point_in_rect(rect, x, y):
+    return rect[0] <= x < rect[0] + rect[2] and rect[1] <= y < rect[1] + rect[3]
+
+
+def snip_target(windows, screens, x, y):
+    for rect in windows:
+        if point_in_rect(rect, x, y):
+            return rect
+    for rect in screens:
+        if point_in_rect(rect, x, y):
+            return rect
+    return None
+
+
+def snip_native_to_logical(rect, displays):
+    x, y = rect[0] + rect[2] // 2, rect[1] + rect[3] // 2
+    origin, ratio = (0, 0), 1
+    for capture, dpr in displays:
+        if point_in_rect(capture, x, y):
+            origin, ratio = (capture[0], capture[1]), dpr or 1
+            break
+    left = origin[0] + (rect[0] - origin[0]) / ratio
+    top = origin[1] + (rect[1] - origin[1]) / ratio
+    return (round(left), round(top), round(rect[2] / ratio), round(rect[3] / ratio))
+
+
+def snip_window_rects(rects, bounds):
+    found = []
+    for rect in rects:
+        clipped = rect_intersection(rect, bounds) if rect and rect[2] > 0 and rect[3] > 0 else None
+        if clipped:
+            found.append(clipped)
+    return found
+
+
+def fit_zoom(view_width, view_height, image_width, image_height):
+    if view_width <= 0 or view_height <= 0 or image_width <= 0 or image_height <= 0:
+        return 1.0
+    return max(0.05, min(1.0, min((view_width - 16) / image_width, (view_height - 16) / image_height)))
+
+
+def segment_distance(point, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = dx * dx + dy * dy
+    t = 0.0 if length <= 0 else max(0.0, min(1.0, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length))
+    return math.hypot(a[0] + t * dx - point[0], a[1] + t * dy - point[1])
+
+
+def shape_hit(kind, points, width, point, tolerance):
+    limit = width / 2 + tolerance
+    if kind == 'rect':
+        left, top, w, h = rect_from_points(points[0], points[1])
+        corners = ((left, top), (left + w, top), (left + w, top + h), (left, top + h))
+        return any(segment_distance(point, corners[i], corners[(i + 1) % 4]) <= limit for i in range(4))
+    if len(points) == 1:
+        return segment_distance(point, points[0], points[0]) <= limit
+    return any(segment_distance(point, points[i - 1], points[i]) <= limit for i in range(1, len(points)))
+
+
+def arrow_geometry(a, b, width):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    if length < 1:
+        return None
+    head = min(length, max(12.0, width * 4))
+    ux, uy = dx / length, dy / length
+    bottom = (b[0] - ux * head, b[1] - uy * head)
+    half = head * 0.55
+    left = (bottom[0] - uy * half, bottom[1] + ux * half)
+    right = (bottom[0] + uy * half, bottom[1] - ux * half)
+    shaft = (b[0] - ux * head * 0.7, b[1] - uy * head * 0.7) if length > head else None
+    return shaft, (b, left, right)
+
+
+def crop_area(start, end, image_width, image_height):
+    rect = rect_from_points(start, end)
+    left, top = max(0.0, rect[0]), max(0.0, rect[1])
+    right, bottom = min(float(image_width), rect[0] + rect[2]), min(float(image_height), rect[1] + rect[3])
+    if right <= left or bottom <= top:
+        return None
+    x, y = round(left), round(top)
+    w, h = round(right) - x, round(bottom) - y
+    if w < 4 or h < 4 or (w, h) == (image_width, image_height):
+        return None
+    return (x, y, w, h)
