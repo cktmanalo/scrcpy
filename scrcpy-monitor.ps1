@@ -6287,6 +6287,10 @@ namespace ScrcpyMonitor {
     public class MenuHotKey : NativeWindow, IDisposable {
         [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint key);
         [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+
+        readonly System.Windows.Forms.Timer delay = new System.Windows.Forms.Timer { Interval = 30 };
+        int waited;
 
         public event EventHandler Pressed;
         public bool Registered { get; private set; }
@@ -6296,18 +6300,30 @@ namespace ScrcpyMonitor {
             parameters.Parent = new IntPtr(-3);
             CreateHandle(parameters);
             Registered = RegisterHotKey(Handle, 1, 0x4003, 0x4D);
+            delay.Tick += OnDelay;
+        }
+
+        static bool Down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+
+        void OnDelay(object sender, EventArgs e) {
+            waited += delay.Interval;
+            if (waited < 1000 && (Down(0x11) || Down(0x12) || Down(0x4D))) return;
+            delay.Stop();
+            var handler = Pressed;
+            if (handler != null) handler(this, EventArgs.Empty);
         }
 
         protected override void WndProc(ref Message m) {
             if (m.Msg == 0x312) {
-                var handler = Pressed;
-                if (handler != null) handler(this, EventArgs.Empty);
+                if (!delay.Enabled) { waited = 0; delay.Start(); }
                 return;
             }
             base.WndProc(ref m);
         }
 
         public void Dispose() {
+            delay.Stop();
+            delay.Dispose();
             if (Registered) UnregisterHotKey(Handle, 1);
             Registered = false;
             DestroyHandle();
